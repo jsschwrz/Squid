@@ -37,7 +37,7 @@ Ownership Model:
 import multiprocessing
 import time
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Callable, Optional, Tuple
 
 import squid.logging
 
@@ -401,12 +401,21 @@ class BackpressureController:
 
         return jobs_over or bytes_over
 
-    def wait_for_capacity(self) -> bool:
-        """Wait until capacity available or timeout. Returns True if got capacity."""
+    def wait_for_capacity(self, should_abort: Optional[Callable[[], bool]] = None) -> bool:
+        """Wait until capacity available or timeout. Returns True if got capacity.
+
+        Args:
+            should_abort: Optional predicate polled while waiting. If it returns True, the wait
+                exits immediately (returns False) instead of blocking for the full timeout. Used
+                so a stop/abort request doesn't sit through a throttle pause waiting for capacity
+                to launch a frame we're about to abandon anyway.
+        """
         if self._warn_if_closed("wait_for_capacity"):
             return True  # Don't block on closed controller
         if not self._enabled or not self.should_throttle():
             return True
+        if should_abort is not None and should_abort():
+            return False
 
         log.info(
             f"Backpressure throttling: jobs={self.get_pending_jobs()}/{self._max_jobs}, "
@@ -416,6 +425,9 @@ class BackpressureController:
 
         deadline = time.monotonic() + self._timeout_s
         while self.should_throttle():
+            if should_abort is not None and should_abort():
+                log.info("Backpressure wait aborted by stop request")
+                return False
             if time.monotonic() > deadline:
                 log.warning(f"Backpressure timeout after {self._timeout_s}s, continuing")
                 return False

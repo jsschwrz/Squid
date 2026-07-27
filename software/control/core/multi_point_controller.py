@@ -761,6 +761,7 @@ class MultiPointController:
             self._log.info(f"region centers: {scan_position_information.scan_region_coords_mm}")
 
             self.abort_acqusition_requested = False
+            self.abort_now_requested = False
 
             self.configuration_before_running_multipoint = self.liveController.currentConfiguration
             # stop live
@@ -937,6 +938,7 @@ class MultiPointController:
                     acquisition_parameters=acquisition_params,
                     callbacks=updated_callbacks,
                     abort_requested_fn=lambda: self.abort_acqusition_requested,
+                    abort_now_requested_fn=lambda: self.abort_now_requested,
                     request_abort_fn=self.request_abort_aquisition,
                     extra_job_classes=[],
                     alignment_widget=self._alignment_widget,
@@ -1076,6 +1078,14 @@ class MultiPointController:
 
     def request_abort_aquisition(self):
         self.abort_acqusition_requested = True
+
+    def request_abort_now(self):
+        """Immediate abort: stop as soon as possible and discard any queued, unsaved images
+        for this run. Sets the graceful abort flag too, so all existing abort checkpoints also
+        trip; the abort_now flag additionally skips the job-drain wait and kills the runners.
+        """
+        self.abort_acqusition_requested = True
+        self.abort_now_requested = True
 
     def validate_acquisition_settings(self) -> bool:
         """Validate settings before starting acquisition"""

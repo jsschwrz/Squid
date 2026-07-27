@@ -5961,6 +5961,13 @@ class FlexibleMultiPointWidget(AcquisitionYAMLDropMixin, _ApplyChannelOffsetMixi
         self.btn_startAcquisition.setStyleSheet("background-color: #C2C2FF")
         self.btn_startAcquisition.setCheckable(True)
         self.btn_startAcquisition.setChecked(False)
+
+        # Immediate-abort button: one click, no confirmation dialog (by design). Discards any
+        # queued unsaved images for the current run. Disabled until an acquisition is running.
+        self.btn_abortAcquisition = QPushButton("Abort Now\n(all data for this loop will be lost)")
+        self.btn_abortAcquisition.setStyleSheet("background-color: #FFC2C2")
+        self.btn_abortAcquisition.setToolTip("Stop immediately and discard all queued unsaved images for this loop.")
+        self.btn_abortAcquisition.setEnabled(False)
         # self.btn_startAcquisition.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
 
         # Add snap images button
@@ -6105,6 +6112,7 @@ class FlexibleMultiPointWidget(AcquisitionYAMLDropMixin, _ApplyChannelOffsetMixi
         button_layout = QVBoxLayout()
         button_layout.addWidget(self.btn_snap_images)
         button_layout.addWidget(self.btn_startAcquisition)
+        button_layout.addWidget(self.btn_abortAcquisition)
 
         grid_acquisition = QHBoxLayout()
         grid_acquisition.addSpacerItem(edge_spacer)
@@ -6171,6 +6179,7 @@ class FlexibleMultiPointWidget(AcquisitionYAMLDropMixin, _ApplyChannelOffsetMixi
         self.checkbox_skipSaving.toggled.connect(self.multipointController.set_skip_saving)
         self.btn_setSavingDir.clicked.connect(self.set_saving_dir)
         self.btn_startAcquisition.clicked.connect(self.toggle_acquisition)
+        self.btn_abortAcquisition.clicked.connect(self.abort_acquisition_now)
         self.multipointController.acquisition_finished.connect(self.acquisition_is_finished)
         self.list_configurations.itemSelectionChanged.connect(self.emit_selected_channels)
         # self.combobox_z_stack.currentIndexChanged.connect(self.signal_z_stacking.emit)
@@ -6529,6 +6538,7 @@ class FlexibleMultiPointWidget(AcquisitionYAMLDropMixin, _ApplyChannelOffsetMixi
             self.is_current_acquisition_widget = True  # keep track of what widget started the acquisition
             self.btn_startAcquisition.setText("Stop\n Acquisition ")
             self.setEnabled_all(False)
+            self.btn_abortAcquisition.setEnabled(True)
 
             # emit signals
             self.signal_acquisition_started.emit(True)
@@ -6547,6 +6557,9 @@ class FlexibleMultiPointWidget(AcquisitionYAMLDropMixin, _ApplyChannelOffsetMixi
             self.multipointController.run_acquisition()
         else:
             # This must eventually propagate through and call out acquisition_finished.
+            # Graceful stop: keep the Abort Now button enabled so the user can escalate to an
+            # immediate abort if the write-queue drain takes too long.
+            self.btn_startAcquisition.setText("Stopping… ")
             self.multipointController.request_abort_aquisition()
 
     def load_last_used_locations(self):
@@ -6959,6 +6972,14 @@ class FlexibleMultiPointWidget(AcquisitionYAMLDropMixin, _ApplyChannelOffsetMixi
         self.multipointController.start_new_experiment("snapped images" + self.lineEdit_experimentID.text())
         self.multipointController.run_acquisition(acquire_current_fov=True)
 
+    def abort_acquisition_now(self):
+        # One-click immediate abort. No confirmation dialog (by design); the button label and
+        # tooltip warn that queued unsaved images for this run will be discarded.
+        self._log.warning("Abort Now clicked: discarding queued unsaved images for this run.")
+        self.btn_abortAcquisition.setEnabled(False)
+        self.btn_startAcquisition.setText("Aborting… ")
+        self.multipointController.request_abort_now()
+
     def acquisition_is_finished(self):
         self._log.debug(
             f"In FlexibleMultiPointWidget, got acquisition_is_finished with {self.is_current_acquisition_widget=}"
@@ -6978,6 +6999,7 @@ class FlexibleMultiPointWidget(AcquisitionYAMLDropMixin, _ApplyChannelOffsetMixi
         self.btn_startAcquisition.setChecked(False)
         self.btn_startAcquisition.setText("Start\n Acquisition ")
         self.setEnabled_all(True)
+        self.btn_abortAcquisition.setEnabled(False)
         self.is_current_acquisition_widget = False
 
     def setEnabled_all(self, enabled, exclude_btn_startAcquisition=True):
@@ -7422,6 +7444,13 @@ class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, _ApplyChannelOffsetMix
         self.btn_startAcquisition.setStyleSheet("background-color: #C2C2FF")
         self.btn_startAcquisition.setCheckable(True)
         self.btn_startAcquisition.setChecked(False)
+
+        # Immediate-abort button: one click, no confirmation dialog (by design). Discards any
+        # queued unsaved images for the current run. Disabled until an acquisition is running.
+        self.btn_abortAcquisition = QPushButton("Abort Now\n(all data for this loop will be lost)")
+        self.btn_abortAcquisition.setStyleSheet("background-color: #FFC2C2")
+        self.btn_abortAcquisition.setToolTip("Stop immediately and discard all queued unsaved images for this loop.")
+        self.btn_abortAcquisition.setEnabled(False)
         # self.btn_startAcquisition.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
 
         self.progress_label = QLabel("Region -/-")
@@ -7652,6 +7681,7 @@ class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, _ApplyChannelOffsetMix
         button_layout = QVBoxLayout()
         button_layout.addWidget(self.btn_snap_images)
         button_layout.addWidget(self.btn_startAcquisition)
+        button_layout.addWidget(self.btn_abortAcquisition)
 
         bottom_right = QHBoxLayout()
         bottom_right.addLayout(options_layout)
@@ -7702,6 +7732,7 @@ class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, _ApplyChannelOffsetMix
         # Connections
         self.btn_setSavingDir.clicked.connect(self.set_saving_dir)
         self.btn_startAcquisition.clicked.connect(self.toggle_acquisition)
+        self.btn_abortAcquisition.clicked.connect(self.abort_acquisition_now)
         self.entry_deltaZ.valueChanged.connect(self.set_deltaZ)
         self.entry_NZ.valueChanged.connect(self.multipointController.set_NZ)
         self.entry_dt.valueChanged.connect(self.multipointController.set_deltat)
@@ -8913,7 +8944,8 @@ class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, _ApplyChannelOffsetMix
 
         else:
             # This must eventually propagate through and call our aquisition_is_finished, or else we'll be left
-            # in an odd state.
+            # in an odd state. Graceful stop: keep Abort Now enabled so the user can escalate.
+            self.btn_startAcquisition.setText("Stopping… ")
             self.multipointController.request_abort_aquisition()
 
     def _set_ui_acquisition_running(self, nz: int, delta_z_um: float, set_button_checked: bool = False):
@@ -8930,6 +8962,7 @@ class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, _ApplyChannelOffsetMix
         if set_button_checked:
             self.btn_startAcquisition.setChecked(True)
         self.btn_startAcquisition.setText("Stop\n Acquisition ")
+        self.btn_abortAcquisition.setEnabled(True)
         # Emit signals to notify other components
         self.signal_acquisition_started.emit(True)
         self.signal_acquisition_shape.emit(nz, delta_z_um)
@@ -8955,6 +8988,14 @@ class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, _ApplyChannelOffsetMix
         except Exception as e:
             self._log.error(f"Exception in set_acquisition_running_state: {e}", exc_info=True)
 
+    def abort_acquisition_now(self):
+        # One-click immediate abort. No confirmation dialog (by design); the button label and
+        # tooltip warn that queued unsaved images for this run will be discarded.
+        self._log.warning("Abort Now clicked: discarding queued unsaved images for this run.")
+        self.btn_abortAcquisition.setEnabled(False)
+        self.btn_startAcquisition.setText("Aborting… ")
+        self.multipointController.request_abort_now()
+
     def acquisition_is_finished(self):
         self._log.debug(
             f"In WellMultiPointWidget, got acquisition_is_finished with {self.is_current_acquisition_widget=}"
@@ -8973,6 +9014,7 @@ class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, _ApplyChannelOffsetMix
             self.focusMapWidget.update_focus_point_display()
             self.focusMapWidget.enable_updating_focus_points_on_signal()
         self.setEnabled_all(True)
+        self.btn_abortAcquisition.setEnabled(False)
         self.toggle_coordinate_controls(self.has_loaded_coordinates)
 
     def setEnabled_all(self, enabled):
@@ -9479,6 +9521,13 @@ class MultiPointWithFluidicsWidget(_ApplyChannelOffsetMixin, QFrame):
         self.btn_startAcquisition.setStyleSheet("background-color: #C2C2FF")
         self.btn_startAcquisition.setCheckable(True)
         self.btn_startAcquisition.setChecked(False)
+
+        # Immediate-abort button: one click, no confirmation dialog (by design). Discards any
+        # queued unsaved images for the current run. Disabled until an acquisition is running.
+        self.btn_abortAcquisition = QPushButton("Abort Now\n(all data for this loop will be lost)")
+        self.btn_abortAcquisition.setStyleSheet("background-color: #FFC2C2")
+        self.btn_abortAcquisition.setToolTip("Stop immediately and discard all queued unsaved images for this loop.")
+        self.btn_abortAcquisition.setEnabled(False)
         self.btn_startAcquisition.setEnabled(False)
 
         # Progress indicators
@@ -9549,6 +9598,7 @@ class MultiPointWithFluidicsWidget(_ApplyChannelOffsetMixin, QFrame):
 
         # Start button on far right
         grid.addWidget(self.btn_startAcquisition, 0, 4)
+        grid.addWidget(self.btn_abortAcquisition, 1, 4)
 
         # Add spacers between columns
         spacer_widget1 = QWidget()
@@ -9578,6 +9628,7 @@ class MultiPointWithFluidicsWidget(_ApplyChannelOffsetMixin, QFrame):
         # Connect signals
         self.btn_setSavingDir.clicked.connect(self.set_saving_dir)
         self.btn_startAcquisition.clicked.connect(self.toggle_acquisition)
+        self.btn_abortAcquisition.clicked.connect(self.abort_acquisition_now)
         self.btn_load_coordinates.clicked.connect(self.on_load_coordinates_clicked)
         # self.btn_init_fluidics.clicked.connect(self.init_fluidics)
         self.entry_deltaZ.valueChanged.connect(self.set_deltaZ)
@@ -9645,6 +9696,7 @@ class MultiPointWithFluidicsWidget(_ApplyChannelOffsetMixin, QFrame):
             self.setEnabled_all(False)
             self.is_current_acquisition_widget = True
             self.btn_startAcquisition.setText("Stop\n Acquisition ")
+            self.btn_abortAcquisition.setEnabled(True)
 
             self.multipointController.set_deltaZ(self.entry_deltaZ.value())
             self.multipointController.set_NZ(self.entry_NZ.value())
@@ -9665,6 +9717,8 @@ class MultiPointWithFluidicsWidget(_ApplyChannelOffsetMixin, QFrame):
             # Start acquisition
             self.multipointController.run_acquisition()
         else:
+            # Graceful stop: keep Abort Now enabled so the user can escalate to an immediate abort.
+            self.btn_startAcquisition.setText("Stopping… ")
             self.multipointController.request_abort_aquisition()
             # Also stop fluidics operations
             if self.multipointController.fluidics:
@@ -9710,6 +9764,14 @@ class MultiPointWithFluidicsWidget(_ApplyChannelOffsetMixin, QFrame):
         """Refresh the channel list after configuration changes."""
         self.channel_sequence.refresh()
 
+    def abort_acquisition_now(self):
+        # One-click immediate abort. No confirmation dialog (by design); the button label and
+        # tooltip warn that queued unsaved images for this run will be discarded.
+        self._log.warning("Abort Now clicked: discarding queued unsaved images for this run.")
+        self.btn_abortAcquisition.setEnabled(False)
+        self.btn_startAcquisition.setText("Aborting… ")
+        self.multipointController.request_abort_now()
+
     def acquisition_is_finished(self):
         """Handle acquisition completion"""
         self._log.debug(
@@ -9723,6 +9785,7 @@ class MultiPointWithFluidicsWidget(_ApplyChannelOffsetMixin, QFrame):
         self.btn_startAcquisition.setChecked(False)
         self.btn_startAcquisition.setText("Start\n Acquisition ")
         self.setEnabled_all(True)
+        self.btn_abortAcquisition.setEnabled(False)
 
     def setEnabled_all(self, enabled):
         """Enable/disable all widget controls"""

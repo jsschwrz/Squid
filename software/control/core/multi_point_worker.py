@@ -77,6 +77,7 @@ class MultiPointWorker:
         callbacks: MultiPointControllerFunctions,
         abort_requested_fn: Callable[[], bool],
         request_abort_fn: Callable[[], None],
+        abort_now_requested_fn: Callable[[], bool] = lambda: False,
         extra_job_classes: list[type[Job]] | None = None,
         abort_on_failed_jobs: bool = True,
         alignment_widget=None,
@@ -115,6 +116,9 @@ class MultiPointWorker:
         self.request_abort_fn: Callable[[], None] = request_abort_fn
         self._run_state = run_state_writer or squid.acquisition_state.NullRunStateWriter()
         self._abort_cause = None  # set to "error" by auto-abort paths (timeout / failed jobs)
+        # Immediate-abort predicate. When True, inner loops break ASAP and _finish_jobs() skips
+        # the drain wait and kills the runners, discarding any queued unsaved images for this run.
+        self.abort_now_requested_fn: Callable[[], bool] = abort_now_requested_fn
         self.NZ = acquisition_parameters.NZ
         self.deltaZ = acquisition_parameters.deltaZ
 
@@ -709,7 +713,6 @@ class MultiPointWorker:
             if job_runner is not None
         ]
 
-        self._log.info(f"Waiting for jobs to finish on {len(active_runners)} job runners before shutting them down...")
         timeout_time = time.time() + timeout_s
 
         def timed_out():
@@ -718,26 +721,41 @@ class MultiPointWorker:
         def time_left():
             return max(timeout_time - time.time(), 0)
 
-        # Wait for all pending jobs across all runners (round-robin to avoid blocking on one)
-        while not timed_out():
-            any_pending = False
+        if self.abort_now_requested_fn():
+            # Immediate abort: don't drain the write queue. Kill runners now and discard any
+            # queued unsaved images for this run (same kill path as the drain-timeout case).
+            self._log.warning(
+                f"Immediate abort: discarding queued unsaved images and killing "
+                f"{len(active_runners)} job runner(s) without draining."
+            )
             for job_class, job_runner in active_runners:
                 if job_runner.has_pending():
-                    any_pending = True
-                    break
-            if not any_pending:
-                break
-            # Process any available results while waiting
-            self._summarize_runner_outputs(drain_all=True)
-            time.sleep(0.1)
+                    self._log.warning(f"Abandoning pending jobs for {job_class.__name__} due to immediate abort.")
+                job_runner.kill()
         else:
-            # Timed out - kill any runners that still have pending jobs
-            for job_class, job_runner in active_runners:
-                if job_runner.has_pending():
-                    self._log.error(
-                        f"Timed out after {timeout_s} [s] waiting for jobs to finish. Pending jobs for {job_class.__name__} abandoned!!!"
-                    )
-                    job_runner.kill()
+            self._log.info(
+                f"Waiting for jobs to finish on {len(active_runners)} job runners before shutting them down..."
+            )
+            # Wait for all pending jobs across all runners (round-robin to avoid blocking on one)
+            while not timed_out():
+                any_pending = False
+                for job_class, job_runner in active_runners:
+                    if job_runner.has_pending():
+                        any_pending = True
+                        break
+                if not any_pending:
+                    break
+                # Process any available results while waiting
+                self._summarize_runner_outputs(drain_all=True)
+                time.sleep(0.1)
+            else:
+                # Timed out - kill any runners that still have pending jobs
+                for job_class, job_runner in active_runners:
+                    if job_runner.has_pending():
+                        self._log.error(
+                            f"Timed out after {timeout_s} [s] waiting for jobs to finish. Pending jobs for {job_class.__name__} abandoned!!!"
+                        )
+                        job_runner.kill()
 
         # Drain results before shutdown
         self._summarize_runner_outputs(drain_all=True)
@@ -1173,6 +1191,10 @@ class MultiPointWorker:
             # iterate through selected modes
             try:
                 for config_idx, config in enumerate(self.selected_configurations):
+                    # Stop launching new channel acquisitions promptly on abort (graceful or immediate),
+                    # rather than grinding through every remaining channel for this position first.
+                    if self.abort_requested_fn():
+                        break
                     self._apply_channel_z_offset(config, af_succeeded)
 
                     # acquire image
@@ -1208,9 +1230,11 @@ class MultiPointWorker:
             self.update_coordinates_dataframe(region_id, z_level, acquire_pos, fov)
             self.callbacks.signal_current_fov(acquire_pos.x_mm, acquire_pos.y_mm)
 
-            # check if the acquisition should be aborted
+            # check if the acquisition should be aborted. Break out of the z-stack here; the
+            # per-FOV check in run_coordinate_acquisition() runs handle_acquisition_abort() and
+            # returns, so we avoid calling it twice.
             if self.abort_requested_fn():
-                self.handle_acquisition_abort(current_path)
+                break
 
             # update FOV counter
             self.af_fov_count = self.af_fov_count + 1
@@ -1534,7 +1558,7 @@ class MultiPointWorker:
         # This is when we know the previous image's jobs have been dispatched (and counters incremented)
         if self._backpressure.should_throttle():
             with self._timing.get_timer("backpressure.wait_for_capacity"):
-                got_capacity = self._backpressure.wait_for_capacity()
+                got_capacity = self._backpressure.wait_for_capacity(should_abort=self.abort_requested_fn)
                 if not got_capacity:
                     self._log.error(
                         f"Backpressure timeout - disk I/O cannot keep up. Stats: {self._backpressure.get_stats()}"
