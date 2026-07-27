@@ -1497,7 +1497,7 @@ class PreferencesDialog(QDialog):
         throttle_layout.addRow("Enable Throttling:", self.throttling_enabled_checkbox)
 
         self.max_pending_jobs_spinbox = QSpinBox()
-        self.max_pending_jobs_spinbox.setRange(1, 100)
+        self.max_pending_jobs_spinbox.setRange(1, 5000)
         self.max_pending_jobs_spinbox.setValue(
             self._get_config_int("GENERAL", "acquisition_max_pending_jobs", control._def.ACQUISITION_MAX_PENDING_JOBS)
         )
@@ -1508,7 +1508,7 @@ class PreferencesDialog(QDialog):
         throttle_layout.addRow("Max Pending Jobs:", self.max_pending_jobs_spinbox)
 
         self.max_pending_mb_spinbox = QDoubleSpinBox()
-        self.max_pending_mb_spinbox.setRange(100.0, 10000.0)
+        self.max_pending_mb_spinbox.setRange(100.0, 131072.0)
         self.max_pending_mb_spinbox.setSingleStep(100.0)
         self.max_pending_mb_spinbox.setValue(
             self._get_config_float("GENERAL", "acquisition_max_pending_mb", control._def.ACQUISITION_MAX_PENDING_MB)
@@ -1534,6 +1534,31 @@ class PreferencesDialog(QDialog):
             "If disk I/O cannot keep up within this time, acquisition logs a warning."
         )
         throttle_layout.addRow("Throttle Timeout:", self.throttle_timeout_spinbox)
+
+        self.target_backlog_spinbox = QDoubleSpinBox()
+        self.target_backlog_spinbox.setRange(0.0, 600.0)
+        self.target_backlog_spinbox.setSingleStep(5.0)
+        self.target_backlog_spinbox.setValue(
+            self._get_config_float("GENERAL", "acquisition_target_backlog_s", control._def.ACQUISITION_TARGET_BACKLOG_S)
+        )
+        self.target_backlog_spinbox.setSuffix(" s")
+        self.target_backlog_spinbox.setToolTip(
+            "Adaptive cap: bound the pending backlog to about this many seconds of measured\n"
+            "write throughput (Max Pending RAM is the absolute ceiling). 0 disables adaptation."
+        )
+        throttle_layout.addRow("Target Backlog:", self.target_backlog_spinbox)
+
+        self.writer_processes_spinbox = QSpinBox()
+        self.writer_processes_spinbox.setRange(1, 64)
+        self.writer_processes_spinbox.setValue(
+            self._get_config_int("GENERAL", "acquisition_writer_processes", control._def.ACQUISITION_WRITER_PROCESSES)
+        )
+        self.writer_processes_spinbox.setToolTip(
+            "Number of parallel image-writer subprocesses per save format.\n"
+            "Higher values raise disk write throughput on fast storage; use the\n"
+            "tools/benchmark_write_paths.py recommendation. Takes effect on next acquisition."
+        )
+        throttle_layout.addRow("Writer Processes:", self.writer_processes_spinbox)
 
         throttle_group.content.addLayout(throttle_layout)
         layout.addWidget(throttle_group)
@@ -1901,6 +1926,8 @@ class PreferencesDialog(QDialog):
         self.config.set("GENERAL", "acquisition_max_pending_jobs", str(self.max_pending_jobs_spinbox.value()))
         self.config.set("GENERAL", "acquisition_max_pending_mb", str(self.max_pending_mb_spinbox.value()))
         self.config.set("GENERAL", "acquisition_throttle_timeout_s", str(self.throttle_timeout_spinbox.value()))
+        self.config.set("GENERAL", "acquisition_target_backlog_s", str(self.target_backlog_spinbox.value()))
+        self.config.set("GENERAL", "acquisition_writer_processes", str(self.writer_processes_spinbox.value()))
 
         # Advanced - Position Limits
         self.config.set("SOFTWARE_POS_LIMIT", "x_positive", str(self.limit_x_pos.value()))
@@ -2048,6 +2075,8 @@ class PreferencesDialog(QDialog):
         control._def.ACQUISITION_MAX_PENDING_JOBS = self.max_pending_jobs_spinbox.value()
         control._def.ACQUISITION_MAX_PENDING_MB = self.max_pending_mb_spinbox.value()
         control._def.ACQUISITION_THROTTLE_TIMEOUT_S = self.throttle_timeout_spinbox.value()
+        control._def.ACQUISITION_TARGET_BACKLOG_S = self.target_backlog_spinbox.value()
+        control._def.ACQUISITION_WRITER_PROCESSES = self.writer_processes_spinbox.value()
 
         # Software position limits
         control._def.SOFTWARE_POS_LIMIT.X_POSITIVE = self.limit_x_pos.value()
@@ -2291,6 +2320,20 @@ class PreferencesDialog(QDialog):
         new_val = self.throttle_timeout_spinbox.value()
         if not self._floats_equal(old_val, new_val):
             changes.append(("Throttle Timeout", f"{old_val} s", f"{new_val} s", False))
+
+        old_val = self._get_config_float(
+            "GENERAL", "acquisition_target_backlog_s", control._def.ACQUISITION_TARGET_BACKLOG_S
+        )
+        new_val = self.target_backlog_spinbox.value()
+        if not self._floats_equal(old_val, new_val):
+            changes.append(("Target Backlog", f"{old_val} s", f"{new_val} s", False))
+
+        old_val = self._get_config_int(
+            "GENERAL", "acquisition_writer_processes", control._def.ACQUISITION_WRITER_PROCESSES
+        )
+        new_val = self.writer_processes_spinbox.value()
+        if old_val != new_val:
+            changes.append(("Writer Processes", str(old_val), str(new_val), False))
 
         # Advanced - Position Limits (live update)
         old_val = self._get_config_float("SOFTWARE_POS_LIMIT", "x_positive", 115)
