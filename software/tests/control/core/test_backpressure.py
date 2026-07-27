@@ -756,7 +756,7 @@ class TestMultiPointControllerCloseMethod:
         mock_job_runner = MagicMock()
         mock_job_runner.is_alive.side_effect = [True, False]
         controller.multiPointWorker = MagicMock()
-        controller.multiPointWorker._job_runners = [(SlowJob, mock_job_runner)]
+        controller.multiPointWorker._job_runners = [(SlowJob, [mock_job_runner])]
 
         MultiPointController.close(controller, timeout_s=1.0)
 
@@ -774,7 +774,7 @@ class TestMultiPointControllerCloseMethod:
         mock_job_runner = MagicMock()
         mock_job_runner.is_alive.side_effect = [True, True, False]
         controller.multiPointWorker = MagicMock()
-        controller.multiPointWorker._job_runners = [(SlowJob, mock_job_runner)]
+        controller.multiPointWorker._job_runners = [(SlowJob, [mock_job_runner])]
 
         MultiPointController.close(controller, timeout_s=1.0)
 

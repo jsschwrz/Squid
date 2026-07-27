@@ -1,12 +1,40 @@
 """Tests for the throughput-driven additions to backpressure:
 
-- cumulative captured/written counters + RateSampler, and
-- the adaptive effective byte cap.
+- cumulative captured/written counters + RateSampler,
+- the adaptive effective byte cap, and
+- MultiPointWorker format-aware writer routing.
 """
+
+import time
+from unittest.mock import MagicMock
 
 import pytest
 
+import squid.abc
 from control.core.backpressure import BackpressureController, RateSampler
+from control.core.job_processing import CaptureInfo
+from control.models import AcquisitionChannel, CameraSettings, IlluminationSettings
+
+
+def make_capture_info(region_id: str = "A1", fov: int = 0) -> CaptureInfo:
+    return CaptureInfo(
+        position=squid.abc.Pos(x_mm=0.0, y_mm=0.0, z_mm=0.0, theta_rad=None),
+        z_index=0,
+        capture_time=time.time(),
+        configuration=AcquisitionChannel(
+            name="BF LED matrix full",
+            display_color="#FFFFFF",
+            camera=1,
+            illumination_settings=IlluminationSettings(illumination_channel="LED", intensity=50.0),
+            camera_settings=CameraSettings(exposure_time_ms=10.0, gain_mode=1.0),
+            z_offset_um=0.0,
+        ),
+        save_directory="/tmp/test",
+        file_id=f"test_{fov}",
+        region_id=region_id,
+        fov=fov,
+        configuration_idx=0,
+    )
 
 
 class TestRateSampler:
@@ -111,3 +139,33 @@ class TestAdaptiveCap:
         assert c._effective_max_bytes() == int(1000.0 * 1024 * 1024)
         c.close()
 
+
+class TestWriterRouting:
+    def _worker(self, region_only):
+        w = MagicMock()
+        w._route_by_region_only = region_only
+        return w
+
+    def test_single_writer_always_zero(self):
+        from control.core.multi_point_worker import MultiPointWorker
+
+        info = make_capture_info(region_id="A1", fov=7)
+        assert MultiPointWorker._writer_index(self._worker(False), info, 1) == 0
+
+    def test_fov_level_deterministic_and_in_range(self):
+        from control.core.multi_point_worker import MultiPointWorker
+
+        w = self._worker(False)
+        info = make_capture_info(region_id="A1", fov=7)
+        idx = MultiPointWorker._writer_index(w, info, 4)
+        assert 0 <= idx < 4
+        assert idx == MultiPointWorker._writer_index(w, info, 4)  # pure function
+
+    def test_region_only_ignores_fov(self):
+        from control.core.multi_point_worker import MultiPointWorker
+
+        w = self._worker(True)
+        a = make_capture_info(region_id="B2", fov=0)
+        b = make_capture_info(region_id="B2", fov=9)
+        # 6D zarr: every FOV of a region must map to the same writer
+        assert MultiPointWorker._writer_index(w, a, 8) == MultiPointWorker._writer_index(w, b, 8)

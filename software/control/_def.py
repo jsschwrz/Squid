@@ -868,6 +868,9 @@ ACQUISITION_THROTTLE_TIMEOUT_S = 30.0  # Max wait time when throttled
 ACQUISITION_TARGET_BACKLOG_S = 30.0
 ACQUISITION_ADAPTIVE_FLOOR_MB = 1024.0  # Warmup / minimum effective cap before a write rate is known
 
+# Parallel image writers per save class (1 = legacy single-writer behavior).
+ACQUISITION_WRITER_PROCESSES = 1
+
 CAMERA_SN = {"ch 1": "SN1", "ch 2": "SN2"}  # for multiple cameras, to be overwritten in the configuration file
 
 ENABLE_STROBE_OUTPUT = False

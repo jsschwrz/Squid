@@ -1152,28 +1152,30 @@ class MultiPointController:
         except Exception:
             self._log.exception("Error stopping memory monitor during close")
 
-        # Forcefully terminate any remaining job runner processes
+        # Forcefully terminate any remaining job runner processes.
+        # _job_runners is List[(job_class, List[JobRunner])] (N parallel writers per class).
         if self.multiPointWorker is not None:
             job_runners = getattr(self.multiPointWorker, "_job_runners", [])
-            for job_class, job_runner in job_runners:
-                try:
-                    if job_runner is not None and job_runner.is_alive():
-                        self._log.warning(f"Terminating {job_class.__name__} job runner (abnormal shutdown)")
-                        job_runner.terminate()
-                        job_runner.join(timeout=self._PROCESS_TERMINATE_TIMEOUT_S)
-                        # If still alive after terminate, force kill
-                        if job_runner.is_alive():
-                            self._log.warning(f"Force killing {job_class.__name__} job runner")
-                            job_runner.kill()
+            for job_class, runners in job_runners:
+                for job_runner in runners:
+                    try:
+                        if job_runner is not None and job_runner.is_alive():
+                            self._log.warning(f"Terminating {job_class.__name__} job runner (abnormal shutdown)")
+                            job_runner.terminate()
                             job_runner.join(timeout=self._PROCESS_TERMINATE_TIMEOUT_S)
-                            # Final check - warn if zombie process remains
+                            # If still alive after terminate, force kill
                             if job_runner.is_alive():
-                                self._log.error(
-                                    f"{job_class.__name__} job runner could not be terminated - "
-                                    "zombie process may remain"
-                                )
-                except Exception:
-                    self._log.exception(f"Error terminating {job_class.__name__} job runner")
+                                self._log.warning(f"Force killing {job_class.__name__} job runner")
+                                job_runner.kill()
+                                job_runner.join(timeout=self._PROCESS_TERMINATE_TIMEOUT_S)
+                                # Final check - warn if zombie process remains
+                                if job_runner.is_alive():
+                                    self._log.error(
+                                        f"{job_class.__name__} job runner could not be terminated - "
+                                        "zombie process may remain"
+                                    )
+                    except Exception:
+                        self._log.exception(f"Error terminating {job_class.__name__} job runner")
 
             # Release backpressure controller resources to prevent semaphore leaks
             try:

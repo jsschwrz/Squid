@@ -3,6 +3,7 @@ import os
 import queue
 import threading
 import time
+import zlib
 from typing import Callable, Dict, List, NamedTuple, Optional, Tuple, Type
 from datetime import datetime
 
@@ -250,10 +251,14 @@ class MultiPointWorker:
             bp_kwargs["bp_values"] = prewarmed_bp_values
         self._backpressure = BackpressureController(**bp_kwargs)
 
-        # For now, use 1 runner per job class.  There's no real reason/rationale behind this, though.  The runners
-        # can all run any job type.  But 1 per is a reasonable arbitrary arrangement while we don't have a lot
-        # of job types.  If we have a lot of custom jobs, this could cause problems via resource hogging.
-        self._job_runners: List[Tuple[Type[Job], JobRunner]] = []
+        # N writer subprocesses per job class (ACQUISITION_WRITER_PROCESSES; 1 = legacy behavior).
+        # Work is partitioned across the N runners of a class by a stable key (see _writer_index)
+        # so two processes never write the same file/array. All runners of a class share the same
+        # backpressure/throughput counters.
+        self._job_runners: List[Tuple[Type[Job], List[JobRunner]]] = []
+        # True when the active save format uses a per-region array (6D Zarr): routing must then be
+        # by region only, not per-FOV, or parallel writers would corrupt the shared array.
+        self._route_by_region_only = False
         self._log.info(f"Acquisition.USE_MULTIPROCESSING = {Acquisition.USE_MULTIPROCESSING}")
 
         # Get the current log file path to share with subprocess workers
@@ -314,20 +319,27 @@ class MultiPointWorker:
         # IMPORTANT: Only use pre-warmed runner if BOTH runner AND backpressure values
         # are available. Using a runner without matching backpressure values would cause
         # the BackpressureController to track different counters than the JobRunner.
+        # 6D Zarr writes into one per-region array, so parallel writers must route by region only.
+        self._route_by_region_only = zarr_writer_info is not None and getattr(zarr_writer_info, "use_6d_fov", False)
+
+        num_writers = max(1, int(control._def.ACQUISITION_WRITER_PROCESSES))
+        if num_writers > 1:
+            self._log.info(f"Using {num_writers} parallel writer subprocesses per save class")
+
         can_use_prewarmed = prewarmed_job_runner is not None and prewarmed_bp_values is not None
         used_prewarmed = False
+        cleanup_done = False  # only the first freshly-created runner needs to sweep stale OME metadata
         for job_class in job_classes:
-            job_runner = None
+            runners: List[JobRunner] = []
             if Acquisition.USE_MULTIPROCESSING:
-                # Try to use pre-warmed runner for the first job class
+                # The first runner of the first class may reuse the pre-warmed subprocess.
                 if can_use_prewarmed and not used_prewarmed:
                     if prewarmed_job_runner.is_ready():
                         self._log.info(f"Using pre-warmed job runner for {job_class.__name__} jobs")
-                        job_runner = prewarmed_job_runner
-                        # Configure it with current acquisition settings
-                        job_runner.set_acquisition_info(self.acquisition_info)
+                        prewarmed_job_runner.set_acquisition_info(self.acquisition_info)
                         if zarr_writer_info:
-                            job_runner.set_zarr_writer_info(zarr_writer_info)
+                            prewarmed_job_runner.set_zarr_writer_info(zarr_writer_info)
+                        runners.append(prewarmed_job_runner)
                         used_prewarmed = True
                     else:
                         self._log.warning(
@@ -342,25 +354,54 @@ class MultiPointWorker:
                         # Don't try to use pre-warmed runner again for subsequent job classes
                         can_use_prewarmed = False
 
-                if job_runner is None:
-                    self._log.info(f"Creating job runner for {job_class.__name__} jobs")
-                    job_runner = control.core.job_processing.JobRunner(
-                        self.acquisition_info,
-                        cleanup_stale_ome_files=use_ome_tiff,
-                        log_file_path=log_file_path,
-                        # Pass backpressure shared values for cross-process tracking
-                        bp_pending_jobs=self._backpressure.pending_jobs_value,
-                        bp_pending_bytes=self._backpressure.pending_bytes_value,
-                        bp_capacity_event=self._backpressure.capacity_event,
-                        # Pass zarr writer info for ZARR_V3 format
-                        zarr_writer_info=zarr_writer_info,
+                # Create the remaining runners for this class up to num_writers.
+                while len(runners) < num_writers:
+                    do_cleanup = use_ome_tiff and not cleanup_done
+                    cleanup_done = cleanup_done or do_cleanup
+                    self._log.info(
+                        f"Creating job runner ({len(runners) + 1}/{num_writers}) for {job_class.__name__} jobs"
                     )
-                    job_runner.start()
-                    # Subprocess starts warming up in background - don't block here
+                    job_runner = self._make_job_runner(do_cleanup, log_file_path, zarr_writer_info)
+                    job_runner.start()  # Subprocess warms up in background - don't block here
+                    runners.append(job_runner)
 
-            self._job_runners.append((job_class, job_runner))
+            self._job_runners.append((job_class, runners))
         self._abort_on_failed_job = abort_on_failed_jobs
         self._first_job_dispatched = False  # Track if we've waited for subprocess warmup
+
+    def _make_job_runner(self, cleanup_stale_ome_files, log_file_path, zarr_writer_info):
+        """Construct a JobRunner wired to the shared backpressure/throughput counters."""
+        return control.core.job_processing.JobRunner(
+            self.acquisition_info,
+            cleanup_stale_ome_files=cleanup_stale_ome_files,
+            log_file_path=log_file_path,
+            # Pass backpressure shared values for cross-process tracking
+            bp_pending_jobs=self._backpressure.pending_jobs_value,
+            bp_pending_bytes=self._backpressure.pending_bytes_value,
+            bp_capacity_event=self._backpressure.capacity_event,
+            # Cumulative throughput counters (for live rate estimate)
+            bp_captured_bytes=self._backpressure.captured_bytes_value,
+            bp_written_bytes=self._backpressure.written_bytes_value,
+            bp_captured_count=self._backpressure.captured_count_value,
+            bp_written_count=self._backpressure.written_count_value,
+            # Pass zarr writer info for ZARR_V3 format
+            zarr_writer_info=zarr_writer_info,
+        )
+
+    def _writer_index(self, info: "CaptureInfo", num_writers: int) -> int:
+        """Pick which writer subprocess handles this image, deterministically.
+
+        Must be a pure function of a stable key so every plane of a stack lands in the same
+        process. Routes by (region, FOV) for per-FOV formats (OME-TIFF, 5D Zarr) and by region
+        only for 6D Zarr (whose per-region array would be corrupted by split writers).
+        """
+        if num_writers <= 1:
+            return 0
+        if self._route_by_region_only:
+            key = str(info.region_id)
+        else:
+            key = f"{info.region_id}/{info.fov}"
+        return zlib.crc32(key.encode("utf-8")) % num_writers
 
     def update_use_piezo(self, value):
         self.use_piezo = value
@@ -662,7 +703,10 @@ class MultiPointWorker:
         self._summarize_runner_outputs(drain_all=True)
 
         active_runners = [
-            (job_class, job_runner) for job_class, job_runner in self._job_runners if job_runner is not None
+            (job_class, job_runner)
+            for job_class, runners in self._job_runners
+            for job_runner in runners
+            if job_runner is not None
         ]
 
         self._log.info(f"Waiting for jobs to finish on {len(active_runners)} job runners before shutting them down...")
@@ -870,25 +914,26 @@ class MultiPointWorker:
         """
         none_failed = True
         had_results = False
-        for job_class, job_runner in self._job_runners:
-            if job_runner is None:
-                continue
-            out_queue = job_runner.output_queue()
-            if out_queue is None:
-                # Queue was cleared during shutdown
-                continue
-            while True:
-                try:
-                    job_result: JobResult = out_queue.get_nowait()
-                    none_failed = none_failed and self._summarize_job_result(job_result)
-                    had_results = True
-                    if not drain_all:
-                        break  # Only process one result per queue if not draining
-                except queue.Empty:
-                    break
-                except ValueError:
-                    # Queue was closed during shutdown - nothing more to drain
-                    break
+        for job_class, runners in self._job_runners:
+            for job_runner in runners:
+                if job_runner is None:
+                    continue
+                out_queue = job_runner.output_queue()
+                if out_queue is None:
+                    # Queue was cleared during shutdown
+                    continue
+                while True:
+                    try:
+                        job_result: JobResult = out_queue.get_nowait()
+                        none_failed = none_failed and self._summarize_job_result(job_result)
+                        had_results = True
+                        if not drain_all:
+                            break  # Only process one result per queue if not draining
+                    except queue.Empty:
+                        break
+                    except ValueError:
+                        # Queue was closed during shutdown - nothing more to drain
+                        break
 
         return SummarizeResult(none_failed=none_failed, had_results=had_results)
 
@@ -1407,23 +1452,27 @@ class MultiPointWorker:
                 with self._timing.get_timer("job creation and dispatch"):
                     # Wait for subprocess to be ready before first dispatch
                     if not self._first_job_dispatched:
-                        for job_class, job_runner in self._job_runners:
-                            if job_runner is not None:
-                                t_wait_start = time.perf_counter()
-                                if job_runner.wait_ready(timeout_s=10.0):
-                                    t_wait_end = time.perf_counter()
-                                    wait_ms = (t_wait_end - t_wait_start) * 1000
-                                    if wait_ms > 10:  # Only log if we actually had to wait
-                                        self._log.info(f"Job runner ready (waited {wait_ms:.0f}ms for subprocess)")
-                                else:
-                                    self._log.warning(f"Job runner for {job_class.__name__} not ready after 10s")
+                        for job_class, runners in self._job_runners:
+                            for job_runner in runners:
+                                if job_runner is not None:
+                                    t_wait_start = time.perf_counter()
+                                    if job_runner.wait_ready(timeout_s=10.0):
+                                        t_wait_end = time.perf_counter()
+                                        wait_ms = (t_wait_end - t_wait_start) * 1000
+                                        if wait_ms > 10:  # Only log if we actually had to wait
+                                            self._log.info(f"Job runner ready (waited {wait_ms:.0f}ms for subprocess)")
+                                    else:
+                                        self._log.warning(f"Job runner for {job_class.__name__} not ready after 10s")
                         self._first_job_dispatched = True
 
-                    for job_class, job_runner in self._job_runners:
+                    for job_class, runners in self._job_runners:
                         job = self._create_job(job_class, info, image)
                         if job is None:
                             continue  # Skip if job creation returns None (e.g., downsampled views disabled for this image)
-                        if job_runner is not None:
+                        if runners:
+                            # Route to a writer by a stable key so all planes of a stack (and, for
+                            # 6D Zarr, all FOVs of a region) land in the same process.
+                            job_runner = runners[self._writer_index(info, len(runners))]
                             if not job_runner.dispatch(job):
                                 self._log.error("Failed to dispatch multiprocessing job!")
                                 self._abort_due_to_error()
