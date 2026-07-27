@@ -15709,9 +15709,14 @@ class BackpressureMonitorWidget(QWidget):
         fm = QFontMetrics(self.font())
         self.label_jobs = self._create_value_label(fm.horizontalAdvance("888/888 jobs"))
         self.label_bytes = self._create_value_label(fm.horizontalAdvance("8888.8/8888.8 MB"))
+        # Live throughput: capture (read from camera) vs write (to disk) MB/s, and their ratio.
+        self.label_throughput = self._create_value_label(fm.horizontalAdvance("R:8888 W:8888 MB/s"))
+        self.label_ratio = self._create_value_label(fm.horizontalAdvance("ratio 88.88"))
 
         self.label_separator = QLabel("|")
         self.label_separator.setStyleSheet("color: #666;")
+        self.label_separator2 = QLabel("|")
+        self.label_separator2.setStyleSheet("color: #666;")
 
         self.label_throttled = QLabel("")
         self.label_throttled.setStyleSheet("color: #e74c3c; font-weight: bold;")
@@ -15720,6 +15725,9 @@ class BackpressureMonitorWidget(QWidget):
         layout.addWidget(self.label_jobs)
         layout.addWidget(self.label_separator)
         layout.addWidget(self.label_bytes)
+        layout.addWidget(self.label_separator2)
+        layout.addWidget(self.label_throughput)
+        layout.addWidget(self.label_ratio)
         layout.addWidget(self.label_throttled)
 
     def _create_value_label(self, width: int) -> QLabel:
@@ -15758,6 +15766,9 @@ class BackpressureMonitorWidget(QWidget):
         self._throttle_sticky_counter = 0
         self.label_jobs.setText("--")
         self.label_bytes.setText("--")
+        self.label_throughput.setText("--")
+        self.label_ratio.setText("--")
+        self.label_ratio.setStyleSheet("")
         self.label_throttled.setText("")
 
     def _update_display(self) -> None:
@@ -15770,6 +15781,18 @@ class BackpressureMonitorWidget(QWidget):
 
             self.label_jobs.setText(f"{stats.pending_jobs}/{stats.max_pending_jobs} jobs")
             self.label_bytes.setText(f"{stats.pending_bytes_mb:.1f}/{stats.max_pending_mb:.1f} MB")
+
+            # Live capture (read) vs write throughput, and their ratio. A sustained ratio
+            # below ~1 means writes can't keep up and the backlog is growing.
+            self.label_throughput.setText(f"R:{stats.capture_mb_s:.0f} W:{stats.write_mb_s:.0f} MB/s")
+            if stats.capture_mb_s > 0.5 and stats.write_mb_s > 0.0:
+                ratio = stats.write_mb_s / stats.capture_mb_s
+                self.label_ratio.setText(f"ratio {ratio:.2f}")
+                # Red when writes lag capture (backlog growing), matching the throttle indicator.
+                self.label_ratio.setStyleSheet("color: #e74c3c; font-weight: bold;" if ratio < 0.95 else "")
+            else:
+                self.label_ratio.setText("ratio --")
+                self.label_ratio.setStyleSheet("")
 
             # Sticky throttle indicator: stays visible for THROTTLE_STICKY_CYCLES after release
             if stats.is_throttled:
