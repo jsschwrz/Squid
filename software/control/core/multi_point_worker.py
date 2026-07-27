@@ -1557,12 +1557,22 @@ class MultiPointWorker:
         # Backpressure check AFTER previous frame dispatched, BEFORE next trigger
         # This is when we know the previous image's jobs have been dispatched (and counters incremented)
         if self._backpressure.should_throttle():
+            # In software-trigger mode the illumination was switched on above in preparation
+            # for this frame. A throttle pause can last up to the backpressure timeout, so turn
+            # the illumination off while we wait for resources to avoid needlessly exposing (and
+            # photobleaching) the sample, then turn it back on before we proceed to the trigger.
+            throttle_illumination_off = self.liveController.trigger_mode == TriggerMode.SOFTWARE
+            if throttle_illumination_off:
+                self.liveController.turn_off_illumination()
             with self._timing.get_timer("backpressure.wait_for_capacity"):
                 got_capacity = self._backpressure.wait_for_capacity(should_abort=self.abort_requested_fn)
                 if not got_capacity:
                     self._log.error(
                         f"Backpressure timeout - disk I/O cannot keep up. Stats: {self._backpressure.get_stats()}"
                     )
+            if throttle_illumination_off:
+                self.liveController.turn_on_illumination()
+                self.wait_till_operation_is_completed()
 
         with self._timing.get_timer("get_ready_for_trigger re-check"):
             # This should be a noop - we have the frame already.  Still, check!
