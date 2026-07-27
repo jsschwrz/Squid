@@ -272,6 +272,10 @@ class MultiPointController:
             bp_pending_jobs=self._prewarmed_bp_values[0],
             bp_pending_bytes=self._prewarmed_bp_values[1],
             bp_capacity_event=self._prewarmed_bp_values[2],
+            bp_captured_bytes=self._prewarmed_bp_values[3],
+            bp_written_bytes=self._prewarmed_bp_values[4],
+            bp_captured_count=self._prewarmed_bp_values[5],
+            bp_written_count=self._prewarmed_bp_values[6],
         )
         self._prewarmed_job_runner.start()
 

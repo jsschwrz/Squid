@@ -766,6 +766,11 @@ class JobRunner(multiprocessing.Process):
         bp_pending_jobs: Optional[multiprocessing.Value] = None,
         bp_pending_bytes: Optional[multiprocessing.Value] = None,
         bp_capacity_event: Optional[multiprocessing.Event] = None,
+        # Cumulative throughput counters (shared with BackpressureController)
+        bp_captured_bytes: Optional[multiprocessing.Value] = None,
+        bp_written_bytes: Optional[multiprocessing.Value] = None,
+        bp_captured_count: Optional[multiprocessing.Value] = None,
+        bp_written_count: Optional[multiprocessing.Value] = None,
         # Zarr writer info (for ZARR_V3 saving)
         zarr_writer_info: Optional[ZarrWriterInfo] = None,
     ):
@@ -792,6 +797,13 @@ class JobRunner(multiprocessing.Process):
         self._bp_pending_jobs = bp_pending_jobs
         self._bp_pending_bytes = bp_pending_bytes
         self._bp_capacity_event = bp_capacity_event
+        # Cumulative, increment-only throughput counters (shared with BackpressureController).
+        # captured_* increments on dispatch, written_* on completion; their delta over time
+        # is the live capture/write throughput used by the adaptive cap and dynamic drain.
+        self._bp_captured_bytes = bp_captured_bytes
+        self._bp_written_bytes = bp_written_bytes
+        self._bp_captured_count = bp_captured_count
+        self._bp_written_count = bp_written_count
 
         # Clean up stale metadata files from previous crashed acquisitions
         # Only run when explicitly requested (i.e., when OME-TIFF saving is being used)
@@ -836,6 +848,14 @@ class JobRunner(multiprocessing.Process):
                 self._bp_pending_jobs.value += 1
             with self._bp_pending_bytes.get_lock():
                 self._bp_pending_bytes.value += image_bytes
+        # Cumulative captured counters: increment-only, NOT rolled back on enqueue failure
+        # (semantics: "images handed to the writer subsystem"). Used for the capture-rate estimate.
+        if self._bp_captured_bytes is not None:
+            with self._bp_captured_bytes.get_lock():
+                self._bp_captured_bytes.value += image_bytes
+        if self._bp_captured_count is not None:
+            with self._bp_captured_count.get_lock():
+                self._bp_captured_count.value += 1
 
         try:
             self._input_queue.put_nowait(job)
@@ -1019,6 +1039,15 @@ class JobRunner(multiprocessing.Process):
                             image_bytes = job.capture_image.image_array.nbytes
                             with self._bp_pending_bytes.get_lock():
                                 self._bp_pending_bytes.value = max(0, self._bp_pending_bytes.value - image_bytes)
+                            # Cumulative written counters (increment-only) for the write-rate estimate.
+                            # Fires exactly once per completed job, same cardinality as the pending
+                            # decrement, so there is no double-count.
+                            if self._bp_written_bytes is not None:
+                                with self._bp_written_bytes.get_lock():
+                                    self._bp_written_bytes.value += image_bytes
+                            if self._bp_written_count is not None:
+                                with self._bp_written_count.get_lock():
+                                    self._bp_written_count.value += 1
 
                         # Signal capacity available for all job completions
                         if self._bp_capacity_event is not None:

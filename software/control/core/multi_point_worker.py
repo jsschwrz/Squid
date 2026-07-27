@@ -241,6 +241,10 @@ class MultiPointWorker:
             "max_mb": control._def.ACQUISITION_MAX_PENDING_MB,
             "timeout_s": control._def.ACQUISITION_THROTTLE_TIMEOUT_S,
             "enabled": control._def.ACQUISITION_THROTTLING_ENABLED,
+            # Adaptive cap: bound backlog to ~target_backlog_s of measured write throughput,
+            # with max_mb as the absolute ceiling and floor_mb as the warmup minimum.
+            "target_backlog_s": control._def.ACQUISITION_TARGET_BACKLOG_S,
+            "floor_mb": control._def.ACQUISITION_ADAPTIVE_FLOOR_MB,
         }
         if prewarmed_bp_values is not None:
             bp_kwargs["bp_values"] = prewarmed_bp_values
