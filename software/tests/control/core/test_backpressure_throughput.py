@@ -169,3 +169,65 @@ class TestWriterRouting:
         b = make_capture_info(region_id="B2", fov=9)
         # 6D zarr: every FOV of a region must map to the same writer
         assert MultiPointWorker._writer_index(w, a, 8) == MultiPointWorker._writer_index(w, b, 8)
+
+
+class TestJobRunnerWarmupOffFramePath:
+    """Writer-subprocess warmup must not block the image callback.
+
+    The image callback sets _ready_for_next_trigger; the acquisition thread only allows
+    5 * total_frame_time + 2 seconds for a frame. Waiting for a cold subprocess inside
+    the callback pushed the first frame past that deadline and aborted the run whenever
+    ACQUISITION_WRITER_PROCESSES > 1 (only the first runner is pre-warmed).
+    """
+
+    def test_wait_ready_is_not_called_from_image_callback(self):
+        import inspect
+
+        from control.core.multi_point_worker import MultiPointWorker
+
+        callback_src = inspect.getsource(MultiPointWorker._image_callback)
+        assert "wait_ready" not in callback_src, (
+            "wait_ready() must not be called from _image_callback -- it blocks frame "
+            "delivery and trips the frame-arrival timeout."
+        )
+
+    def test_warmup_helper_waits_for_every_runner(self):
+        from control.core.multi_point_worker import MultiPointWorker
+
+        class FakeRunner:
+            def __init__(self, ready=True):
+                self.ready = ready
+                self.calls = 0
+
+            def wait_ready(self, timeout_s):
+                self.calls += 1
+                return self.ready
+
+        runners = [FakeRunner(), FakeRunner(), FakeRunner()]
+        worker = MagicMock()
+        worker._job_runners = [(SlowJobStub, runners)]
+        worker._log = MagicMock()
+
+        MultiPointWorker._wait_for_job_runners_ready(worker, timeout_s=5.0)
+
+        # Every runner is waited on exactly once, including a None entry being skipped.
+        assert [r.calls for r in runners] == [1, 1, 1]
+
+    def test_unready_runner_does_not_raise(self):
+        from control.core.multi_point_worker import MultiPointWorker
+
+        class NeverReady:
+            def wait_ready(self, timeout_s):
+                return False
+
+        worker = MagicMock()
+        worker._job_runners = [(SlowJobStub, [NeverReady(), None])]
+        worker._log = MagicMock()
+
+        # A runner that never comes up is logged and skipped, not fatal.
+        MultiPointWorker._wait_for_job_runners_ready(worker, timeout_s=0.01)
+        assert worker._log.warning.called
+
+
+class SlowJobStub:
+    __name__ = "SlowJobStub"

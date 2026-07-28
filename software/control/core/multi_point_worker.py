@@ -371,7 +371,6 @@ class MultiPointWorker:
 
             self._job_runners.append((job_class, runners))
         self._abort_on_failed_job = abort_on_failed_jobs
-        self._first_job_dispatched = False  # Track if we've waited for subprocess warmup
 
     def _make_job_runner(self, cleanup_stale_ome_files, log_file_path, zarr_writer_info):
         """Construct a JobRunner wired to the shared backpressure/throughput counters."""
@@ -506,11 +505,46 @@ class MultiPointWorker:
             return "completed_with_errors"
         return "completed"
 
+    def _wait_for_job_runners_ready(self, timeout_s: float = 30.0) -> None:
+        """Block until every writer subprocess is up, BEFORE the first trigger is sent.
+
+        This must not happen on the frame-delivery path. The image callback is what sets
+        _ready_for_next_trigger, and the acquisition thread only allows
+        5 * total_frame_time + 2 seconds for a frame to arrive. Waiting for a cold
+        subprocess inside the callback therefore stalls frame delivery past that deadline
+        and aborts the run: with ACQUISITION_WRITER_PROCESSES=4 only the first runner is
+        pre-warmed, so the callback blocked ~5 s spawning the other three and the very
+        first frame timed out.
+
+        The per-runner budget is generous because this is a one-off startup cost paid off
+        the critical path; a runner that is still not ready is left to warm up on its own
+        rather than blocking the run further (dispatch queues to it regardless).
+        """
+        deadline = time.time() + timeout_s
+        for job_class, runners in self._job_runners:
+            for job_runner in runners:
+                if job_runner is None:
+                    continue
+                remaining = max(0.0, deadline - time.time())
+                t_start = time.perf_counter()
+                if job_runner.wait_ready(timeout_s=remaining):
+                    wait_ms = (time.perf_counter() - t_start) * 1000
+                    if wait_ms > 10:  # Only log if we actually had to wait
+                        self._log.info(f"Job runner ready (waited {wait_ms:.0f}ms for subprocess)")
+                else:
+                    self._log.warning(
+                        f"Job runner for {job_class.__name__} not ready after {timeout_s:.0f}s; "
+                        "continuing anyway (it will finish warming up in the background)."
+                    )
+
     def run(self):
         this_image_callback_id = None
         self._run_state_fatal = False
         try:
             start_time = time.perf_counter_ns()
+            # Pay the writer-subprocess warmup cost here, before any trigger is sent, so it
+            # can never stall the image callback and trip the frame-arrival timeout.
+            self._wait_for_job_runners_ready()
             self.camera.start_streaming()
             this_image_callback_id = self.camera.add_frame_callback(self._image_callback)
             sleep_time = min(self.dt / 20.0, 0.5)
@@ -1475,20 +1509,6 @@ class MultiPointWorker:
 
                 with self._timing.get_timer("job creation and dispatch"):
                     # Wait for subprocess to be ready before first dispatch
-                    if not self._first_job_dispatched:
-                        for job_class, runners in self._job_runners:
-                            for job_runner in runners:
-                                if job_runner is not None:
-                                    t_wait_start = time.perf_counter()
-                                    if job_runner.wait_ready(timeout_s=10.0):
-                                        t_wait_end = time.perf_counter()
-                                        wait_ms = (t_wait_end - t_wait_start) * 1000
-                                        if wait_ms > 10:  # Only log if we actually had to wait
-                                            self._log.info(f"Job runner ready (waited {wait_ms:.0f}ms for subprocess)")
-                                    else:
-                                        self._log.warning(f"Job runner for {job_class.__name__} not ready after 10s")
-                        self._first_job_dispatched = True
-
                     for job_class, runners in self._job_runners:
                         job = self._create_job(job_class, info, image)
                         if job is None:
