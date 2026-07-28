@@ -67,6 +67,30 @@ if __name__ == "__main__":
     # QMessageBox before any other startup side effects (logging, migration).
     app = QApplication(["Squid"])
     app.setStyle("Fusion")
+
+    # Qt 6.5+ follows the Windows dark-mode setting; PyQt5 did not. On a machine with
+    # dark mode enabled that flips the palette dark, which makes the buttons that
+    # hardcode a light background (and any widget Qt colours from the palette alone,
+    # e.g. plain QDoubleSpinBox) unreadable light-on-light. Pin the scheme so the GUI
+    # looks the same regardless of the OS setting. See GUI_COLOR_SCHEME in _def.py.
+    try:
+        _scheme = str(control._def.GUI_COLOR_SCHEME).strip().lower()
+        _scheme_enum = {
+            "light": Qt.ColorScheme.Light,
+            "dark": Qt.ColorScheme.Dark,
+            "system": Qt.ColorScheme.Unknown,  # Unknown == "follow the OS"
+        }.get(_scheme)
+        if _scheme_enum is None:
+            squid.logging.get_logger("main_hcs").warning(
+                f"Unknown GUI_COLOR_SCHEME={control._def.GUI_COLOR_SCHEME!r}; falling back to light."
+            )
+            _scheme_enum = Qt.ColorScheme.Light
+        app.styleHints().setColorScheme(_scheme_enum)
+    except AttributeError:
+        # setColorScheme() needs Qt 6.8+. Older Qt just keeps the OS default.
+        squid.logging.get_logger("main_hcs").warning(
+            "Qt too old for setColorScheme(); GUI will follow the OS colour scheme."
+        )
     app.setWindowIcon(QIcon("icon/cephla_logo.ico"))
 
     # Single-instance check before file logging or migration so a losing
