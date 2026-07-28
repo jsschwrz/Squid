@@ -3,7 +3,6 @@ import os
 import queue
 import threading
 import time
-import zlib
 from typing import Callable, Dict, List, NamedTuple, Optional, Tuple, Type
 from datetime import datetime
 
@@ -280,6 +279,8 @@ class MultiPointWorker:
         # True when the active save format uses a per-region array (6D Zarr): routing must then be
         # by region only, not per-FOV, or parallel writers would corrupt the shared array.
         self._route_by_region_only = False
+        # routing key -> writer index, assigned round-robin on first sight (see _writer_index).
+        self._writer_assignments: Dict[str, int] = {}
         self._log.info(f"Acquisition.USE_MULTIPROCESSING = {Acquisition.USE_MULTIPROCESSING}")
 
         # Get the current log file path to share with subprocess workers
@@ -409,19 +410,35 @@ class MultiPointWorker:
         )
 
     def _writer_index(self, info: "CaptureInfo", num_writers: int) -> int:
-        """Pick which writer subprocess handles this image, deterministically.
+        """Pick which writer subprocess handles this image.
 
-        Must be a pure function of a stable key so every plane of a stack lands in the same
-        process. Routes by (region, FOV) for per-FOV formats (OME-TIFF, 5D Zarr) and by region
-        only for 6D Zarr (whose per-region array would be corrupted by split writers).
+        Every plane of a stack must land in the same process, because an OME-TIFF stack is
+        a single file the planes memmap into. The routing key is therefore (region, FOV) for
+        per-FOV formats (OME-TIFF, 5D Zarr), or the region alone for 6D Zarr, whose
+        per-region array would be corrupted by split writers.
+
+        Keys are assigned to writers round-robin in first-seen order, NOT by hashing. Hashing
+        distributes well only over many keys; over the handful an acquisition actually has it
+        is just an arbitrary assignment, and collisions leave writers idle while others carry
+        double load. Observed with crc32 on a 4-FOV run with 4 writers:
+
+            FOV 0 -> 3, FOV 1 -> 1, FOV 2 -> 3, FOV 3 -> 1   (writers 0 and 2 never used)
+
+        One of the two loaded writers could not finish and its backlog was abandoned at the
+        drain, losing 34 of 37 planes of one FOV. Round-robin spreads K keys evenly over
+        min(K, num_writers) writers by construction.
+
+        Assignment is stable within a run (memoised per key) and reproducible across a run
+        because FOVs are visited in a deterministic order.
         """
         if num_writers <= 1:
             return 0
-        if self._route_by_region_only:
-            key = str(info.region_id)
-        else:
-            key = f"{info.region_id}/{info.fov}"
-        return zlib.crc32(key.encode("utf-8")) % num_writers
+        key = str(info.region_id) if self._route_by_region_only else f"{info.region_id}/{info.fov}"
+        index = self._writer_assignments.get(key)
+        if index is None:
+            index = len(self._writer_assignments) % num_writers
+            self._writer_assignments[key] = index
+        return index
 
     def update_use_piezo(self, value):
         self.use_piezo = value

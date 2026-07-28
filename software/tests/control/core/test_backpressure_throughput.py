@@ -144,6 +144,7 @@ class TestWriterRouting:
     def _worker(self, region_only):
         w = MagicMock()
         w._route_by_region_only = region_only
+        w._writer_assignments = {}
         return w
 
     def test_single_writer_always_zero(self):
@@ -290,3 +291,61 @@ class TestSpanFloor:
         c.job_dispatched(img)
         assert c._effective_max_bytes() == int(2048.0 * 1024 * 1024)
         c.close()
+
+
+class TestWriterRoutingBalance:
+    """Routing must spread FOVs evenly, not hash them.
+
+    crc32 % num_writers distributes well only over many keys. On a real 4-FOV run with
+    4 writers it produced FOV0->3, FOV1->1, FOV2->3, FOV3->1: writers 0 and 2 idle,
+    the other two double-loaded. One could not finish and 34 of 37 planes of a FOV were
+    abandoned at the drain.
+    """
+
+    def _worker(self, region_only=False):
+        w = MagicMock()
+        w._route_by_region_only = region_only
+        w._writer_assignments = {}
+        return w
+
+    def _assign(self, worker, n_fovs, n_writers, region="current"):
+        from control.core.multi_point_worker import MultiPointWorker
+
+        return [
+            MultiPointWorker._writer_index(worker, make_capture_info(region_id=region, fov=f), n_writers)
+            for f in range(n_fovs)
+        ]
+
+    def test_four_fovs_use_all_four_writers(self):
+        # The exact configuration that lost data.
+        assert sorted(self._assign(self._worker(), 4, 4)) == [0, 1, 2, 3]
+
+    def test_no_writer_idle_when_fovs_at_least_writers(self):
+        for n_writers in (2, 3, 4, 8):
+            for n_fovs in (n_writers, n_writers * 3):
+                idx = self._assign(self._worker(), n_fovs, n_writers)
+                assert set(idx) == set(range(n_writers)), f"idle writer at {n_fovs} FOVs / {n_writers} writers"
+
+    def test_load_is_balanced_within_one_fov(self):
+        from collections import Counter
+
+        counts = Counter(self._assign(self._worker(), 37, 4))
+        assert max(counts.values()) - min(counts.values()) <= 1
+
+    def test_assignment_is_stable_for_repeated_key(self):
+        # Every plane of a stack re-derives the index and must get the same writer.
+        w = self._worker()
+        info = make_capture_info(region_id="current", fov=2)
+        from control.core.multi_point_worker import MultiPointWorker
+
+        first = MultiPointWorker._writer_index(w, info, 4)
+        for _ in range(37):
+            assert MultiPointWorker._writer_index(w, info, 4) == first
+
+    def test_region_only_routing_still_collapses_fovs(self):
+        # 6D Zarr: all FOVs of a region share one array, so they must share one writer.
+        w = self._worker(region_only=True)
+        assert len(set(self._assign(w, 6, 4))) == 1
+
+    def test_single_writer_always_zero(self):
+        assert self._assign(self._worker(), 5, 1) == [0, 0, 0, 0, 0]
