@@ -3,11 +3,12 @@ import argparse
 import logging
 import os
 
-os.environ["QT_API"] = "pyqt5"
+os.environ["QT_API"] = "pyqt6"
 import signal
 import sys
 
 # qt libraries
+from qtpy.QtCore import Qt
 from qtpy.QtWidgets import *
 from qtpy.QtGui import *
 
@@ -54,10 +55,42 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
+    # This GUI embeds several napari viewers (Live, Multichannel, Mosaic), each
+    # backed by its own vispy/OpenGL canvas, in a single process. Multiple vispy
+    # canvases must share one OpenGL context or vispy misroutes GLIR draw commands
+    # between them and rendering fails with "Cannot SIZE object N because it does
+    # not exist" (the mosaic image never appears). This attribute MUST be set
+    # before the QApplication is constructed. See napari's multiple-viewer example.
+    QApplication.setAttribute(Qt.ApplicationAttribute.AA_ShareOpenGLContexts, True)
+
     # Construct QApplication first so the single-instance check can show a
     # QMessageBox before any other startup side effects (logging, migration).
     app = QApplication(["Squid"])
     app.setStyle("Fusion")
+
+    # Qt 6.5+ follows the Windows dark-mode setting; PyQt5 did not. On a machine with
+    # dark mode enabled that flips the palette dark, which makes the buttons that
+    # hardcode a light background (and any widget Qt colours from the palette alone,
+    # e.g. plain QDoubleSpinBox) unreadable light-on-light. Pin the scheme so the GUI
+    # looks the same regardless of the OS setting. See GUI_COLOR_SCHEME in _def.py.
+    try:
+        _scheme = str(control._def.GUI_COLOR_SCHEME).strip().lower()
+        _scheme_enum = {
+            "light": Qt.ColorScheme.Light,
+            "dark": Qt.ColorScheme.Dark,
+            "system": Qt.ColorScheme.Unknown,  # Unknown == "follow the OS"
+        }.get(_scheme)
+        if _scheme_enum is None:
+            squid.logging.get_logger("main_hcs").warning(
+                f"Unknown GUI_COLOR_SCHEME={control._def.GUI_COLOR_SCHEME!r}; falling back to light."
+            )
+            _scheme_enum = Qt.ColorScheme.Light
+        app.styleHints().setColorScheme(_scheme_enum)
+    except AttributeError:
+        # setColorScheme() needs Qt 6.8+. Older Qt just keeps the OS default.
+        squid.logging.get_logger("main_hcs").warning(
+            "Qt too old for setColorScheme(); GUI will follow the OS colour scheme."
+        )
     app.setWindowIcon(QIcon("icon/cephla_logo.ico"))
 
     # Single-instance check before file logging or migration so a losing

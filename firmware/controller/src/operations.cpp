@@ -505,8 +505,12 @@ void do_focus_control()
     focusPosition = Z_POS_LIMIT;
   if (focusPosition < Z_NEG_LIMIT)
     focusPosition = Z_NEG_LIMIT;
-  if (is_homing_Z == false && is_preparing_for_homing_Z == false)
+  static int32_t last_focusPosition = 0;
+  if (focusPosition != last_focusPosition && is_homing_Z == false && is_preparing_for_homing_Z == false)
+  {
     tmc4361A_moveTo(&tmc4361[z], focusPosition);
+    last_focusPosition = focusPosition;
+  }
 }
 
 void check_position()

@@ -860,8 +860,16 @@ SIMULATE_LASER_AF_CAMERA = False  # Laser autofocus camera
 # Prevents RAM exhaustion when acquisition speed exceeds disk write speed
 ACQUISITION_THROTTLING_ENABLED = True
 ACQUISITION_MAX_PENDING_JOBS = 10  # Max jobs in flight before throttling
-ACQUISITION_MAX_PENDING_MB = 2000.0  # Max pending MB before throttling
+ACQUISITION_MAX_PENDING_MB = 2000.0  # Absolute ceiling on pending MB (adaptive cap stays below this)
 ACQUISITION_THROTTLE_TIMEOUT_S = 30.0  # Max wait time when throttled
+
+# Adaptive backpressure cap: bound the pending backlog to ~this many seconds of measured
+# write throughput (write_mb_s * target). 0 disables adaptation (static ACQUISITION_MAX_PENDING_MB).
+ACQUISITION_TARGET_BACKLOG_S = 30.0
+ACQUISITION_ADAPTIVE_FLOOR_MB = 1024.0  # Warmup / minimum effective cap before a write rate is known
+
+# Parallel image writers per save class (1 = legacy single-writer behavior).
+ACQUISITION_WRITER_PROCESSES = 1
 
 CAMERA_SN = {"ch 1": "SN1", "ch 2": "SN2"}  # for multiple cameras, to be overwritten in the configuration file
 
@@ -997,6 +1005,18 @@ LIVE_ONLY_MODE = False
 # NDViewer integration
 ENABLE_NDVIEWER = False
 MOSAIC_VIEW_TARGET_PIXEL_SIZE_UM = 2
+
+# Qt 6.5+ follows the Windows "app mode" setting, so on a machine with dark mode enabled
+# the whole GUI flips to a dark palette. PyQt5 ignored that setting entirely, so the app's
+# styling was only ever exercised against a light palette: several buttons hardcode light
+# background colours without setting a text colour, and widgets Qt styles from the palette
+# alone (plain QDoubleSpinBox / QLineEdit) end up light-on-light and unreadable.
+#
+# Pin the scheme so appearance does not depend on an OS setting. "light" matches how the
+# app looked under PyQt5; "dark" and "system" are honoured for anyone who wants them, but
+# note the hardcoded button colours are only legible in light. Override in the [GENERAL]
+# section of the machine .ini with gui_color_scheme = dark.
+GUI_COLOR_SCHEME = "light"
 
 # Downsampled-view auto-save settings. Each flag independently controls one
 # output of the unified mosaic widget's save path:

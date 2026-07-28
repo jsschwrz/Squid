@@ -16,6 +16,7 @@ import squid.abc
 from control.core.backpressure import (
     BackpressureController,
     BackpressureStats,
+    RateSampler,
     create_backpressure_values,
 )
 from control.core.job_processing import (
@@ -328,7 +329,7 @@ class TestBackpressureController:
     def test_constructor_with_bp_values_uses_provided_values(self):
         """Constructor uses pre-created bp_values instead of creating new ones."""
         bp_values = create_backpressure_values()
-        jobs, bytes_, event = bp_values
+        jobs, bytes_, event = bp_values[:3]
 
         controller = BackpressureController(max_jobs=10, max_mb=500.0, bp_values=bp_values)
 
@@ -490,6 +491,10 @@ def _create_runner_with_backpressure(controller: BackpressureController) -> JobR
         bp_pending_jobs=controller.pending_jobs_value,
         bp_pending_bytes=controller.pending_bytes_value,
         bp_capacity_event=controller.capacity_event,
+        bp_captured_bytes=controller.captured_bytes_value,
+        bp_written_bytes=controller.written_bytes_value,
+        bp_captured_count=controller.captured_count_value,
+        bp_written_count=controller.written_count_value,
     )
 
 
@@ -751,7 +756,7 @@ class TestMultiPointControllerCloseMethod:
         mock_job_runner = MagicMock()
         mock_job_runner.is_alive.side_effect = [True, False]
         controller.multiPointWorker = MagicMock()
-        controller.multiPointWorker._job_runners = [(SlowJob, mock_job_runner)]
+        controller.multiPointWorker._job_runners = [(SlowJob, [mock_job_runner])]
 
         MultiPointController.close(controller, timeout_s=1.0)
 
@@ -769,7 +774,7 @@ class TestMultiPointControllerCloseMethod:
         mock_job_runner = MagicMock()
         mock_job_runner.is_alive.side_effect = [True, True, False]
         controller.multiPointWorker = MagicMock()
-        controller.multiPointWorker._job_runners = [(SlowJob, mock_job_runner)]
+        controller.multiPointWorker._job_runners = [(SlowJob, [mock_job_runner])]
 
         MultiPointController.close(controller, timeout_s=1.0)
 

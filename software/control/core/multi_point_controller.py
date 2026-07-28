@@ -272,6 +272,10 @@ class MultiPointController:
             bp_pending_jobs=self._prewarmed_bp_values[0],
             bp_pending_bytes=self._prewarmed_bp_values[1],
             bp_capacity_event=self._prewarmed_bp_values[2],
+            bp_captured_bytes=self._prewarmed_bp_values[3],
+            bp_written_bytes=self._prewarmed_bp_values[4],
+            bp_captured_count=self._prewarmed_bp_values[5],
+            bp_written_count=self._prewarmed_bp_values[6],
         )
         self._prewarmed_job_runner.start()
 
@@ -757,6 +761,7 @@ class MultiPointController:
             self._log.info(f"region centers: {scan_position_information.scan_region_coords_mm}")
 
             self.abort_acqusition_requested = False
+            self.abort_now_requested = False
 
             self.configuration_before_running_multipoint = self.liveController.currentConfiguration
             # stop live
@@ -933,6 +938,7 @@ class MultiPointController:
                     acquisition_parameters=acquisition_params,
                     callbacks=updated_callbacks,
                     abort_requested_fn=lambda: self.abort_acqusition_requested,
+                    abort_now_requested_fn=lambda: self.abort_now_requested,
                     request_abort_fn=self.request_abort_aquisition,
                     extra_job_classes=[],
                     alignment_widget=self._alignment_widget,
@@ -1073,6 +1079,14 @@ class MultiPointController:
     def request_abort_aquisition(self):
         self.abort_acqusition_requested = True
 
+    def request_abort_now(self):
+        """Immediate abort: stop as soon as possible and discard any queued, unsaved images
+        for this run. Sets the graceful abort flag too, so all existing abort checkpoints also
+        trip; the abort_now flag additionally skips the job-drain wait and kills the runners.
+        """
+        self.abort_acqusition_requested = True
+        self.abort_now_requested = True
+
     def validate_acquisition_settings(self) -> bool:
         """Validate settings before starting acquisition"""
         if self.do_reflection_af and not self.laserAutoFocusController.laser_af_properties.has_reference:
@@ -1148,28 +1162,30 @@ class MultiPointController:
         except Exception:
             self._log.exception("Error stopping memory monitor during close")
 
-        # Forcefully terminate any remaining job runner processes
+        # Forcefully terminate any remaining job runner processes.
+        # _job_runners is List[(job_class, List[JobRunner])] (N parallel writers per class).
         if self.multiPointWorker is not None:
             job_runners = getattr(self.multiPointWorker, "_job_runners", [])
-            for job_class, job_runner in job_runners:
-                try:
-                    if job_runner is not None and job_runner.is_alive():
-                        self._log.warning(f"Terminating {job_class.__name__} job runner (abnormal shutdown)")
-                        job_runner.terminate()
-                        job_runner.join(timeout=self._PROCESS_TERMINATE_TIMEOUT_S)
-                        # If still alive after terminate, force kill
-                        if job_runner.is_alive():
-                            self._log.warning(f"Force killing {job_class.__name__} job runner")
-                            job_runner.kill()
+            for job_class, runners in job_runners:
+                for job_runner in runners:
+                    try:
+                        if job_runner is not None and job_runner.is_alive():
+                            self._log.warning(f"Terminating {job_class.__name__} job runner (abnormal shutdown)")
+                            job_runner.terminate()
                             job_runner.join(timeout=self._PROCESS_TERMINATE_TIMEOUT_S)
-                            # Final check - warn if zombie process remains
+                            # If still alive after terminate, force kill
                             if job_runner.is_alive():
-                                self._log.error(
-                                    f"{job_class.__name__} job runner could not be terminated - "
-                                    "zombie process may remain"
-                                )
-                except Exception:
-                    self._log.exception(f"Error terminating {job_class.__name__} job runner")
+                                self._log.warning(f"Force killing {job_class.__name__} job runner")
+                                job_runner.kill()
+                                job_runner.join(timeout=self._PROCESS_TERMINATE_TIMEOUT_S)
+                                # Final check - warn if zombie process remains
+                                if job_runner.is_alive():
+                                    self._log.error(
+                                        f"{job_class.__name__} job runner could not be terminated - "
+                                        "zombie process may remain"
+                                    )
+                    except Exception:
+                        self._log.exception(f"Error terminating {job_class.__name__} job runner")
 
             # Release backpressure controller resources to prevent semaphore leaks
             try:

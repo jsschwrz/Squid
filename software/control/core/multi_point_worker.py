@@ -45,6 +45,8 @@ from control.core.job_processing import (
     JobImage,
     JobRunner,
     JobResult,
+    drain_runners,
+    find_dead_runners,
 )
 from control.core.mosaic_utils import (
     calculate_overlap_pixels,
@@ -76,6 +78,7 @@ class MultiPointWorker:
         callbacks: MultiPointControllerFunctions,
         abort_requested_fn: Callable[[], bool],
         request_abort_fn: Callable[[], None],
+        abort_now_requested_fn: Callable[[], bool] = lambda: False,
         extra_job_classes: list[type[Job]] | None = None,
         abort_on_failed_jobs: bool = True,
         alignment_widget=None,
@@ -114,6 +117,9 @@ class MultiPointWorker:
         self.request_abort_fn: Callable[[], None] = request_abort_fn
         self._run_state = run_state_writer or squid.acquisition_state.NullRunStateWriter()
         self._abort_cause = None  # set to "error" by auto-abort paths (timeout / failed jobs)
+        # Immediate-abort predicate. When True, inner loops break ASAP and _finish_jobs() skips
+        # the drain wait and kills the runners, discarding any queued unsaved images for this run.
+        self.abort_now_requested_fn: Callable[[], bool] = abort_now_requested_fn
         self.NZ = acquisition_parameters.NZ
         self.deltaZ = acquisition_parameters.deltaZ
 
@@ -236,20 +242,45 @@ class MultiPointWorker:
         # Initialize backpressure controller for throttling acquisition when queue fills up.
         # If pre-warmed values are provided, use them for consistent tracking with the
         # pre-warmed job runner. Otherwise, BackpressureController creates its own values.
+        # Writers are routed per FOV (all planes of a stack share one output file), so
+        # parallel writers only engage when the pending backlog spans several FOVs. Ask
+        # the controller to keep the cap big enough for num_writers whole z-stacks;
+        # otherwise a cap smaller than one stack pins all work on a single writer and the
+        # resulting low write rate holds the adaptive cap down, keeping it that way.
+        _num_writers = max(1, int(control._def.ACQUISITION_WRITER_PROCESSES))
+        _min_span_images = _num_writers * max(1, int(self.NZ)) if _num_writers > 1 else 0
+
         bp_kwargs = {
             "max_jobs": control._def.ACQUISITION_MAX_PENDING_JOBS,
             "max_mb": control._def.ACQUISITION_MAX_PENDING_MB,
             "timeout_s": control._def.ACQUISITION_THROTTLE_TIMEOUT_S,
             "enabled": control._def.ACQUISITION_THROTTLING_ENABLED,
+            # Adaptive cap: bound backlog to ~target_backlog_s of measured write throughput,
+            # with max_mb as the absolute ceiling and floor_mb as the warmup minimum.
+            "target_backlog_s": control._def.ACQUISITION_TARGET_BACKLOG_S,
+            "floor_mb": control._def.ACQUISITION_ADAPTIVE_FLOOR_MB,
+            "min_span_images": _min_span_images,
         }
+        if _min_span_images:
+            self._log.info(
+                f"Backpressure cap will hold >= {_min_span_images} images "
+                f"({_num_writers} writers x {self.NZ} z-levels) so parallel writers can engage; "
+                f"still bounded by ACQUISITION_MAX_PENDING_MB={control._def.ACQUISITION_MAX_PENDING_MB} MB."
+            )
         if prewarmed_bp_values is not None:
             bp_kwargs["bp_values"] = prewarmed_bp_values
         self._backpressure = BackpressureController(**bp_kwargs)
 
-        # For now, use 1 runner per job class.  There's no real reason/rationale behind this, though.  The runners
-        # can all run any job type.  But 1 per is a reasonable arbitrary arrangement while we don't have a lot
-        # of job types.  If we have a lot of custom jobs, this could cause problems via resource hogging.
-        self._job_runners: List[Tuple[Type[Job], JobRunner]] = []
+        # N writer subprocesses per job class (ACQUISITION_WRITER_PROCESSES; 1 = legacy behavior).
+        # Work is partitioned across the N runners of a class by a stable key (see _writer_index)
+        # so two processes never write the same file/array. All runners of a class share the same
+        # backpressure/throughput counters.
+        self._job_runners: List[Tuple[Type[Job], List[JobRunner]]] = []
+        # True when the active save format uses a per-region array (6D Zarr): routing must then be
+        # by region only, not per-FOV, or parallel writers would corrupt the shared array.
+        self._route_by_region_only = False
+        # routing key -> writer index, assigned round-robin on first sight (see _writer_index).
+        self._writer_assignments: Dict[str, int] = {}
         self._log.info(f"Acquisition.USE_MULTIPROCESSING = {Acquisition.USE_MULTIPROCESSING}")
 
         # Get the current log file path to share with subprocess workers
@@ -310,20 +341,27 @@ class MultiPointWorker:
         # IMPORTANT: Only use pre-warmed runner if BOTH runner AND backpressure values
         # are available. Using a runner without matching backpressure values would cause
         # the BackpressureController to track different counters than the JobRunner.
+        # 6D Zarr writes into one per-region array, so parallel writers must route by region only.
+        self._route_by_region_only = zarr_writer_info is not None and getattr(zarr_writer_info, "use_6d_fov", False)
+
+        num_writers = max(1, int(control._def.ACQUISITION_WRITER_PROCESSES))
+        if num_writers > 1:
+            self._log.info(f"Using {num_writers} parallel writer subprocesses per save class")
+
         can_use_prewarmed = prewarmed_job_runner is not None and prewarmed_bp_values is not None
         used_prewarmed = False
+        cleanup_done = False  # only the first freshly-created runner needs to sweep stale OME metadata
         for job_class in job_classes:
-            job_runner = None
+            runners: List[JobRunner] = []
             if Acquisition.USE_MULTIPROCESSING:
-                # Try to use pre-warmed runner for the first job class
+                # The first runner of the first class may reuse the pre-warmed subprocess.
                 if can_use_prewarmed and not used_prewarmed:
                     if prewarmed_job_runner.is_ready():
                         self._log.info(f"Using pre-warmed job runner for {job_class.__name__} jobs")
-                        job_runner = prewarmed_job_runner
-                        # Configure it with current acquisition settings
-                        job_runner.set_acquisition_info(self.acquisition_info)
+                        prewarmed_job_runner.set_acquisition_info(self.acquisition_info)
                         if zarr_writer_info:
-                            job_runner.set_zarr_writer_info(zarr_writer_info)
+                            prewarmed_job_runner.set_zarr_writer_info(zarr_writer_info)
+                        runners.append(prewarmed_job_runner)
                         used_prewarmed = True
                     else:
                         self._log.warning(
@@ -338,25 +376,69 @@ class MultiPointWorker:
                         # Don't try to use pre-warmed runner again for subsequent job classes
                         can_use_prewarmed = False
 
-                if job_runner is None:
-                    self._log.info(f"Creating job runner for {job_class.__name__} jobs")
-                    job_runner = control.core.job_processing.JobRunner(
-                        self.acquisition_info,
-                        cleanup_stale_ome_files=use_ome_tiff,
-                        log_file_path=log_file_path,
-                        # Pass backpressure shared values for cross-process tracking
-                        bp_pending_jobs=self._backpressure.pending_jobs_value,
-                        bp_pending_bytes=self._backpressure.pending_bytes_value,
-                        bp_capacity_event=self._backpressure.capacity_event,
-                        # Pass zarr writer info for ZARR_V3 format
-                        zarr_writer_info=zarr_writer_info,
+                # Create the remaining runners for this class up to num_writers.
+                while len(runners) < num_writers:
+                    do_cleanup = use_ome_tiff and not cleanup_done
+                    cleanup_done = cleanup_done or do_cleanup
+                    self._log.info(
+                        f"Creating job runner ({len(runners) + 1}/{num_writers}) for {job_class.__name__} jobs"
                     )
-                    job_runner.start()
-                    # Subprocess starts warming up in background - don't block here
+                    job_runner = self._make_job_runner(do_cleanup, log_file_path, zarr_writer_info)
+                    job_runner.start()  # Subprocess warms up in background - don't block here
+                    runners.append(job_runner)
 
-            self._job_runners.append((job_class, job_runner))
+            self._job_runners.append((job_class, runners))
         self._abort_on_failed_job = abort_on_failed_jobs
-        self._first_job_dispatched = False  # Track if we've waited for subprocess warmup
+
+    def _make_job_runner(self, cleanup_stale_ome_files, log_file_path, zarr_writer_info):
+        """Construct a JobRunner wired to the shared backpressure/throughput counters."""
+        return control.core.job_processing.JobRunner(
+            self.acquisition_info,
+            cleanup_stale_ome_files=cleanup_stale_ome_files,
+            log_file_path=log_file_path,
+            # Pass backpressure shared values for cross-process tracking
+            bp_pending_jobs=self._backpressure.pending_jobs_value,
+            bp_pending_bytes=self._backpressure.pending_bytes_value,
+            bp_capacity_event=self._backpressure.capacity_event,
+            # Cumulative throughput counters (for live rate estimate)
+            bp_captured_bytes=self._backpressure.captured_bytes_value,
+            bp_written_bytes=self._backpressure.written_bytes_value,
+            bp_captured_count=self._backpressure.captured_count_value,
+            bp_written_count=self._backpressure.written_count_value,
+            # Pass zarr writer info for ZARR_V3 format
+            zarr_writer_info=zarr_writer_info,
+        )
+
+    def _writer_index(self, info: "CaptureInfo", num_writers: int) -> int:
+        """Pick which writer subprocess handles this image.
+
+        Every plane of a stack must land in the same process, because an OME-TIFF stack is
+        a single file the planes memmap into. The routing key is therefore (region, FOV) for
+        per-FOV formats (OME-TIFF, 5D Zarr), or the region alone for 6D Zarr, whose
+        per-region array would be corrupted by split writers.
+
+        Keys are assigned to writers round-robin in first-seen order, NOT by hashing. Hashing
+        distributes well only over many keys; over the handful an acquisition actually has it
+        is just an arbitrary assignment, and collisions leave writers idle while others carry
+        double load. Observed with crc32 on a 4-FOV run with 4 writers:
+
+            FOV 0 -> 3, FOV 1 -> 1, FOV 2 -> 3, FOV 3 -> 1   (writers 0 and 2 never used)
+
+        One of the two loaded writers could not finish and its backlog was abandoned at the
+        drain, losing 34 of 37 planes of one FOV. Round-robin spreads K keys evenly over
+        min(K, num_writers) writers by construction.
+
+        Assignment is stable within a run (memoised per key) and reproducible across a run
+        because FOVs are visited in a deterministic order.
+        """
+        if num_writers <= 1:
+            return 0
+        key = str(info.region_id) if self._route_by_region_only else f"{info.region_id}/{info.fov}"
+        index = self._writer_assignments.get(key)
+        if index is None:
+            index = len(self._writer_assignments) % num_writers
+            self._writer_assignments[key] = index
+        return index
 
     def update_use_piezo(self, value):
         self.use_piezo = value
@@ -439,6 +521,24 @@ class MultiPointWorker:
         self._abort_cause = "error"
         self.request_abort_fn()
 
+    def _abort_if_job_runners_dead(self) -> bool:
+        """Abort the acquisition if any job runner subprocess died with jobs pending.
+
+        A dead runner can never complete its jobs or release backpressure capacity:
+        the acquisition would otherwise crawl at one throttle timeout per frame while
+        losing every image dispatched to that runner. Returns True if aborted.
+        """
+        dead = find_dead_runners(self._job_runners)
+        if not dead:
+            return False
+        names = ", ".join(job_class.__name__ for job_class, _ in dead)
+        self._log.error(
+            f"Job runner subprocess died with jobs pending ({names}); those jobs can never "
+            f"complete. Aborting acquisition."
+        )
+        self._abort_due_to_error()
+        return True
+
     def _run_state_beat(self) -> None:
         self._run_state.beat(
             {
@@ -457,11 +557,46 @@ class MultiPointWorker:
             return "completed_with_errors"
         return "completed"
 
+    def _wait_for_job_runners_ready(self, timeout_s: float = 30.0) -> None:
+        """Block until every writer subprocess is up, BEFORE the first trigger is sent.
+
+        This must not happen on the frame-delivery path. The image callback is what sets
+        _ready_for_next_trigger, and the acquisition thread only allows
+        5 * total_frame_time + 2 seconds for a frame to arrive. Waiting for a cold
+        subprocess inside the callback therefore stalls frame delivery past that deadline
+        and aborts the run: with ACQUISITION_WRITER_PROCESSES=4 only the first runner is
+        pre-warmed, so the callback blocked ~5 s spawning the other three and the very
+        first frame timed out.
+
+        The per-runner budget is generous because this is a one-off startup cost paid off
+        the critical path; a runner that is still not ready is left to warm up on its own
+        rather than blocking the run further (dispatch queues to it regardless).
+        """
+        deadline = time.time() + timeout_s
+        for job_class, runners in self._job_runners:
+            for job_runner in runners:
+                if job_runner is None:
+                    continue
+                remaining = max(0.0, deadline - time.time())
+                t_start = time.perf_counter()
+                if job_runner.wait_ready(timeout_s=remaining):
+                    wait_ms = (time.perf_counter() - t_start) * 1000
+                    if wait_ms > 10:  # Only log if we actually had to wait
+                        self._log.info(f"Job runner ready (waited {wait_ms:.0f}ms for subprocess)")
+                else:
+                    self._log.warning(
+                        f"Job runner for {job_class.__name__} not ready after {timeout_s:.0f}s; "
+                        "continuing anyway (it will finish warming up in the background)."
+                    )
+
     def run(self):
         this_image_callback_id = None
         self._run_state_fatal = False
         try:
             start_time = time.perf_counter_ns()
+            # Pay the writer-subprocess warmup cost here, before any trigger is sent, so it
+            # can never stall the image callback and trip the frame-arrival timeout.
+            self._wait_for_job_runners_ready()
             self.camera.start_streaming()
             this_image_callback_id = self.camera.add_frame_callback(self._image_callback)
             sleep_time = min(self.dt / 20.0, 0.5)
@@ -653,43 +788,55 @@ class MultiPointWorker:
         self._ready_for_next_trigger.set()
         self._image_callback_idle.set()
 
-    def _finish_jobs(self, timeout_s=10):
+    def _finish_jobs(self, stall_timeout_s=10):
         # Drain and summarize all currently available job results before waiting for completion
         self._summarize_runner_outputs(drain_all=True)
 
         active_runners = [
-            (job_class, job_runner) for job_class, job_runner in self._job_runners if job_runner is not None
+            (job_class, job_runner)
+            for job_class, runners in self._job_runners
+            for job_runner in runners
+            if job_runner is not None
         ]
 
-        self._log.info(f"Waiting for jobs to finish on {len(active_runners)} job runners before shutting them down...")
-        timeout_time = time.time() + timeout_s
-
-        def timed_out():
-            return time.time() > timeout_time
-
-        def time_left():
-            return max(timeout_time - time.time(), 0)
-
-        # Wait for all pending jobs across all runners (round-robin to avoid blocking on one)
-        while not timed_out():
-            any_pending = False
+        if self.abort_now_requested_fn():
+            # Immediate abort: the operator has explicitly discarded this run, so skip the
+            # drain entirely and kill the runners. This is the one case where abandoning
+            # queued images is intended rather than a failure.
+            self._log.warning(
+                f"Immediate abort: discarding queued unsaved images and killing "
+                f"{len(active_runners)} job runner(s) without draining."
+            )
             for job_class, job_runner in active_runners:
                 if job_runner.has_pending():
-                    any_pending = True
-                    break
-            if not any_pending:
-                break
-            # Process any available results while waiting
-            self._summarize_runner_outputs(drain_all=True)
-            time.sleep(0.1)
+                    self._log.warning(f"Abandoning pending jobs for {job_class.__name__} due to immediate abort.")
+                job_runner.kill()
         else:
-            # Timed out - kill any runners that still have pending jobs
-            for job_class, job_runner in active_runners:
-                if job_runner.has_pending():
-                    self._log.error(
-                        f"Timed out after {timeout_s} [s] waiting for jobs to finish. Pending jobs for {job_class.__name__} abandoned!!!"
-                    )
-                    job_runner.kill()
+            self._log.info(
+                f"Waiting for jobs to finish on {len(active_runners)} job runners before shutting them down..."
+            )
+
+            # Progress-based drain: a full-but-steadily-draining queue gets as long as it
+            # needs (under backpressure saturation the pending count equals the job limit
+            # by construction, so any fixed deadline would abandon the acquisition tail).
+            # Jobs are abandoned only when nothing completes for stall_timeout_s or the
+            # runner subprocess died.
+            drain_result = drain_runners(
+                active_runners,
+                stall_timeout_s=stall_timeout_s,
+                poll_fn=lambda: self._summarize_runner_outputs(drain_all=True),
+            )
+            for job_class_name, abandoned_count in drain_result.abandoned.items():
+                cause = (
+                    "its runner subprocess died"
+                    if job_class_name in drain_result.dead
+                    else f"no jobs completed for {stall_timeout_s} [s]"
+                )
+                self._log.error(
+                    f"Abandoned {abandoned_count} pending {job_class_name} job(s) because {cause}. "
+                    f"Data for these jobs is lost!"
+                )
+            self._acquisition_error_count += drain_result.total_abandoned
 
         # Drain results before shutdown
         self._summarize_runner_outputs(drain_all=True)
@@ -709,9 +856,11 @@ class MultiPointWorker:
                 log.error(f"Error shutting down job runner in background: {e}")
 
         self._log.info("Shutting down job runners (non-blocking)...")
-        remaining_time = time_left()
+        # Runners are idle after a clean drain (and already killed if they stalled or
+        # died), so a short join timeout before terminate() suffices.
+        shutdown_timeout_s = 2.0
         for job_class, job_runner in active_runners:
-            t = threading.Thread(target=shutdown_runner, args=(job_runner, remaining_time), daemon=True)
+            t = threading.Thread(target=shutdown_runner, args=(job_runner, shutdown_timeout_s), daemon=True)
             t.start()
 
         # Final drain of all output queues (should be empty, but check anyway)
@@ -866,25 +1015,26 @@ class MultiPointWorker:
         """
         none_failed = True
         had_results = False
-        for job_class, job_runner in self._job_runners:
-            if job_runner is None:
-                continue
-            out_queue = job_runner.output_queue()
-            if out_queue is None:
-                # Queue was cleared during shutdown
-                continue
-            while True:
-                try:
-                    job_result: JobResult = out_queue.get_nowait()
-                    none_failed = none_failed and self._summarize_job_result(job_result)
-                    had_results = True
-                    if not drain_all:
-                        break  # Only process one result per queue if not draining
-                except queue.Empty:
-                    break
-                except ValueError:
-                    # Queue was closed during shutdown - nothing more to drain
-                    break
+        for job_class, runners in self._job_runners:
+            for job_runner in runners:
+                if job_runner is None:
+                    continue
+                out_queue = job_runner.output_queue()
+                if out_queue is None:
+                    # Queue was cleared during shutdown
+                    continue
+                while True:
+                    try:
+                        job_result: JobResult = out_queue.get_nowait()
+                        none_failed = none_failed and self._summarize_job_result(job_result)
+                        had_results = True
+                        if not drain_all:
+                            break  # Only process one result per queue if not draining
+                    except queue.Empty:
+                        break
+                    except ValueError:
+                        # Queue was closed during shutdown - nothing more to drain
+                        break
 
         return SummarizeResult(none_failed=none_failed, had_results=had_results)
 
@@ -1124,6 +1274,10 @@ class MultiPointWorker:
             # iterate through selected modes
             try:
                 for config_idx, config in enumerate(self.selected_configurations):
+                    # Stop launching new channel acquisitions promptly on abort (graceful or immediate),
+                    # rather than grinding through every remaining channel for this position first.
+                    if self.abort_requested_fn():
+                        break
                     self._apply_channel_z_offset(config, af_succeeded)
 
                     # acquire image
@@ -1159,9 +1313,11 @@ class MultiPointWorker:
             self.update_coordinates_dataframe(region_id, z_level, acquire_pos, fov)
             self.callbacks.signal_current_fov(acquire_pos.x_mm, acquire_pos.y_mm)
 
-            # check if the acquisition should be aborted
+            # check if the acquisition should be aborted. Break out of the z-stack here; the
+            # per-FOV check in run_coordinate_acquisition() runs handle_acquisition_abort() and
+            # returns, so we avoid calling it twice.
             if self.abort_requested_fn():
-                self.handle_acquisition_abort(current_path)
+                break
 
             # update FOV counter
             self.af_fov_count = self.af_fov_count + 1
@@ -1402,24 +1558,14 @@ class MultiPointWorker:
 
                 with self._timing.get_timer("job creation and dispatch"):
                     # Wait for subprocess to be ready before first dispatch
-                    if not self._first_job_dispatched:
-                        for job_class, job_runner in self._job_runners:
-                            if job_runner is not None:
-                                t_wait_start = time.perf_counter()
-                                if job_runner.wait_ready(timeout_s=10.0):
-                                    t_wait_end = time.perf_counter()
-                                    wait_ms = (t_wait_end - t_wait_start) * 1000
-                                    if wait_ms > 10:  # Only log if we actually had to wait
-                                        self._log.info(f"Job runner ready (waited {wait_ms:.0f}ms for subprocess)")
-                                else:
-                                    self._log.warning(f"Job runner for {job_class.__name__} not ready after 10s")
-                        self._first_job_dispatched = True
-
-                    for job_class, job_runner in self._job_runners:
+                    for job_class, runners in self._job_runners:
                         job = self._create_job(job_class, info, image)
                         if job is None:
                             continue  # Skip if job creation returns None (e.g., downsampled views disabled for this image)
-                        if job_runner is not None:
+                        if runners:
+                            # Route to a writer by a stable key so all planes of a stack (and, for
+                            # 6D Zarr, all FOVs of a region) land in the same process.
+                            job_runner = runners[self._writer_index(info, len(runners))]
                             if not job_runner.dispatch(job):
                                 self._log.error("Failed to dispatch multiprocessing job!")
                                 self._abort_due_to_error()
@@ -1480,12 +1626,32 @@ class MultiPointWorker:
         # Backpressure check AFTER previous frame dispatched, BEFORE next trigger
         # This is when we know the previous image's jobs have been dispatched (and counters incremented)
         if self._backpressure.should_throttle():
+            # In software-trigger mode the illumination was switched on above in preparation
+            # for this frame. A throttle pause can last up to the backpressure timeout, so turn
+            # the illumination off while we wait for resources to avoid needlessly exposing (and
+            # photobleaching) the sample, then turn it back on before we proceed to the trigger.
+            throttle_illumination_off = self.liveController.trigger_mode == TriggerMode.SOFTWARE
+            if throttle_illumination_off:
+                self.liveController.turn_off_illumination()
+
+            # A dead runner subprocess can never release capacity - detect it up front
+            # instead of burning the full throttle timeout on every frame. Checked after the
+            # illumination is off so that aborting here cannot leave the sample lit.
+            if self._abort_if_job_runners_dead():
+                return
+
             with self._timing.get_timer("backpressure.wait_for_capacity"):
-                got_capacity = self._backpressure.wait_for_capacity()
-                if not got_capacity:
-                    self._log.error(
-                        f"Backpressure timeout - disk I/O cannot keep up. Stats: {self._backpressure.get_stats()}"
-                    )
+                got_capacity = self._backpressure.wait_for_capacity(should_abort=self.abort_requested_fn)
+            if not got_capacity:
+                if self._abort_if_job_runners_dead():
+                    return
+                self._log.error(
+                    f"Backpressure timeout - disk I/O cannot keep up. Stats: {self._backpressure.get_stats()}"
+                )
+
+            if throttle_illumination_off:
+                self.liveController.turn_on_illumination()
+                self.wait_till_operation_is_completed()
 
         with self._timing.get_timer("get_ready_for_trigger re-check"):
             # This should be a noop - we have the frame already.  Still, check!
@@ -1533,7 +1699,9 @@ class MultiPointWorker:
                 # wrong.
                 non_hw_frame_timeout = 5 * self.camera.get_total_frame_time() / 1e3 + 2
                 if not self._ready_for_next_trigger.wait(non_hw_frame_timeout):
-                    self._log.error("Timed out waiting {non_hw_frame_timeout} [s] for a frame, aborting acquisition.")
+                    self._log.error(
+                        f"Timed out waiting {non_hw_frame_timeout} [s] for a frame, aborting acquisition."
+                    )
                     self._abort_due_to_error()
                     # Let this fall through so we still turn off illumination.  Let the caller actually break out
                     # of the acquisition.
