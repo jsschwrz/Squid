@@ -229,6 +229,9 @@ class BackpressureController:
         # Adaptive cap params. target_backlog_s == 0 disables adaptation (static cap).
         target_backlog_s: float = 0.0,
         floor_mb: float = 0.0,
+        # Keep the cap large enough to hold this many images, so that per-FOV writer
+        # routing can actually spread work across parallel writers. 0 disables.
+        min_span_images: int = 0,
         # Pre-created backpressure values for sharing with pre-warmed JobRunner.
         # If provided, uses these instead of creating new ones.
         bp_values: Optional[BackpressureValues] = None,
@@ -239,6 +242,7 @@ class BackpressureController:
         self._timeout_s = timeout_s
         self._target_backlog_s = target_backlog_s
         self._floor_bytes = int(floor_mb * _BYTES_PER_MB)
+        self._min_span_images = max(0, int(min_span_images))
         self._closed = False  # Lifecycle tracking
 
         # Live throughput estimate (main-thread only).
@@ -366,17 +370,52 @@ class BackpressureController:
             return
         self._rate_sampler.update(self._read_value(captured), self._read_value(written), now)
 
+    def mean_image_bytes(self) -> float:
+        """Mean accounted size of a dispatched image, or 0.0 before any are dispatched.
+
+        Derived from the cumulative counters rather than from camera geometry, so it
+        always matches exactly what pending_bytes is measuring (crop, binning and pixel
+        format included) with no per-camera size arithmetic.
+        """
+        count = self._read_value(self._captured_count)
+        if count <= 0:
+            return 0.0
+        return self._read_value(self._captured_bytes) / count
+
+    def _span_floor_bytes(self) -> int:
+        """Minimum cap needed for the backlog to span min_span_images images.
+
+        Writers are assigned work by a stable key (all planes of one FOV go to a single
+        process, because an OME-TIFF stack is one file). Parallelism therefore only
+        engages when the pending backlog spans several FOVs. If the cap is smaller than
+        one FOV's stack, exactly one writer is ever busy no matter how many exist -- and
+        the resulting low write rate holds the adaptive cap down, which keeps it that
+        way. Raising the floor to cover min_span_images breaks that loop.
+
+        Returns 0 until a mean image size is known (before then the plain floor applies).
+        """
+        if self._min_span_images <= 0:
+            return 0
+        mean_bytes = self.mean_image_bytes()
+        if mean_bytes <= 0:
+            return 0
+        return int(self._min_span_images * mean_bytes)
+
     def _effective_max_bytes(self) -> int:
         """Current adaptive byte cap.
 
-        Bounds the backlog to ~target_backlog_s of measured write throughput,
-        clamped between the warmup floor and the absolute ceiling. With
-        target_backlog_s == 0 (adaptation off) this is just the static ceiling.
+        Bounds the backlog to ~target_backlog_s of measured write throughput, clamped
+        between the effective floor and the absolute ceiling. The effective floor is the
+        larger of the configured warmup floor and the span floor needed to keep every
+        writer busy. With target_backlog_s == 0 (adaptation off) this is just the static
+        ceiling.
         """
         if self._target_backlog_s <= 0:
             return self._max_bytes
         target = self._rate_sampler.write_mb_s * _BYTES_PER_MB * self._target_backlog_s
-        return int(min(self._max_bytes, max(self._floor_bytes, target)))
+        floor = max(self._floor_bytes, self._span_floor_bytes())
+        # The ceiling still wins: never exceed the absolute RAM limit to chase parallelism.
+        return int(min(self._max_bytes, max(floor, target)))
 
     def should_throttle(self) -> bool:
         """Check if acquisition should wait (jobs limit or effective byte cap exceeded)."""

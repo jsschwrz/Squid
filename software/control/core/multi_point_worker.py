@@ -241,6 +241,14 @@ class MultiPointWorker:
         # Initialize backpressure controller for throttling acquisition when queue fills up.
         # If pre-warmed values are provided, use them for consistent tracking with the
         # pre-warmed job runner. Otherwise, BackpressureController creates its own values.
+        # Writers are routed per FOV (all planes of a stack share one output file), so
+        # parallel writers only engage when the pending backlog spans several FOVs. Ask
+        # the controller to keep the cap big enough for num_writers whole z-stacks;
+        # otherwise a cap smaller than one stack pins all work on a single writer and the
+        # resulting low write rate holds the adaptive cap down, keeping it that way.
+        _num_writers = max(1, int(control._def.ACQUISITION_WRITER_PROCESSES))
+        _min_span_images = _num_writers * max(1, int(self.NZ)) if _num_writers > 1 else 0
+
         bp_kwargs = {
             "max_jobs": control._def.ACQUISITION_MAX_PENDING_JOBS,
             "max_mb": control._def.ACQUISITION_MAX_PENDING_MB,
@@ -250,7 +258,14 @@ class MultiPointWorker:
             # with max_mb as the absolute ceiling and floor_mb as the warmup minimum.
             "target_backlog_s": control._def.ACQUISITION_TARGET_BACKLOG_S,
             "floor_mb": control._def.ACQUISITION_ADAPTIVE_FLOOR_MB,
+            "min_span_images": _min_span_images,
         }
+        if _min_span_images:
+            self._log.info(
+                f"Backpressure cap will hold >= {_min_span_images} images "
+                f"({_num_writers} writers x {self.NZ} z-levels) so parallel writers can engage; "
+                f"still bounded by ACQUISITION_MAX_PENDING_MB={control._def.ACQUISITION_MAX_PENDING_MB} MB."
+            )
         if prewarmed_bp_values is not None:
             bp_kwargs["bp_values"] = prewarmed_bp_values
         self._backpressure = BackpressureController(**bp_kwargs)

@@ -231,3 +231,62 @@ class TestJobRunnerWarmupOffFramePath:
 
 class SlowJobStub:
     __name__ = "SlowJobStub"
+
+
+class TestSpanFloor:
+    """The cap must stay large enough for parallel writers to actually engage.
+
+    Writers are routed per FOV, so if the cap is smaller than one z-stack only one
+    writer is ever busy -- and the low write rate that causes holds the adaptive cap
+    down, which keeps it that way. Observed live: cap pinned at the 1024 MB floor with
+    a 1505 MB z-stack, 4 writers configured, only 1 ever busy.
+    """
+
+    def _controller(self, min_span_images, floor_mb=1024.0, max_mb=49152.0):
+        return BackpressureController(
+            max_jobs=10000,
+            max_mb=max_mb,
+            target_backlog_s=30.0,
+            floor_mb=floor_mb,
+            min_span_images=min_span_images,
+        )
+
+    def test_no_span_floor_when_single_writer(self):
+        c = self._controller(min_span_images=0)
+        c.job_dispatched(50 * 1024 * 1024)
+        assert c._span_floor_bytes() == 0
+        c.close()
+
+    def test_span_floor_zero_before_any_image(self):
+        # No image dispatched yet -> unknown mean size -> plain floor applies.
+        c = self._controller(min_span_images=116)
+        assert c._span_floor_bytes() == 0
+        assert c._effective_max_bytes() == int(1024.0 * 1024 * 1024)
+        c.close()
+
+    def test_mean_image_bytes_from_counters(self):
+        c = self._controller(min_span_images=4)
+        c.job_dispatched(10 * 1024 * 1024)
+        c.job_dispatched(20 * 1024 * 1024)
+        assert c.mean_image_bytes() == pytest.approx(15 * 1024 * 1024)
+        c.close()
+
+    def test_span_floor_lifts_cap_above_one_zstack(self):
+        # The real case: 4 writers x 29 z-levels, ~51.9 MB per image.
+        img = int(51.9 * 1024 * 1024)
+        c = self._controller(min_span_images=4 * 29)
+        c.job_dispatched(img)
+        c._rate_sampler._write_mb_s = 25.0  # 25 * 30 = 750 MB, below the old 1024 floor
+
+        one_stack = 29 * img
+        assert c._effective_max_bytes() > one_stack, "cap must exceed a single z-stack"
+        assert c._effective_max_bytes() == pytest.approx(4 * 29 * img, rel=1e-6)
+        c.close()
+
+    def test_ceiling_still_wins_over_span_floor(self):
+        # Never blow past the absolute RAM limit just to chase parallelism.
+        img = int(51.9 * 1024 * 1024)
+        c = self._controller(min_span_images=4 * 29, max_mb=2048.0)
+        c.job_dispatched(img)
+        assert c._effective_max_bytes() == int(2048.0 * 1024 * 1024)
+        c.close()
