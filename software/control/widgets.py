@@ -94,6 +94,52 @@ def check_space_available_with_error_dialog(
     return True
 
 
+def check_time_lapse_pacing_with_dialog(
+    multi_point_controller: MultiPointController, logger: logging.Logger, parent=None
+) -> bool:
+    """Warn (proceed/cancel) when one time point looks longer than the requested dt interval.
+
+    This is advisory, NOT a veto: an overrunning time lapse still acquires every requested
+    time point, it just stretches out.  Returns True to proceed, False if the user cancelled.
+    """
+    Nt = multi_point_controller.Nt
+    dt = multi_point_controller.deltat
+    if Nt <= 1 or dt <= 0:
+        return True  # single time point, or continuous mode - nothing to pace against
+
+    try:
+        estimated_s = multi_point_controller.get_estimated_time_point_duration_s()
+    except Exception:
+        logger.exception("Could not estimate time point duration; skipping the time-lapse pacing check.")
+        return True
+
+    logger.info(f"Time-lapse pacing check: estimated {estimated_s:.1f} [s] per time point, {dt=} [s], {Nt=}")
+    if estimated_s <= dt:
+        return True
+
+    requested_total_min = (dt * (Nt - 1) + estimated_s) / 60.0
+    actual_total_min = (estimated_s * Nt) / 60.0
+    logger.warning(f"Time point estimate ({estimated_s:.1f} s) exceeds dt ({dt:.1f} s) for a {Nt} time point run.")
+    message = (
+        f"Each time point is estimated to take about {estimated_s:.0f} s, which is longer than the "
+        f"requested interval of {dt:.0f} s.\n\n"
+        f"All {Nt} time points will still be acquired - none are skipped - but they will run back to "
+        f"back, so the effective interval will be about {estimated_s:.0f} s and the run will take "
+        f"roughly {actual_total_min:.0f} min instead of {requested_total_min:.0f} min.\n\n"
+        f"This is a rough estimate from exposure times, FOV count, Z levels and autofocus settings; "
+        f"actual timing may differ.\n\n"
+        f"Start the acquisition anyway?"
+    )
+    reply = QMessageBox.question(
+        parent,
+        "Time Point Longer Than Interval",
+        message,
+        QMessageBox.Yes | QMessageBox.No,
+        QMessageBox.Yes,
+    )
+    return reply == QMessageBox.Yes
+
+
 def resource_allocation_dialog(parent=None):
     """Tell the operator that mosaic view is being traded away for this run."""
     msg = QMessageBox(parent)
@@ -6532,6 +6578,13 @@ class FlexibleMultiPointWidget(AcquisitionYAMLDropMixin, _ApplyChannelOffsetMixi
                 self.btn_startAcquisition.setChecked(False)
                 return
 
+            # Advisory: a time point longer than dt is allowed (nothing is skipped), but the
+            # operator should know the run will stretch out before they commit to it.
+            if not check_time_lapse_pacing_with_dialog(self.multipointController, self._log, self):
+                self._log.info("User cancelled acquisition after the time-lapse pacing warning.")
+                self.btn_startAcquisition.setChecked(False)
+                return
+
             # Not enough RAM for the live mosaic is not a reason to refuse the run — only
             # the preview is unaffordable. Trade it away and carry on.
             if mosaic_ram_exceeds_available(
@@ -8910,6 +8963,13 @@ class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, _ApplyChannelOffsetMix
                 self._log.error("Failed to start acquisition.  Not enough disk space available.")
                 return
 
+            # Advisory: a time point longer than dt is allowed (nothing is skipped), but the
+            # operator should know the run will stretch out before they commit to it.
+            if not check_time_lapse_pacing_with_dialog(self.multipointController, self._log, self):
+                self.btn_startAcquisition.setChecked(False)
+                self._log.info("User cancelled acquisition after the time-lapse pacing warning.")
+                return
+
             # Not enough RAM for the live mosaic is not a reason to refuse the run — only
             # the preview is unaffordable. Trade it away and carry on.
             if mosaic_ram_exceeds_available(
@@ -9675,6 +9735,12 @@ class MultiPointWithFluidicsWidget(_ApplyChannelOffsetMixin, QFrame):
             self.multipointController.set_use_fluidics(True)  # may be set to False from other widgets
             self.multipointController.set_selected_configurations(self.channel_sequence.ordered_selected_names())
             self.multipointController.set_Nt(len(rounds))
+            # Fluidics rounds are self-paced by the fluidics sequences, not by a time interval.
+            # The controller is shared, so without this a dt left behind by a previous wellplate
+            # or flexible run would pace (and, before the never-skip fix, silently drop) rounds --
+            # and since the fluidic port is keyed off time_point, a dropped round desyncs
+            # reagents from images.
+            self.multipointController.set_deltat(0)
             self.multipointController.fluidics.set_rounds(rounds)
             self.multipointController.start_new_experiment(self.lineEdit_experimentID.text())
 
