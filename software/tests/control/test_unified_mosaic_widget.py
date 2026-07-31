@@ -155,3 +155,74 @@ class TestFullViewMagnificationPersistence:
         )
         # Integer factor 3 -> 2.22 um, NOT the exact target 2.0 um.
         assert widget.viewer_pixel_size_mm == pytest.approx(0.00222, abs=1e-5)
+
+
+class TestOpenInSquidXplorerButton:
+    """The bottom-bar handoff button: Full View | Plate View | Clear | Save View | Open in Xplorer."""
+
+    def test_button_is_a_plain_action_not_a_view_mode(self, mosaic_widget):
+        """It must stay out of the exclusive mode group, or clicking it would
+        uncheck whichever view mode is active."""
+        widget, _ = mosaic_widget
+        button = widget.open_in_squidxplorer_button
+        assert button.text() == "Open in Xplorer"
+        assert "SquidXplorer" in button.toolTip()
+        assert not button.isCheckable()
+        assert button not in widget._mode_button_group.buttons()
+
+    def test_short_labels_cannot_be_squeezed_unreadable(self, mosaic_widget):
+        """Clear and Save View are pinned so a long neighbour can't elide them."""
+        widget, _ = mosaic_widget
+        for button in (widget.clear_button, widget.save_button, widget.open_in_squidxplorer_button):
+            assert button.minimumWidth() >= button.sizeHint().width(), button.text()
+
+    def test_disabled_until_a_run_names_its_folder(self, mosaic_widget, tmp_path):
+        widget, _ = mosaic_widget
+        assert not widget.open_in_squidxplorer_button.isEnabled()
+
+        widget.set_acquisition_save_target(str(tmp_path))
+        assert widget.open_in_squidxplorer_button.isEnabled()
+
+        widget.set_acquisition_save_target(None)
+        assert not widget.open_in_squidxplorer_button.isEnabled()
+
+    def test_disabled_while_the_run_is_writing(self, mosaic_widget, tmp_path):
+        widget, _ = mosaic_widget
+        widget.set_acquisition_save_target(str(tmp_path))
+
+        widget.set_acquisition_running(True)
+        assert not widget.open_in_squidxplorer_button.isEnabled()
+
+        widget.set_acquisition_running(False)
+        assert widget.open_in_squidxplorer_button.isEnabled()
+
+    def test_enabled_with_an_empty_canvas(self, mosaic_widget, tmp_path):
+        """A RAM-limited run leaves no tiles on screen, but its folder is exactly
+        the one worth opening — so the button must not depend on layers_initialized."""
+        widget, _ = mosaic_widget
+        widget.set_acquisition_save_target(str(tmp_path))
+        assert not widget.layers_initialized
+        assert widget.open_in_squidxplorer_button.isEnabled()
+
+    def test_click_emits_the_acquisition_folder(self, mosaic_widget, qtbot, tmp_path):
+        widget, _ = mosaic_widget
+        widget.set_acquisition_save_target(str(tmp_path))
+
+        with qtbot.waitSignal(widget.signal_open_in_squidxplorer, timeout=1000) as blocker:
+            widget.open_in_squidxplorer_button.click()
+        assert blocker.args == [str(tmp_path)]
+
+    def test_click_with_a_vanished_folder_informs_and_stays_quiet(self, mosaic_widget, qtbot, monkeypatch, tmp_path):
+        """Enabled state is a cache; the folder can disappear underneath it."""
+        widget, _ = mosaic_widget
+        missing = tmp_path / "deleted run"
+        widget.set_acquisition_save_target(str(missing))
+
+        shown = []
+        monkeypatch.setattr(
+            "control.widgets_mosaic.QMessageBox.information",
+            lambda *args, **kwargs: shown.append(args[1:3]),
+        )
+        with qtbot.assertNotEmitted(widget.signal_open_in_squidxplorer):
+            widget._on_open_in_squidxplorer_clicked()
+        assert shown, "expected an information dialog when the folder is gone"
