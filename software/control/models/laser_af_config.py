@@ -6,13 +6,37 @@ calibration data and detection parameters.
 """
 
 import base64
-from typing import List, Optional
+from typing import Any, List, Optional
 
 import numpy as np
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 import control._def as _def
 from control._def import SpotDetectionMode
+import squid.logging
+
+_log = squid.logging.get_logger(__name__)
+
+# Fields written by the line-profile spot detector, which connected-components detection
+# replaced. They have no equivalent in the new schema and are dropped on load.
+#
+# displacement_success_window_um is NOT convertible to displacement_success_window_pixels:
+# the old field was a convergence tolerance for averaged measurements, the new one is a
+# maximum accepted distance from the reference x. Different quantities, so the new default
+# from _def is used rather than a fabricated conversion.
+_LEGACY_LINE_PROFILE_FIELDS = frozenset(
+    {
+        "displacement_success_window_um",
+        "y_window",
+        "x_window",
+        "min_peak_width",
+        "min_peak_distance",
+        "min_peak_prominence",
+        "spot_spacing",
+    }
+)
+
+_migration_warned: set = set()
 
 
 class LaserAFConfig(BaseModel):
@@ -52,9 +76,9 @@ class LaserAFConfig(BaseModel):
         default_factory=lambda: SpotDetectionMode(_def.LASER_AF_SPOT_DETECTION_MODE),
         description="Spot detection mode",
     )
-    displacement_success_window_um: float = Field(
-        default_factory=lambda: _def.DISPLACEMENT_SUCCESS_WINDOW_UM,
-        description="Acceptable displacement window in um",
+    displacement_success_window_pixels: float = Field(
+        default_factory=lambda: float(_def.DISPLACEMENT_SUCCESS_WINDOW_PIXELS),
+        description="Max displacement from reference x to accept detection (pixels)",
     )
 
     # Spot detection
@@ -62,23 +86,23 @@ class LaserAFConfig(BaseModel):
     correlation_threshold: float = Field(
         default_factory=lambda: _def.CORRELATION_THRESHOLD, description="Correlation threshold"
     )
-    y_window: int = Field(
-        default_factory=lambda: _def.LASER_AF_Y_WINDOW, description="Y window half-height for detection"
+    # Connected component spot detection parameters
+    cc_threshold: float = Field(
+        default_factory=lambda: float(_def.LASER_AF_CC_THRESHOLD), description="Intensity threshold for binarization"
     )
-    x_window: int = Field(
-        default_factory=lambda: _def.LASER_AF_X_WINDOW, description="X window half-width for detection"
+    cc_min_area: int = Field(
+        default_factory=lambda: _def.LASER_AF_CC_MIN_AREA, description="Minimum component area in pixels"
     )
-    min_peak_width: float = Field(
-        default_factory=lambda: float(_def.LASER_AF_MIN_PEAK_WIDTH), description="Minimum peak width"
+    cc_max_area: int = Field(
+        default_factory=lambda: _def.LASER_AF_CC_MAX_AREA, description="Maximum component area in pixels"
     )
-    min_peak_distance: float = Field(
-        default_factory=lambda: float(_def.LASER_AF_MIN_PEAK_DISTANCE), description="Minimum distance between peaks"
+    cc_row_tolerance: float = Field(
+        default_factory=lambda: float(_def.LASER_AF_CC_ROW_TOLERANCE),
+        description="Allowed deviation from expected row",
     )
-    min_peak_prominence: float = Field(
-        default_factory=lambda: _def.LASER_AF_MIN_PEAK_PROMINENCE, description="Minimum peak prominence"
-    )
-    spot_spacing: float = Field(
-        default_factory=lambda: float(_def.LASER_AF_SPOT_SPACING), description="Expected spot spacing"
+    cc_max_aspect_ratio: float = Field(
+        default_factory=lambda: float(_def.LASER_AF_CC_MAX_ASPECT_RATIO),
+        description="Maximum aspect ratio for valid spot",
     )
     filter_sigma: Optional[float] = Field(
         default_factory=lambda: _def.LASER_AF_FILTER_SIGMA, description="Gaussian filter sigma (None to disable)"
@@ -107,6 +131,73 @@ class LaserAFConfig(BaseModel):
     reference_image_dtype: Optional[str] = Field(None, description="Data type of reference image array")
 
     model_config = {"extra": "forbid"}
+
+    @model_validator(mode="before")
+    @classmethod
+    def _migrate_legacy_line_profile_config(cls, data: Any) -> Any:
+        """Allow configs written by the line-profile detector to load.
+
+        ``extra="forbid"`` would otherwise reject them. Because
+        ``ConfigRepository._load_yaml`` swallows ValidationError and returns None, that
+        rejection is silent: the objective would come up with no laser AF config at all,
+        losing its calibration and reference image with only a log warning. Dropping the
+        dead keys here keeps every real calibration field (pixel_to_um, x_reference,
+        reference_image, correlation_threshold, ...) intact.
+
+        The cc_* detection parameters are deliberately NOT translated -- they are a
+        different parameterisation of a different algorithm, so they fall back to the
+        _def defaults and the objective needs re-tuning.
+
+        ``filter_sigma`` is the one exception, rewritten because leaving it would run the
+        new detector unfiltered; see the comment on that branch below.
+
+        Unknown keys that are not on the legacy list still raise, so genuine typos are
+        still caught.
+        """
+        if not isinstance(data, dict):
+            return data
+
+        present = _LEGACY_LINE_PROFILE_FIELDS.intersection(data)
+        if not present:
+            return data
+
+        data = {k: v for k, v in data.items() if k not in _LEGACY_LINE_PROFILE_FIELDS}
+
+        # Legacy configs carry filter_sigma = -1 (or None), the "filtering off" sentinel the
+        # line-profile detector ran with. Connected-components detection was developed with
+        # the Gaussian pre-filter enabled, so a migrating config adopts the new _def default
+        # rather than running the new detector in a regime it was never tuned for.
+        #
+        # Only applied on this legacy path: a config that has already been migrated (no
+        # legacy keys) keeps whatever filter_sigma it was deliberately given, including 0.
+        legacy_sigma = data.get("filter_sigma")
+        # Guard the comparison: this runs before pydantic coercion, so a malformed value
+        # must fall through to normal validation rather than raising TypeError here.
+        filtering_disabled = legacy_sigma is None or (
+            isinstance(legacy_sigma, (int, float)) and not isinstance(legacy_sigma, bool) and legacy_sigma <= 0
+        )
+        if filtering_disabled:
+            data["filter_sigma"] = _def.LASER_AF_FILTER_SIGMA
+            if legacy_sigma != _def.LASER_AF_FILTER_SIGMA:
+                _log.info(
+                    "Laser AF filter_sigma was %r (off); adopting cc default of %r.",
+                    legacy_sigma,
+                    _def.LASER_AF_FILTER_SIGMA,
+                )
+
+        # One warning per distinct field set, so repeated loads don't spam the log.
+        key = tuple(sorted(present))
+        if key not in _migration_warned:
+            _migration_warned.add(key)
+            _log.warning(
+                "Laser AF config uses legacy line-profile fields %s; they were dropped. "
+                "Connected-components detection parameters (cc_threshold, cc_min_area, "
+                "cc_max_area, cc_row_tolerance, cc_max_aspect_ratio) now use defaults from "
+                "_def and this objective should be re-tuned. Re-save the config to remove "
+                "this warning.",
+                ", ".join(sorted(present)),
+            )
+        return data
 
     def get_spot_detection_mode(self) -> SpotDetectionMode:
         """Get the SpotDetectionMode enum value."""
