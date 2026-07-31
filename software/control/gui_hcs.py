@@ -1226,6 +1226,12 @@ class HighContentScreeningGui(QMainWindow):
             elif self.ndviewerTab is None:
                 self.log.debug("NDViewer tab not available, FOV click navigation disabled")
 
+            # "Open in SquidXplorer" bottom-bar button. Connected here rather than in
+            # napari_connections so it survives Performance Mode, which tears that dict
+            # down — a RAM-limited run is precisely when the operator needs the handoff.
+            if self.unifiedMosaicWidget is not None:
+                self.unifiedMosaicWidget.signal_open_in_squidxplorer.connect(self._on_open_in_squidxplorer_requested)
+
             # z plot
             self.zPlotWidget = widgets.SurfacePlotWidget()
             dock_surface_plot = dock.Dock("Z Plot", autoOrientation=False)
@@ -1519,6 +1525,11 @@ class HighContentScreeningGui(QMainWindow):
         # signals over here, where self.unifiedMosaicWidget is reachable.
         self.multipointController.signal_acquisition_save_target.connect(self._on_acquisition_save_target)
         self.multipointController.timepoint_finished.connect(self._on_timepoint_finished)
+
+        # Gate the mosaic's "Open in SquidXplorer" button on run state — the folder is
+        # still being written while a run is in progress.
+        self.multipointController.signal_acquisition_start.connect(self._on_mosaic_acquisition_started)
+        self.multipointController.acquisition_finished.connect(self._on_mosaic_acquisition_finished)
 
         # Laser engine readiness gate — modal progress dialog while waiting at timepoint boundaries.
         self.multipointController.signal_laser_engine_waiting.connect(self._show_laser_engine_dialog)
@@ -1908,6 +1919,30 @@ class HighContentScreeningGui(QMainWindow):
     def _on_timepoint_finished(self, time_point: int):
         if self.unifiedMosaicWidget is not None:
             self.unifiedMosaicWidget.save_for_timepoint(time_point)
+
+    def _on_mosaic_acquisition_started(self):
+        if self.unifiedMosaicWidget is not None:
+            self.unifiedMosaicWidget.set_acquisition_running(True)
+
+    def _on_mosaic_acquisition_finished(self):
+        if self.unifiedMosaicWidget is not None:
+            self.unifiedMosaicWidget.set_acquisition_running(False)
+
+    def _on_open_in_squidxplorer_requested(self, run_dir):
+        """The mosaic's bottom-bar button. Confirms the folder, then hands it over.
+
+        Not gated by _squidxplorer_prompt_suppressed: that flag is the opt-out for the
+        automatic post-run prompt, and an explicit button press is a fresh request.
+        """
+        reply = QMessageBox.question(
+            self,
+            "Open in SquidXplorer",
+            f"Open this acquisition in SquidXplorer?\n\n{run_dir}",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.Yes,
+        )
+        if reply == QMessageBox.Yes:
+            self._launch_squidxplorer(run_dir)
 
     def _on_resource_limited_run_finished(self):
         """A run that traded away mosaic view has ended."""
