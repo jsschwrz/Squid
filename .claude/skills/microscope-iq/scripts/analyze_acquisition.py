@@ -59,6 +59,10 @@ RE_OOR = re.compile(
 )
 RE_STALE = re.compile(r"it has been ([\d.]+) \[s\] since a valid packet")
 
+# Below this adjusted R2, neither the spatial nor the temporal model is explaining the
+# defocus, so declaring a winner between them would invent a trend that is not there.
+MIN_ADJ_R2_FOR_VERDICT = 0.5
+
 
 def _f(x):
     try:
@@ -319,8 +323,18 @@ def analyse_af(fovs, imgs_df, cfg, out):
             # cannot separate them. The decisive test: pure time drift would make the
             # apparent gradient scale with SECONDS per step, not MILLIMETRES per step.
             # Compare the fitted x/y gradients against that prediction.
+            #
+            # But first: if NEITHER model explains the data, comparing them is meaningless.
+            # A region that is a flat offset plus scatter will still produce a slightly
+            # better fit on one side by chance, and reporting that as "tilt" or "drift"
+            # invents a trend that is not there.
             verdict = "collinear (raster order confounds space and time)"
-            if adjxy - adjt > 0.05:
+            if max(adjxy, adjt) < MIN_ADJ_R2_FOR_VERDICT:
+                verdict = (
+                    f"neither (both fits weak: adj_R2 plane={adjxy:.2f}, time={adjt:.2f}) "
+                    "-- offset plus scatter, not a gradient"
+                )
+            elif adjxy - adjt > 0.05:
                 verdict = "tilt"
             elif adjt - adjxy > 0.05:
                 verdict = "drift"
@@ -341,11 +355,17 @@ def analyse_af(fovs, imgs_df, cfg, out):
                     pass
 
             span = float(np.hypot(gg.x_t.max() - gg.x_t.min(), gg.y_t.max() - gg.y_t.min()))
+            region_s = float(t_rel.max() - t_rel.min())
             tilt.append(dict(region=r, n_fit=int(len(gg)),
                              dz_dx_um_per_mm=round(float(cxy[0]), 3),
                              dz_dy_um_per_mm=round(float(cxy[1]), 3),
                              r2_plane=round(float(r2xy), 3), adj_r2_plane=round(float(adjxy), 3),
                              drift_um_per_min=round(float(ct[0]) * 60, 3),
+                             # Per-minute rate is an extrapolation: on a short region it is
+                             # inflated by dividing across a tiny time span. The total change
+                             # actually observed is what should be compared between runs.
+                             region_duration_s=round(region_s, 1),
+                             drift_total_um_over_region=round(float(ct[0]) * region_s, 2),
                              r2_time=round(float(r2t), 3), adj_r2_time=round(float(adjt), 3),
                              adj_r2_xyt=round(float(adjall), 3),
                              tilt_pp_um=round(float(np.hypot(cxy[0], cxy[1]) * span), 2),

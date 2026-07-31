@@ -1,0 +1,359 @@
+{
+  "dataset": "C:\\Users\\Cephla\\Downloads\\SetUp_NewAF_2026-07-30_19-50-44.181790",
+  "config": {
+    "experiment_id": "SetUp_NewAF_2026-07-30_19-50-44.181790",
+    "objective": "10x",
+    "NA": 0.3,
+    "pixel_size_um": 0.376,
+    "nz": 1,
+    "dz_um": 0.469,
+    "nt": 1,
+    "laser_af": true,
+    "contrast_af": false,
+    "channels": [
+      {
+        "name": "Fluorescence 405 nm Ex - penta",
+        "exposure_ms": 100.0,
+        "z_offset_um": 0.0
+      }
+    ],
+    "regions": [
+      "A1",
+      "A6",
+      "D6",
+      "D1"
+    ]
+  },
+  "log_lines_parsed": 5378,
+  "laser_af": {
+    "attempted": 56,
+    "locked": 52,
+    "failed": 4,
+    "lock_rate_pct": 92.9,
+    "threshold_bracket": [
+      0.884,
+      0.901
+    ],
+    "spot_reference_x_px": 773.8,
+    "um_per_px": 1.8897,
+    "false_rejections": 3,
+    "genuine_failures": 1,
+    "mean_abs_residual_locked_um": 0.127,
+    "mean_abs_defocus_failed_um": 9.375,
+    "dof_full_um": 2.48,
+    "z_stack_range_um": 0.469,
+    "failed_exceeding_stack_range": 4,
+    "failed_exceeding_half_dof": 4,
+    "per_region": [
+      {
+        "region": "A1",
+        "n": 16,
+        "locked": 16,
+        "lock_rate_pct": 100.0,
+        "mean_xcorr": 0.982,
+        "mean_disp_um": 0.09,
+        "region_offset_um": 3.28
+      },
+      {
+        "region": "A6",
+        "n": 12,
+        "locked": 10,
+        "lock_rate_pct": 83.3,
+        "mean_xcorr": 0.942,
+        "mean_disp_um": 0.27,
+        "region_offset_um": 1.0
+      },
+      {
+        "region": "D1",
+        "n": 16,
+        "locked": 14,
+        "lock_rate_pct": 87.5,
+        "mean_xcorr": 0.951,
+        "mean_disp_um": 0.24,
+        "region_offset_um": 1.8
+      },
+      {
+        "region": "D6",
+        "n": 12,
+        "locked": 12,
+        "lock_rate_pct": 100.0,
+        "mean_xcorr": 0.976,
+        "mean_disp_um": 1.22,
+        "region_offset_um": 0.84
+      }
+    ],
+    "tilt_vs_drift": [
+      {
+        "region": "A1",
+        "n_fit": 16,
+        "dz_dx_um_per_mm": 0.887,
+        "dz_dy_um_per_mm": 1.095,
+        "r2_plane": 0.93,
+        "adj_r2_plane": 0.919,
+        "drift_um_per_min": 35.78,
+        "region_duration_s": 21.6,
+        "drift_total_um_over_region": 12.85,
+        "r2_time": 0.77,
+        "adj_r2_time": 0.754,
+        "adj_r2_xyt": 0.914,
+        "tilt_pp_um": 15.55,
+        "verdict": "tilt"
+      },
+      {
+        "region": "A6",
+        "n_fit": 12,
+        "dz_dx_um_per_mm": 0.048,
+        "dz_dy_um_per_mm": 1.072,
+        "r2_plane": 0.836,
+        "adj_r2_plane": 0.8,
+        "drift_um_per_min": 35.443,
+        "region_duration_s": 17.2,
+        "drift_total_um_over_region": 10.18,
+        "r2_time": 0.732,
+        "adj_r2_time": 0.705,
+        "adj_r2_xyt": 0.805,
+        "tilt_pp_um": 10.07,
+        "verdict": "tilt"
+      },
+      {
+        "region": "D1",
+        "n_fit": 15,
+        "dz_dx_um_per_mm": 0.081,
+        "dz_dy_um_per_mm": 0.376,
+        "r2_plane": 0.318,
+        "adj_r2_plane": 0.204,
+        "drift_um_per_min": 10.378,
+        "region_duration_s": 23.3,
+        "drift_total_um_over_region": 4.03,
+        "r2_time": 0.324,
+        "adj_r2_time": 0.272,
+        "adj_r2_xyt": 0.143,
+        "tilt_pp_um": 4.25,
+        "verdict": "neither (both fits weak: adj_R2 plane=0.20, time=0.27) -- offset plus scatter, not a gradient"
+      },
+      {
+        "region": "D6",
+        "n_fit": 12,
+        "dz_dx_um_per_mm": 0.01,
+        "dz_dy_um_per_mm": 0.741,
+        "r2_plane": 0.951,
+        "adj_r2_plane": 0.94,
+        "drift_um_per_min": 26.477,
+        "region_duration_s": 15.9,
+        "drift_total_um_over_region": 7.0,
+        "r2_time": 0.872,
+        "adj_r2_time": 0.86,
+        "adj_r2_xyt": 0.934,
+        "tilt_pp_um": 6.95,
+        "verdict": "tilt"
+      }
+    ]
+  },
+  "throughput": {
+    "wall_time_s": 83.6,
+    "acquisition_time_s": 82.63,
+    "n_fov": 56,
+    "n_z_positions": 56,
+    "n_frames": 56,
+    "n_channels": 1,
+    "n_image_files": 56,
+    "bytes_on_disk_gb": 1.95,
+    "frames_per_s": 0.678,
+    "ms_per_frame": 1475.6,
+    "s_per_z_position": 1.476,
+    "s_per_fov": 1.48,
+    "data_rate_MB_s": 23.5,
+    "time_budget": {
+      "acquire_camera_image": {
+        "n": 56,
+        "mean_s": 0.4326,
+        "p95_s": 0.4572,
+        "max_s": 0.4787,
+        "total_s": 24.2,
+        "pct_of_run": 29.3
+      },
+      "exposure_time_done_sleep_hw or wait_for_image_sw": {
+        "n": 56,
+        "mean_s": 0.3199,
+        "p95_s": 0.3382,
+        "max_s": 0.3709,
+        "total_s": 17.9,
+        "pct_of_run": 21.7
+      },
+      "_image_callback": {
+        "n": 56,
+        "mean_s": 0.0769,
+        "p95_s": 0.0963,
+        "max_s": 0.1018,
+        "total_s": 4.3,
+        "pct_of_run": 5.2
+      },
+      "send_trigger": {
+        "n": 56,
+        "mean_s": 0.0022,
+        "p95_s": 0.0037,
+        "max_s": 0.0045,
+        "total_s": 0.1,
+        "pct_of_run": 0.1
+      },
+      "move_to_coordinate": {
+        "n": 56,
+        "mean_s": 0.6912,
+        "p95_s": 2.362,
+        "max_s": 4.0397,
+        "total_s": 38.7,
+        "pct_of_run": 46.8
+      },
+      "image_to_display*.emit": {
+        "n": 56,
+        "mean_s": 0.0077,
+        "p95_s": 0.0678,
+        "max_s": 0.0828,
+        "total_s": 0.4,
+        "pct_of_run": 0.5
+      },
+      "job creation and dispatch": {
+        "n": 56,
+        "mean_s": 0.0001,
+        "p95_s": 0.0001,
+        "max_s": 0.0007,
+        "total_s": 0.0,
+        "pct_of_run": 0.0
+      }
+    },
+    "exposure_per_z_position_s": 0.1,
+    "duty_cycle_pct": 6.8,
+    "floor_if_exposure_only_min": 0.1,
+    "slowdown": {
+      "acquire_first_half_s": 0.788,
+      "acquire_second_half_s": 0.78,
+      "acquire_delta_pct": -1.0,
+      "acquire_median_s": 0.78,
+      "fovs_over_110pct_of_median": [
+        {
+          "idx": 47,
+          "t_rel_s": 71.0,
+          "acquire_s": 0.941
+        }
+      ],
+      "per_frame_drift_ms_over_run": 24.9
+    },
+    "microcontroller_stale_reads": {
+      "n": 6,
+      "mean_gap_s": 0.105,
+      "max_gap_s": 0.108,
+      "first_t_rel_s": 13.9,
+      "last_t_rel_s": 77.5
+    }
+  },
+  "positioning": {
+    "merge": {
+      "both": 56,
+      "left_only": 0,
+      "right_only": 0
+    },
+    "dx_um": {
+      "n": 56,
+      "mean_signed": 0.0431,
+      "mean_abs": 0.185,
+      "std": 0.2208,
+      "p95_abs": 0.345,
+      "max_abs": 0.345
+    },
+    "dy_um": {
+      "n": 56,
+      "mean_signed": -0.0144,
+      "mean_abs": 0.2068,
+      "std": 0.2146,
+      "p95_abs": 0.2849,
+      "max_abs": 0.2849
+    },
+    "dr_um": {
+      "n": 56,
+      "mean_signed": 0.2943,
+      "mean_abs": 0.2943,
+      "std": 0.0935,
+      "p95_abs": 0.4276,
+      "max_abs": 0.4474
+    },
+    "max_xy_error_px": 1.19,
+    "dz_um_all": {
+      "n": 56,
+      "mean_signed": 1.5971,
+      "mean_abs": 2.923,
+      "std": 3.375,
+      "p95_abs": 6.9141,
+      "max_abs": 9.9375
+    },
+    "dz_um_af_locked": {
+      "n": 52,
+      "mean_signed": 1.72,
+      "mean_abs": 3.1478,
+      "std": 3.474,
+      "max_abs": 9.9375
+    },
+    "dz_um_af_failed": {
+      "n": 4,
+      "mean_signed": 0.0,
+      "mean_abs": 0.0,
+      "std": 0.0,
+      "max_abs": 0.0
+    },
+    "residual_focus_error_um": {
+      "n": 56,
+      "mean_signed": 0.3072,
+      "mean_abs": 0.7877,
+      "std": 3.3978,
+      "p95_abs": 2.925,
+      "max_abs": 23.6
+    },
+    "xy_drift_within_stack_um": {
+      "max_x": 0.0,
+      "max_y": 0.0
+    },
+    "per_region": [
+      {
+        "region": "A1",
+        "n": 16,
+        "mean_abs_dx_um": 0.207,
+        "mean_abs_dy_um": 0.207,
+        "max_dr_um": 0.447,
+        "mean_abs_dz_um": 4.488,
+        "max_abs_dz_um": 9.938
+      },
+      {
+        "region": "A6",
+        "n": 12,
+        "mean_abs_dx_um": 0.156,
+        "mean_abs_dy_um": 0.207,
+        "max_dr_um": 0.433,
+        "mean_abs_dz_um": 1.57,
+        "max_abs_dz_um": 3.656
+      },
+      {
+        "region": "D1",
+        "n": 16,
+        "mean_abs_dx_um": 0.207,
+        "mean_abs_dy_um": 0.207,
+        "max_dr_um": 0.43,
+        "mean_abs_dz_um": 3.047,
+        "max_abs_dz_um": 5.813
+      },
+      {
+        "region": "D6",
+        "n": 12,
+        "mean_abs_dx_um": 0.156,
+        "mean_abs_dy_um": 0.207,
+        "max_dr_um": 0.414,
+        "mean_abs_dz_um": 2.023,
+        "max_abs_dz_um": 3.656
+      }
+    ]
+  },
+  "warning_error_templates": {
+    "Cross correlation check failed - spots not well aligned (laser_auto_focus_controller.py:#)": 8,
+    "Read thread is stale, it has been # [s] since a valid packet. Last cmd id from the mcu was #, our last sent cmd id was # (microcontroller.py:#)": 6,
+    "Autofocus failed in acquire_at_position.  Continuing to acquire anyway using the current z position (z=# [mm]) (multi_point_worker.py:#)": 4,
+    "Got an image in the image callback, but we didn't send a trigger.  Ignoring the image. (multi_point_worker.py:#)": 1
+  }
+}

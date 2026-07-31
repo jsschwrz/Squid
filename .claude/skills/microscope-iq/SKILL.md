@@ -44,8 +44,12 @@ throughput, positioning discrepancy. Lead each with the headline number, then
 the evidence, then the caveat. Always state which numbers came from the log
 versus the CSVs. Finish with a severity-ranked findings table.
 
-Reference example: `QCMetric/IQ_SoakTest_Results.md` (repo-relative) — the
-2026-07-30 four-corners soak test, which is also where this skill came from.
+Reference examples (repo-relative), both worth reading before writing a new one:
+- `QCMetric/IQ_SoakTest_Results.md` — the 2026-07-30 four-corners soak test this
+  skill came from
+- `QCMetric/IQ_NewAF_Results.md` — the same grid re-run after the connected-components
+  AF merge, showing how to structure a **comparison** report and how to be explicit
+  about confounded attribution when more than one thing changed between runs
 
 ## How to read the results
 
@@ -91,11 +95,26 @@ apparent dz/dx and dz/dy would differ by that same ratio. If they are comparable
 while the visit rates differ several-fold, it is tilt.
 
 When defocus varies only along the slow axis, the data genuinely cannot decide —
-say so rather than guessing. To resolve it, **re-acquire the region in reverse FOV
-order**: tilt reproduces the same spatial map, drift inverts relative to position.
+say so rather than guessing.
 
-A region with low adj R² on *both* fits is neither — that is a flat focus-map
-*offset*, and a tilt correction will not help it.
+**The cheapest way to resolve it: re-acquire the same geometry at a different time
+scale.** Drop to 1 channel × 1 z and the run gets ~15-20x faster while every FOV
+position stays identical — laser AF fires once per FOV regardless of channels or z,
+so you lose no AF data. Tilt is fixed to position and reproduces the same
+peak-to-peak; drift is fixed to time and shrinks in proportion to the duration.
+This settled A1/A6/D6 on this instrument: 374 s -> 22 s per region, tilt unchanged
+at 15.2 -> 15.6 um. Compare `tilt_pp_um` and `drift_total_um_over_region` between
+the two runs, not `drift_um_per_min` -- the per-minute rate is an extrapolation and
+is inflated on short runs.
+
+(Re-acquiring in reverse FOV order also works -- tilt reproduces, drift inverts --
+but it needs a config change the GUI may not expose, so try the time-scale test first.)
+
+A region with low adj R² on *both* fits is neither tilt nor drift — that is a flat
+focus-map *offset* plus scatter, and a tilt correction will not help it. The script
+emits an explicit `neither (both fits weak...)` verdict below
+`MIN_ADJ_R2_FOR_VERDICT` rather than declaring whichever model happened to fit
+marginally better; do not read a winner out of two failing fits.
 
 ### Throughput
 
