@@ -711,17 +711,16 @@ class TestLaserAFConfig:
         assert config.spot_detection_mode == SpotDetectionMode(_def.LASER_AF_SPOT_DETECTION_MODE)
         assert config.laser_af_averaging_n == _def.LASER_AF_AVERAGING_N
         assert config.correlation_threshold == _def.CORRELATION_THRESHOLD
-        assert config.min_peak_prominence == _def.LASER_AF_MIN_PEAK_PROMINENCE
         assert config.focus_camera_exposure_time_ms == float(_def.FOCUS_CAMERA_EXPOSURE_TIME_MS)
         assert config.focus_camera_analog_gain == float(_def.FOCUS_CAMERA_ANALOG_GAIN)
-        assert config.displacement_success_window_um == _def.DISPLACEMENT_SUCCESS_WINDOW_UM
+        assert config.displacement_success_window_pixels == float(_def.DISPLACEMENT_SUCCESS_WINDOW_PIXELS)
         assert config.spot_crop_size == _def.SPOT_CROP_SIZE
         assert config.pixel_to_um_calibration_distance == _def.PIXEL_TO_UM_CALIBRATION_DISTANCE
-        assert config.y_window == _def.LASER_AF_Y_WINDOW
-        assert config.x_window == _def.LASER_AF_X_WINDOW
-        assert config.min_peak_width == float(_def.LASER_AF_MIN_PEAK_WIDTH)
-        assert config.min_peak_distance == float(_def.LASER_AF_MIN_PEAK_DISTANCE)
-        assert config.spot_spacing == float(_def.LASER_AF_SPOT_SPACING)
+        assert config.cc_threshold == float(_def.LASER_AF_CC_THRESHOLD)
+        assert config.cc_min_area == _def.LASER_AF_CC_MIN_AREA
+        assert config.cc_max_area == _def.LASER_AF_CC_MAX_AREA
+        assert config.cc_row_tolerance == float(_def.LASER_AF_CC_ROW_TOLERANCE)
+        assert config.cc_max_aspect_ratio == float(_def.LASER_AF_CC_MAX_ASPECT_RATIO)
         assert config.filter_sigma == _def.LASER_AF_FILTER_SIGMA
         assert config.initialize_crop_width == _def.LASER_AF_INITIALIZE_CROP_WIDTH
         assert config.initialize_crop_height == _def.LASER_AF_INITIALIZE_CROP_HEIGHT
@@ -744,6 +743,81 @@ class TestLaserAFConfig:
         assert config.pixel_to_um == 0.5
         assert config.has_reference is True
         assert config.spot_detection_mode == SpotDetectionMode.SINGLE
+
+    def test_legacy_line_profile_config_still_loads(self):
+        """A config written by the line-profile detector must still load.
+
+        ConfigRepository._load_yaml swallows ValidationError and returns None, so a
+        rejected config silently loses the objective's whole calibration rather than
+        failing loudly. The legacy detection keys are dropped; every calibration field
+        must survive.
+        """
+        import control._def as _def
+
+        legacy = {
+            "pixel_to_um": 1.9707661823541205,
+            "x_reference": 1606.9260959823705,
+            "has_reference": True,
+            "correlation_threshold": 0.9,
+            "calibration_timestamp": "2026-07-30 15:02:13",
+            "reference_image": "base64encodeddata",
+            "reference_image_shape": [100, 100],
+            "reference_image_dtype": "float32",
+            # line-profile fields that no longer exist in the schema
+            "displacement_success_window_um": 1.0,
+            "y_window": 96,
+            "x_window": 20,
+            "min_peak_width": 10.0,
+            "min_peak_distance": 10.0,
+            "min_peak_prominence": 0.25,
+            "spot_spacing": 100.0,
+            "filter_sigma": -1.0,  # legacy "filtering off" sentinel
+        }
+        config = LaserAFConfig(**legacy)
+
+        # calibration preserved
+        assert config.pixel_to_um == 1.9707661823541205
+        assert config.x_reference == 1606.9260959823705
+        assert config.has_reference is True
+        assert config.correlation_threshold == 0.9
+        assert config.reference_image == "base64encodeddata"
+        assert config.reference_image_shape == [100, 100]
+
+        # detection parameters fall back to the new defaults, not translated
+        assert config.cc_threshold == float(_def.LASER_AF_CC_THRESHOLD)
+        assert config.cc_min_area == _def.LASER_AF_CC_MIN_AREA
+        assert config.displacement_success_window_pixels == float(_def.DISPLACEMENT_SUCCESS_WINDOW_PIXELS)
+
+        # the legacy "filtering off" sentinel is replaced by the connected-components
+        # default, which is the regime the new detector was tuned in
+        assert config.filter_sigma == _def.LASER_AF_FILTER_SIGMA
+
+        # legacy keys are gone from a re-dump, so re-saving cleans the file
+        dumped = config.model_dump(exclude_none=True, mode="json", warnings=False)
+        assert not {"y_window", "x_window", "spot_spacing", "displacement_success_window_um"} & set(dumped)
+        assert LaserAFConfig(**dumped).pixel_to_um == 1.9707661823541205
+
+    def test_migrated_config_keeps_explicit_filter_sigma(self):
+        """filter_sigma is only defaulted on the legacy path, not overridden forever.
+
+        Once a config has been migrated (no legacy keys), an explicitly chosen value --
+        including 0 to disable filtering -- must survive.
+        """
+        migrated = LaserAFConfig(pixel_to_um=1.0, filter_sigma=0)
+        assert migrated.filter_sigma == 0
+
+        explicit = LaserAFConfig(pixel_to_um=1.0, filter_sigma=3)
+        assert explicit.filter_sigma == 3
+
+    def test_malformed_filter_sigma_reports_cleanly(self):
+        """A bad filter_sigma must reach pydantic, not TypeError inside the shim."""
+        with pytest.raises(ValidationError):
+            LaserAFConfig(pixel_to_um=1.0, y_window=96, filter_sigma="not-a-number")
+
+    def test_unknown_field_still_rejected(self):
+        """The legacy shim must not become a blanket extra="allow"."""
+        with pytest.raises(ValidationError):
+            LaserAFConfig(pixel_to_um=1.0, not_a_real_field=123)
 
     def test_laser_af_config_with_reference_image(self):
         """Test LaserAFConfig with reference image data."""
