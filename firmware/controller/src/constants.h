@@ -64,6 +64,13 @@ static inline bool INTERLOCK_OK() { return true; }
 static inline bool INTERLOCK_OK() { return digitalRead(PIN_ILLUMINATION_INTERLOCK) == LOW; }
 #endif
 
+// TEMP DIAGNOSTIC - not for merge. Candidate pins whose live state is reported in
+// response bytes 19-21; bit i corresponds to DIAG_PINS[i]. 1 = HIGH (pull-up, loop
+// open), 0 = LOW (pulled to GND, loop closed). Used to locate which Teensy pin the
+// physical interlock connector actually lands on. Pin 0 = PG, pin 2 = current interlock.
+static const int DIAG_PINS[] = {0, 1, 2, 7, 8, 14, 17, 18, 19, 24, 26, 27, 38, 39, 40};
+static const int NUM_DIAG_PINS = sizeof(DIAG_PINS) / sizeof(DIAG_PINS[0]);
+
 // PWM6 2
 // PWM7 1
 // PWM8 0

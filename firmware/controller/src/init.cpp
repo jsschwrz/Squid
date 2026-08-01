@@ -78,6 +78,11 @@ void init_io()
     pinMode(digitial_output_pins[i], OUTPUT);
     digitalWrite(digitial_output_pins[i], LOW);
   }
+
+  // TEMP DIAGNOSTIC - not for merge. Pull up the candidate interlock pins so their
+  // state can be reported in response bytes 19-21.
+  for (int i = 0; i < NUM_DIAG_PINS; i++)
+    pinMode(DIAG_PINS[i], INPUT_PULLUP);
 }
 
 void init_stages()

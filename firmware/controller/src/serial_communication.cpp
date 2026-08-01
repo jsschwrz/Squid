@@ -87,10 +87,15 @@ void send_position_update()
     buffer_tx[18] &= ~ (1 << BIT_POS_JOYSTICK_BUTTON); // clear the joystick button bit
     buffer_tx[18] = buffer_tx[18] | joystick_button_pressed << BIT_POS_JOYSTICK_BUTTON;
 
-    // Clear reserved bytes to avoid stale data affecting the checksum
-    buffer_tx[19] = 0;
-    buffer_tx[20] = 0;
-    buffer_tx[21] = 0;
+    // TEMP DIAGNOSTIC - not for merge. Report candidate interlock pin states in the
+    // otherwise-reserved bytes; bit i corresponds to DIAG_PINS[i].
+    uint32_t diag_mask = 0;
+    for (int i = 0; i < NUM_DIAG_PINS; i++)
+      if (digitalRead(DIAG_PINS[i]))
+        diag_mask |= (1UL << i);
+    buffer_tx[19] = diag_mask & 0xFF;
+    buffer_tx[20] = (diag_mask >> 8) & 0xFF;
+    buffer_tx[21] = (diag_mask >> 16) & 0xFF;
 
     // Firmware version in byte 22: high nibble = major, low nibble = minor
     buffer_tx[22] = (FIRMWARE_VERSION_MAJOR << 4) | (FIRMWARE_VERSION_MINOR & 0x0F);
