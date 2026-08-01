@@ -6746,13 +6746,6 @@ class FlexibleMultiPointWidget(AcquisitionYAMLDropMixin, _ApplyChannelOffsetMixi
                 self.btn_startAcquisition.setChecked(False)
                 return
 
-            # Advisory: a time point longer than dt is allowed (nothing is skipped), but the
-            # operator should know the run will stretch out before they commit to it.
-            if not check_time_lapse_pacing_with_dialog(self.multipointController, self._log, self):
-                self._log.info("User cancelled acquisition after the time-lapse pacing warning.")
-                self.btn_startAcquisition.setChecked(False)
-                return
-
             # Not enough RAM for the live mosaic is not a reason to refuse the run — only
             # the preview is unaffordable. Trade it away and carry on.
             if mosaic_ram_exceeds_available(
@@ -9145,13 +9138,6 @@ class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, _ApplyChannelOffsetMix
             elif not check_space_available_with_error_dialog(self.multipointController, self._log):
                 self.btn_startAcquisition.setChecked(False)
                 self._log.error("Failed to start acquisition.  Not enough disk space available.")
-                return
-
-            # Advisory: a time point longer than dt is allowed (nothing is skipped), but the
-            # operator should know the run will stretch out before they commit to it.
-            if not check_time_lapse_pacing_with_dialog(self.multipointController, self._log, self):
-                self.btn_startAcquisition.setChecked(False)
-                self._log.info("User cancelled acquisition after the time-lapse pacing warning.")
                 return
 
             # Not enough RAM for the live mosaic is not a reason to refuse the run — only
