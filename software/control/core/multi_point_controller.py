@@ -227,6 +227,7 @@ class MultiPointController:
         self.base_path = None
         self.use_fluidics = False
         self.skip_saving = False
+        self.dry_run = False
         self.xy_mode = "Current Position"
         self.widget_type = "wellplate"  # "wellplate" or "flexible"
         self.scan_size_mm = 0.0  # For wellplate mode: size of scan area per region
@@ -436,6 +437,15 @@ class MultiPointController:
 
     def set_skip_saving(self, skip_saving):
         self.skip_saving = skip_saving
+
+    def set_dry_run(self, dry_run: bool):
+        """Dry run: the real acquisition path runs, but the illumination is never opened.
+
+        Set ONLY by run_timing_probe().  The flag on its own does not make a run safe --
+        timing_probe_refusal_reason() holds the guards that do, and _illumination_fuse()
+        is the runtime backstop.
+        """
+        self.dry_run = dry_run
 
     def set_xy_mode(self, xy_mode):
         self.xy_mode = xy_mode
@@ -1068,6 +1078,7 @@ class MultiPointController:
             z_range=self.z_range,
             use_fluidics=self.use_fluidics,
             skip_saving=self.skip_saving,
+            dry_run=self.dry_run,
             plate_num_rows=plate_num_rows,
             plate_num_cols=plate_num_cols,
             xy_mode=self.xy_mode,
