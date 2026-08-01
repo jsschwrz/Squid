@@ -69,7 +69,11 @@ static inline bool INTERLOCK_OK() { return false; }
 // response bytes 19-21; bit i corresponds to DIAG_PINS[i]. 1 = HIGH (pull-up, loop
 // open), 0 = LOW (pulled to GND, loop closed). Used to locate which Teensy pin the
 // physical interlock connector actually lands on. Pin 0 = PG, pin 2 = current interlock.
-static const int DIAG_PINS[] = {0, 1, 2, 7, 8, 14, 17, 18, 19, 24, 26, 27, 38, 39, 40};
+// Sweep 3 adds 6, 9, 10, 15 - the general-purpose digitial_output_pins. init_io()
+// drives them OUTPUT/LOW and nothing ever touches them again, so an interlock line
+// landing on one would be fighting the driver and read as no change at all. The
+// pulldown below is applied after that loop, so they end up as inputs.
+static const int DIAG_PINS[] = {0, 1, 2, 6, 7, 8, 9, 10, 14, 15, 17, 18, 19, 24, 26, 27, 38, 39, 40};
 static const int NUM_DIAG_PINS = sizeof(DIAG_PINS) / sizeof(DIAG_PINS[0]);
 
 // PWM6 2
