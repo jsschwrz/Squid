@@ -58,11 +58,12 @@ static const int LASER_730nm = PIN_ILLUMINATION_D5;
 static const int LASER_INTERLOCK = PIN_ILLUMINATION_INTERLOCK;
 
 // Laser safety interlock check
-#ifdef DISABLE_LASER_INTERLOCK
-static inline bool INTERLOCK_OK() { return true; }
-#else
-static inline bool INTERLOCK_OK() { return digitalRead(PIN_ILLUMINATION_INTERLOCK) == LOW; }
-#endif
+// TEMP DIAGNOSTIC - not for merge. Hard-forced false for the duration of the
+// active-high pin sweep. The sweep configures the candidate pins (pin 2 included)
+// as INPUT_PULLDOWN, so the normal `== LOW` test would read a pulled-down pin 2 as
+// "interlock satisfied" and permit lasers with no interlock present. Blocking
+// outright is the only safe state while the pin modes are being manipulated.
+static inline bool INTERLOCK_OK() { return false; }
 
 // TEMP DIAGNOSTIC - not for merge. Candidate pins whose live state is reported in
 // response bytes 19-21; bit i corresponds to DIAG_PINS[i]. 1 = HIGH (pull-up, loop
