@@ -7,7 +7,7 @@ import yaml
 import logging
 import sys
 from pathlib import Path
-from typing import Dict, List, NamedTuple, Optional, TYPE_CHECKING
+from typing import Callable, Dict, List, NamedTuple, Optional, TYPE_CHECKING
 
 import psutil
 
@@ -2904,13 +2904,31 @@ class LaserAutofocusSettingWidget(QWidget):
     # broken rather than as pacing.
     _MARGIN_REFRESH_INTERVAL_S = 0.2
 
-    def __init__(self, streamHandler, liveController: LiveController, laserAutofocusController, stretch=True):
+    def __init__(
+        self,
+        streamHandler,
+        liveController: LiveController,
+        laserAutofocusController,
+        stretch=True,
+        microscope=None,
+        objectiveStore=None,
+        mainLiveController: Optional[LiveController] = None,
+        getFlexibleMultiPointLocations: Optional[Callable] = None,
+    ):
         super().__init__()
         self._log = squid.logging.get_logger(self.__class__.__name__)
         self.streamHandler = streamHandler
+        # NOTE: this is the *focus* camera's live controller. The Laser AF Map needs the main
+        # camera's, which arrives separately as mainLiveController.
         self.liveController: LiveController = liveController
         self.laserAutofocusController = laserAutofocusController
         self.stretch = stretch
+        # Optional extras used only by the Laser AF Map diagnostic. They stay None-tolerant so
+        # tests and other contexts can build this widget bare.
+        self.microscope = microscope
+        self.objectiveStore = objectiveStore
+        self.mainLiveController = mainLiveController
+        self.getFlexibleMultiPointLocations = getFlexibleMultiPointLocations
         self.liveController.set_trigger_fps(10)
         self.streamHandler.set_display_fps(10)
 
@@ -3332,8 +3350,19 @@ class LaserAutofocusSettingWidget(QWidget):
             "Leaves the crop and the reference position untouched."
         )
         sweep_button_layout = QHBoxLayout()
+        self.btn_laser_af_map = QPushButton("Laser AF Map")
+        self.btn_laser_af_map.setStyleSheet("background-color: #C2C2FF")
+        self.btn_laser_af_map.setEnabled(False)
+        self.btn_laser_af_map.setToolTip(
+            "Diagnostic: sweep Z at each Flexible Multipoint location, recording the laser AF\n"
+            "displacement, a main-camera image and a laser-AF-camera image at every step, then\n"
+            "repeat the closed-loop autofocus N times to measure where it lands and how much it\n"
+            "scatters. Requires an initialized laser AF."
+        )
+
         sweep_button_layout.addWidget(self.focus_sweep_button)
         sweep_button_layout.addWidget(self.apply_slope_button)
+        sweep_button_layout.addWidget(self.btn_laser_af_map)
         calibration_layout.addLayout(sweep_button_layout)
 
         self.calibration_label = QLabel()
@@ -3373,7 +3402,10 @@ class LaserAutofocusSettingWidget(QWidget):
         self._update_confirm_prediction_label()
         self.focus_sweep_button.clicked.connect(self.signal_run_af_sweep.emit)
         self.apply_slope_button.clicked.connect(self.signal_apply_sweep_slope.emit)
+        self.btn_laser_af_map.clicked.connect(self.on_laser_af_map_clicked)
         self.characterization_checkbox.toggled.connect(self.toggle_characterization_mode)
+
+        self.update_map_button_state()
 
     def _add_spinbox(
         self,
@@ -3655,6 +3687,7 @@ class LaserAutofocusSettingWidget(QWidget):
         )
 
         self.update_threshold_button.setEnabled(self.laserAutofocusController.is_initialized)
+        self.update_map_button_state()
         self.update_calibration_label()
         self.center_crop_button.setEnabled(self._last_spot_detection is not None)
         # Reached after every crop apply and every Initialize. The table describes a frame captured
@@ -3667,6 +3700,61 @@ class LaserAutofocusSettingWidget(QWidget):
         # the previous objective be written into this one's pixel_to_um in a single click, which
         # is silent and wrong. Disarming costs a re-sweep; that is the cheaper mistake.
         self.set_sweep_slope_available(False)
+
+    def update_map_button_state(self):
+        """Enable the Laser AF Map button once the controller is initialized.
+
+        Initialization is necessary but not sufficient: apply_and_initialize() clears
+        has_reference, and without a reference every displacement reads NaN. The dialog
+        surfaces that separately rather than silently keeping this button greyed out, so the
+        user can see *why* they can't proceed.
+        """
+        self.btn_laser_af_map.setEnabled(
+            bool(self.laserAutofocusController.is_initialized) and self._laser_af_map_dependencies_available()
+        )
+
+    def _laser_af_map_dependencies_available(self) -> bool:
+        microscope = self.microscope
+        if microscope is None:
+            return False
+        return (self.mainLiveController or getattr(microscope, "live_controller", None)) is not None and (
+            self.objectiveStore or getattr(microscope, "objective_store", None)
+        ) is not None
+
+    def on_laser_af_map_clicked(self):
+        # Imported lazily so GUI startup doesn't pay for it and so this module stays optional.
+        from control.laser_af_map import LaserAFMapDialog, LaserAFMapProgressDialog, LaserAFMapWorker
+
+        if not self._laser_af_map_dependencies_available():
+            error_dialog("The Laser AF Map is unavailable: this widget was built without a microscope handle.")
+            return
+
+        # The focus camera's live view fights the map for the focus camera; stop it up front.
+        if self.liveController.is_live:
+            self.stop_live()
+
+        dialog = LaserAFMapDialog(
+            laser_af_controller=self.laserAutofocusController,
+            microscope=self.microscope,
+            objective_store=self.objectiveStore or self.microscope.objective_store,
+            live_controller=self.mainLiveController or self.microscope.live_controller,
+            get_flexible_points=self.getFlexibleMultiPointLocations,
+            default_base_path=get_last_used_saving_path(),
+            parent=self,
+        )
+        if dialog.exec_() != QDialog.Accepted or dialog.config is None:
+            return
+
+        save_last_used_saving_path(dialog.config.base_path)
+
+        worker = LaserAFMapWorker(self.microscope, self.laserAutofocusController, dialog.config)
+        progress = LaserAFMapProgressDialog(worker, parent=self)
+        progress.start()
+        progress.exec_()
+
+        # measure_displacement / move_to_target may have moved the reference state around, and
+        # the run restores camera callbacks; resync the panel with the controller.
+        self.update_map_button_state()
 
     def update_threshold_settings(self):
         updates = {
