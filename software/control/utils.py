@@ -506,6 +506,43 @@ def truncate_to_interval(val, interval: int):
     return int(interval * (val // interval))
 
 
+def clamp_roi(
+    offset_x: float,
+    offset_y: float,
+    width: float,
+    height: float,
+    sensor_width: int,
+    sensor_height: int,
+    x_interval: int = 8,
+    y_interval: int = 2,
+    min_width: int = 8,
+    min_height: int = 2,
+) -> Tuple[int, int, int, int]:
+    """Snap an ROI to the camera's alignment grid and clamp it inside the sensor.
+
+    Cameras reject an ROI that runs off the sensor. Some backends raise (the Daheng
+    backend in control/camera.py compares the readback and raises CameraError), others
+    silently keep the previous ROI, which leaves the config and the delivered frames
+    describing different regions. Callers should route any computed ROI through here so
+    an out-of-range request never reaches the driver.
+
+    Returns (offset_x, offset_y, width, height) as ints, guaranteed to satisfy
+    0 <= offset and offset + size <= sensor.
+
+    Order matters. Sizes are clamped and truncated first, then offsets are clamped
+    against the resulting size; truncation only ever shrinks, so the result stays in
+    bounds. Negative offsets are clamped to 0 *before* truncation because
+    truncate_to_interval floors: truncate_to_interval(-3, 8) == -8, not 0.
+    """
+    width = truncate_to_interval(min(max(width, min_width), sensor_width), x_interval)
+    height = truncate_to_interval(min(max(height, min_height), sensor_height), y_interval)
+
+    offset_x = truncate_to_interval(min(max(offset_x, 0), sensor_width - width), x_interval)
+    offset_y = truncate_to_interval(min(max(offset_y, 0), sensor_height - height), y_interval)
+
+    return int(offset_x), int(offset_y), int(width), int(height)
+
+
 def get_available_disk_space(directory: pathlib.Path) -> int:
     """
     Returns the available disk space, in bytes, for files created as children of the given directory.

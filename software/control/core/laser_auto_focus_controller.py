@@ -17,6 +17,7 @@ from control.microcontroller import Microcontroller
 from control.piezo import PiezoStage
 from control.models import LaserAFConfig
 from squid.abc import AbstractCamera, AbstractStage
+from squid.camera.utils import SimulatedCamera
 import squid.logging
 
 
@@ -55,6 +56,19 @@ class LaserAutofocusController(QObject):
 
         self.image = None  # for saving the focus camera image for debugging when centroid cannot be found
 
+        # Capture the sensor size before load_cached_configuration() narrows the ROI to the
+        # stored crop. get_resolution() reports WidthMax/HeightMax, which under GenICam is
+        # allowed to mean SensorWidth - OffsetX; reading it here, while the offset is still
+        # at the driver default, avoids under-reporting. The max() is belt-and-braces for a
+        # driver that has already applied an offset of its own.
+        try:
+            roi_x, roi_y, roi_w, roi_h = camera.get_region_of_interest()
+            max_w, max_h = camera.get_resolution()
+            self._sensor_size = (max(int(max_w), roi_x + roi_w), max(int(max_h), roi_y + roi_h))
+        except Exception:
+            self._sensor_size = (3088, 2064)
+            self._log.warning("Could not query focus camera sensor size; assuming 3088x2064.", exc_info=True)
+
         # Load configurations if available
         self.load_cached_configuration()
 
@@ -67,6 +81,10 @@ class LaserAutofocusController(QObject):
     def _current_profile(self) -> Optional[str]:
         """Get current profile from ConfigRepository."""
         return self._config_repo.current_profile
+
+    def get_sensor_size(self) -> Tuple[int, int]:
+        """Focus camera sensor size as (width, height), captured before any crop was applied."""
+        return self._sensor_size
 
     def initialize_manual(self, config: LaserAFConfig) -> None:
         """Initialize laser autofocus with manual parameters."""
@@ -141,18 +159,42 @@ class LaserAutofocusController(QObject):
         # Initialize with loaded config
         self.initialize_manual(config)
 
-    def initialize_auto(self) -> bool:
+    def initialize_auto(self, search_within_current_crop: bool = False) -> bool:
         """Automatically initialize laser autofocus by finding the spot and calibrating.
 
         This method:
-        1. Finds the laser spot on full sensor
+        1. Finds the laser spot
         2. Sets up ROI around the spot
         3. Calibrates pixel-to-um conversion using two z positions
+
+        By default the search covers a window centered on the sensor, and the crop is then
+        placed around whatever was found. That window cannot be moved off-center, so when
+        the sensor shows more than one reflection it may well pick the wrong one -- and it
+        overwrites any crop the operator had placed by hand.
+
+        With search_within_current_crop, the existing crop *is* the search region and is
+        left exactly as it was. This is the mode to use once the operator has framed the
+        reflection they want and excluded the spurious ones: the crop is the answer to
+        "which spot", so initialization has nothing left to guess.
+
+        Either way the reference is cleared and pixel-to-um is re-calibrated.
 
         Returns:
             bool: True if initialization successful, False if any step fails
         """
-        self.camera.set_region_of_interest(0, 0, 3088, 2064)
+        if search_within_current_crop:
+            # Apply the configured crop before searching, so the region searched is exactly
+            # the region the caller framed. Without this, a crop that had been edited but not
+            # yet applied would be searched at its old position. apply_crop also clamps it and
+            # clears the reference, and is a no-op on the camera if it is already in effect.
+            self.apply_crop(
+                self.laser_af_properties.x_offset,
+                self.laser_af_properties.y_offset,
+                self.laser_af_properties.width,
+                self.laser_af_properties.height,
+            )
+        else:
+            self.camera.set_region_of_interest(0, 0, *self._sensor_size)
 
         # update camera settings
         self.camera.set_exposure_time(self.laser_af_properties.focus_camera_exposure_time_ms)
@@ -167,11 +209,19 @@ class LaserAutofocusController(QObject):
 
         result = self._get_laser_spot_centroid(
             remove_background=True,
+            # Without a center crop the search covers the current ROI, which in this mode is
+            # the operator's crop.
             use_center_crop=(
-                self.laser_af_properties.initialize_crop_width,
-                self.laser_af_properties.initialize_crop_height,
+                None
+                if search_within_current_crop
+                else (
+                    self.laser_af_properties.initialize_crop_width,
+                    self.laser_af_properties.initialize_crop_height,
+                )
             ),
-            ignore_row_tolerance=True,  # Spot can be anywhere on full frame during init
+            # The search region is the constraint on which spot is picked, so the row filter
+            # would only add a second, invisible constraint on top of it.
+            ignore_row_tolerance=True,
         )
         if result is None:
             self._log.error("Failed to find laser spot during initialization")
@@ -183,11 +233,56 @@ class LaserAutofocusController(QObject):
         self.microcontroller.turn_off_AF_laser()
         self.microcontroller.wait_till_operation_is_completed()
 
-        # Set up ROI around spot and clear reference
+        if search_within_current_crop:
+            # The crop is deliberate, so keep it: re-centering on the spot could pull a
+            # reflection the operator excluded back into frame. apply_crop above already
+            # cleared the reference; drop the stale reference position with it, since it means
+            # nothing without the reference image and carrying it is what corrupts the stored
+            # value on the next save.
+            self._log.info(
+                f"Laser spot found at crop-relative ({int(x)}, {int(y)}) within the crop "
+                f"({int(self.laser_af_properties.x_offset)}, {int(self.laser_af_properties.y_offset)}, "
+                f"{int(self.laser_af_properties.width)}, {int(self.laser_af_properties.height)}); crop left as is."
+            )
+            self.laser_af_properties = self.laser_af_properties.model_copy(update={"x_reference": None})
+
+            if not self._calibrate_pixel_to_um():
+                self._log.error("Failed to calibrate pixel-to-um conversion")
+                return False
+            return True
+
+        # Set up ROI around spot and clear reference.
+        #
+        # The centered ROI is clamped to the sensor: a spot close enough to an edge would
+        # otherwise produce an offset that runs off the sensor (a spot at x=2819 with
+        # width=1536 asks for offset 2051, and 2051 + 1536 > 3088), which the camera
+        # rejects. Clamping trades centering for an ROI that actually applies -- the spot
+        # then sits off-center with less travel room on the near side, which the crop
+        # controls in the laser AF settings widget let the user rebalance.
+        requested_x = x - self.laser_af_properties.width / 2
+        requested_y = y - self.laser_af_properties.height / 2
+        crop_x, crop_y, crop_w, crop_h = utils.clamp_roi(
+            requested_x,
+            requested_y,
+            self.laser_af_properties.width,
+            self.laser_af_properties.height,
+            *self._sensor_size,
+        )
+        # Only warn when the clamp actually bit -- an offset that merely got truncated to the
+        # camera's 8/2 px alignment grid is normal and would otherwise warn on every init.
+        if not (0 <= requested_x <= self._sensor_size[0] - crop_w and 0 <= requested_y <= self._sensor_size[1] - crop_h):
+            self._log.warning(
+                f"Laser spot at ({x:.1f}, {y:.1f}) cannot be centered in a {crop_w}x{crop_h} crop on a "
+                f"{self._sensor_size[0]}x{self._sensor_size[1]} sensor; using offset ({crop_x}, {crop_y}). "
+                f"The spot sits {x - crop_x:.0f} px from the left crop edge and {crop_x + crop_w - x:.0f} px "
+                f"from the right, limiting focus travel on the near side. Narrow the crop or move the spot."
+            )
         config = self.laser_af_properties.model_copy(
             update={
-                "x_offset": x - self.laser_af_properties.width / 2,
-                "y_offset": y - self.laser_af_properties.height / 2,
+                "x_offset": crop_x,
+                "y_offset": crop_y,
+                "width": crop_w,
+                "height": crop_h,
                 "has_reference": False,
             }
         )
@@ -210,6 +305,89 @@ class LaserAutofocusController(QObject):
             )
 
         return True
+
+    def apply_crop(self, x_offset: float, y_offset: float, width: int, height: int) -> Tuple[int, int, int, int]:
+        """Re-program the focus camera ROI without re-running spot search or calibration.
+
+        This is the manual counterpart to initialize_auto's automatic crop placement, for
+        when the spot the operator wants is not the one automatic initialization picks, or
+        sits too close to a sensor edge to be centered. Because pixel_to_um and
+        calibration_timestamp are untouched, the crop can be nudged repeatedly while
+        watching the live stream.
+
+        The requested ROI is snapped to the camera's alignment grid and clamped to the
+        sensor, so an out-of-range request cannot reach set_region_of_interest().
+
+        x_reference is carried across the shift in the full-sensor frame so it keeps
+        pointing at the same physical pixel. The cross-correlation reference *image* is
+        always dropped, including for an x-only shift: set_reference() anchors that crop at
+        the ROI's vertical center, so any change to y_offset or height silently
+        desynchronizes the template from the sensor rows it was taken from. The operator
+        has to press Set Reference again.
+
+        Returns the ROI actually applied, as (x_offset, y_offset, width, height).
+        """
+        new_x, new_y, new_w, new_h = utils.clamp_roi(x_offset, y_offset, width, height, *self._sensor_size)
+        requested = (x_offset, y_offset, width, height)
+        if (new_x, new_y, new_w, new_h) != requested:
+            self._log.info(f"Requested laser AF crop {requested} adjusted to {(new_x, new_y, new_w, new_h)}.")
+
+        # laser_af_properties.x_reference is crop-relative; initialize_manual expects the
+        # full-sensor value and subtracts the new offset itself.
+        old_x_reference = self.laser_af_properties.x_reference
+        x_reference_full = None if old_x_reference is None else old_x_reference + self.laser_af_properties.x_offset
+
+        config = self.laser_af_properties.model_copy(
+            update={
+                "x_offset": new_x,
+                "y_offset": new_y,
+                "width": new_w,
+                "height": new_h,
+                "x_reference": x_reference_full,
+                "has_reference": False,
+            }
+        )
+        config.set_reference_image(None)
+        self.reference_crop = None
+
+        # initialize_manual applies the ROI, converts x_reference back to crop-relative,
+        # keeps is_initialized True and persists. Its own 8/2 px truncation is a no-op here
+        # because clamp_roi already snapped the values.
+        self.initialize_manual(config)
+        self.signal_reference_changed.emit(False)
+
+        return new_x, new_y, new_w, new_h
+
+    def center_crop_on_point(
+        self,
+        x_in_crop: float,
+        y_in_crop: float,
+        width: Optional[int] = None,
+        height: Optional[int] = None,
+        source_roi: Optional[Tuple[int, int, int, int]] = None,
+    ) -> Tuple[int, int, int, int]:
+        """Shift the crop so a crop-relative point sits at the center of the crop.
+
+        Used to re-center on a spot found by manual spot detection, giving it equal focus
+        travel room on both sides.
+
+        source_roi is the ROI the coordinates were measured in; it defaults to the camera's
+        current ROI. Pass it explicitly when the measurement and this call are separated in
+        time, so a crop change in between cannot cause the coordinates to be misread.
+        """
+        if source_roi is None:
+            source_roi = self.camera.get_region_of_interest()
+        source_x_offset, source_y_offset = source_roi[0], source_roi[1]
+
+        width = self.laser_af_properties.width if width is None else width
+        height = self.laser_af_properties.height if height is None else height
+
+        return self.apply_crop(
+            source_x_offset + x_in_crop - width / 2,
+            source_y_offset + y_in_crop - height / 2,
+            width,
+            height,
+        )
 
     def _calibrate_pixel_to_um(self) -> bool:
         """Calibrate pixel-to-um conversion.
@@ -273,12 +451,33 @@ class LaserAutofocusController(QObject):
             time.sleep(control._def.MULTIPOINT_PIEZO_DELAY_MS / 1000)
 
         # Calculate conversion factor
-        if x1 - x0 == 0:
-            pixel_to_um = 0.4  # Simulation value
+        displacement_px = x1 - x0
+        if isinstance(self.camera, SimulatedCamera):
+            # The simulated focus camera renders a static spot, so there is no displacement
+            # to divide by. Gate this on the camera actually being simulated rather than on
+            # the measured displacement -- keying it off "the spot did not move" is exactly
+            # the real-hardware failure below, and would mask it.
+            pixel_to_um = 0.4
             self._log.warning("Using simulation value for pixel_to_um conversion")
+        elif abs(displacement_px) < control._def.LASER_AF_MIN_CALIBRATION_DISPLACEMENT_PX:
+            self._log.error(
+                f"Calibration failed: the spot moved {displacement_px:.3f} px "
+                f"(x0={x0:.2f}, x1={x1:.2f}) over a "
+                f"{self.laser_af_properties.pixel_to_um_calibration_distance} um z move, below the "
+                f"{control._def.LASER_AF_MIN_CALIBRATION_DISPLACEMENT_PX} px minimum. A reflection that "
+                f"does not translate with defocus is usually a static back-reflection rather than the "
+                f"sample reflection; check which spot is being detected before recalibrating."
+            )
+            return False
         else:
-            pixel_to_um = self.laser_af_properties.pixel_to_um_calibration_distance / (x1 - x0)
+            pixel_to_um = self.laser_af_properties.pixel_to_um_calibration_distance / displacement_px
         self._log.info(f"Pixel to um conversion factor is {pixel_to_um:.3f} um/pixel")
+        if abs(pixel_to_um) > control._def.LASER_AF_MAX_PLAUSIBLE_PIXEL_TO_UM:
+            self._log.warning(
+                f"Calibrated pixel_to_um of {pixel_to_um:.3f} um/pixel is implausibly large "
+                f"(> {control._def.LASER_AF_MAX_PLAUSIBLE_PIXEL_TO_UM}); the detected spot barely moved and "
+                f"may not be the sample reflection. Autofocus will be unreliable until this is re-done."
+            )
         calibration_timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
         # Update config with new calibration values

@@ -920,6 +920,11 @@ SHOW_LEGACY_DISPLACEMENT_MEASUREMENT_WINDOWS = False
 LASER_AF_FILTER_SIGMA = 1  # Sigma for Gaussian filter before spot detection
 LASER_AF_INITIALIZE_CROP_WIDTH = 1200
 LASER_AF_INITIALIZE_CROP_HEIGHT = 800
+# Calibration sanity limits. A pixel_to_um calibration divides the z move by the spot's x
+# displacement, so a spot that barely moves yields a huge factor: locking onto a static
+# back-reflection once produced -98.6 um/pixel from 0.06 px of travel.
+LASER_AF_MIN_CALIBRATION_DISPLACEMENT_PX = 1.0  # below this, calibration fails rather than dividing
+LASER_AF_MAX_PLAUSIBLE_PIXEL_TO_UM = 10.0  # above this, calibration warns (real values here are 0.4 - 2.0)
 
 LASER_AF_SEARCH_DOWN_FIRST = (
     True  # If True, search downward (smaller z values) first then upward; if False, search upward first

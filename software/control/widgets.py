@@ -2941,8 +2941,13 @@ class LaserAutofocusSettingWidget(QWidget):
         self.setPalette(palette)
 
         self.spinboxes = {}
+        # (x, y, source_roi) of the last successful manual spot detection. source_roi is the
+        # camera ROI those coordinates were measured in, so a later crop change cannot cause
+        # them to be reinterpreted against the wrong frame.
+        self._last_spot_detection = None
         self.init_ui()
         self.update_calibration_label()
+        self._update_crop_status()
 
     def init_ui(self):
         layout = QVBoxLayout()
@@ -2986,6 +2991,42 @@ class LaserAutofocusSettingWidget(QWidget):
         live_layout.addLayout(exposure_layout)
         live_layout.addLayout(analog_gain_layout)
         live_group.setLayout(live_layout)
+
+        # Crop / ROI group. The focus camera streams only this region, so where it sits
+        # decides which reflection is visible and how far the spot can travel before it
+        # leaves the frame. Initialize places it automatically, but when it picks the wrong
+        # reflection, or the right one is too close to a sensor edge to be centered, these
+        # let the operator place it by hand.
+        crop_group = QFrame()
+        crop_group.setFrameStyle(QFrame.Panel | QFrame.Raised)
+        crop_layout = QVBoxLayout()
+
+        sensor_width, sensor_height = self.laserAutofocusController.get_sensor_size()
+        self._add_spinbox(crop_layout, "Crop Width (pixels):", "width", 8, sensor_width, 0, step=8)
+        self._add_spinbox(crop_layout, "Crop Height (pixels):", "height", 2, sensor_height, 0, step=2)
+        self._add_spinbox(crop_layout, "Crop X Offset (pixels):", "x_offset", 0, sensor_width, 0, step=8)
+        self._add_spinbox(crop_layout, "Crop Y Offset (pixels):", "y_offset", 0, sensor_height, 0, step=2)
+
+        self.apply_crop_button = QPushButton("Apply Crop")
+        self.apply_crop_button.setToolTip(
+            "Re-program the focus camera ROI without re-running Initialize or the pixel-to-um calibration."
+        )
+        self.center_crop_button = QPushButton("Center on Last Detection")
+        self.center_crop_button.setToolTip("Shift the crop so the last detected spot sits at the center of the crop.")
+        self.center_crop_button.setEnabled(False)
+        self.reset_crop_button = QPushButton("Reset to Full Sensor")
+        self.reset_crop_button.setToolTip("Show the whole sensor, to find which reflection actually tracks focus.")
+
+        crop_button_layout = QHBoxLayout()
+        crop_button_layout.addWidget(self.apply_crop_button)
+        crop_button_layout.addWidget(self.center_crop_button)
+        crop_button_layout.addWidget(self.reset_crop_button)
+        crop_layout.addLayout(crop_button_layout)
+
+        self.crop_status_label = QLabel()
+        self.crop_status_label.setWordWrap(True)
+        crop_layout.addWidget(self.crop_status_label)
+        crop_group.setLayout(crop_layout)
 
         # Non-threshold property group
         non_threshold_group = QFrame()
@@ -3043,15 +3084,44 @@ class LaserAutofocusSettingWidget(QWidget):
         spot_mode_layout.addWidget(self.spot_mode_combo)
         spot_detection_layout.addLayout(spot_mode_layout)
 
-        # Add Run Spot Detection button
+        # Add Run Spot Detection button. It grabs a single triggered frame, so it can only
+        # run while live is stopped -- which it is at construction.
         self.run_spot_detection_button = QPushButton("Run Spot Detection")
-        self.run_spot_detection_button.setEnabled(False)  # Disabled by default
+        self.run_spot_detection_button.setEnabled(not self.liveController.is_live)
         spot_detection_layout.addWidget(self.run_spot_detection_button)
         spot_detection_group.setLayout(spot_detection_layout)
 
         # Initialize button
         initialize_group = QFrame()
         initialize_layout = QVBoxLayout()
+        init_search_tooltip = (
+            "Search window used by Initialize, centered on the SENSOR rather than on the spot. "
+            "Shrinking it can exclude an off-center spot entirely."
+        )
+        self._add_spinbox(
+            initialize_layout, "Init Search Width (pixels):", "initialize_crop_width", 16, sensor_width, 0, step=8
+        )
+        self._add_spinbox(
+            initialize_layout, "Init Search Height (pixels):", "initialize_crop_height", 16, sensor_height, 0, step=2
+        )
+        self.spinboxes["initialize_crop_width"].setToolTip(init_search_tooltip)
+        self.spinboxes["initialize_crop_height"].setToolTip(init_search_tooltip)
+
+        self.search_in_crop_checkbox = QCheckBox("Search within current crop")
+        self.search_in_crop_checkbox.setToolTip(
+            "Use the crop above as the search region for Initialize, and leave it in place.\n"
+            "Frame the reflection you want, exclude the spurious ones, then Initialize.\n"
+            "Unchecked, Initialize searches a window centered on the sensor and moves the crop "
+            "to wherever it finds a spot."
+        )
+        initialize_layout.addWidget(self.search_in_crop_checkbox)
+        # The init search window only applies to the sensor-centered search.
+        self.search_in_crop_checkbox.toggled.connect(
+            lambda checked: [
+                self.spinboxes["initialize_crop_width"].setEnabled(not checked),
+                self.spinboxes["initialize_crop_height"].setEnabled(not checked),
+            ]
+        )
         self.initialize_button = QPushButton("Initialize")
         self.initialize_button.setStyleSheet("background-color: #C2C2FF")
         initialize_layout.addWidget(self.initialize_button)
@@ -3067,6 +3137,7 @@ class LaserAutofocusSettingWidget(QWidget):
 
         # Add to main layout
         layout.addWidget(live_group)
+        layout.addWidget(crop_group)
         layout.addWidget(non_threshold_group)
         layout.addWidget(settings_group)
         layout.addWidget(spot_detection_group)
@@ -3083,6 +3154,9 @@ class LaserAutofocusSettingWidget(QWidget):
         self.analog_gain_spinbox.valueChanged.connect(self.update_analog_gain)
         self.update_threshold_button.clicked.connect(self.update_threshold_settings)
         self.run_spot_detection_button.clicked.connect(self.run_spot_detection)
+        self.apply_crop_button.clicked.connect(self.apply_crop)
+        self.center_crop_button.clicked.connect(self.center_crop_on_last_detection)
+        self.reset_crop_button.clicked.connect(self.reset_crop_to_full_sensor)
         self.initialize_button.clicked.connect(self.apply_and_initialize)
         self.characterization_checkbox.toggled.connect(self.toggle_characterization_mode)
 
@@ -3172,6 +3246,8 @@ class LaserAutofocusSettingWidget(QWidget):
 
         self.update_threshold_button.setEnabled(self.laserAutofocusController.is_initialized)
         self.update_calibration_label()
+        self.center_crop_button.setEnabled(self._last_spot_detection is not None)
+        self._update_crop_status()
 
     def apply_and_initialize(self):
         self.clear_labels()
@@ -3193,12 +3269,37 @@ class LaserAutofocusSettingWidget(QWidget):
             "focus_camera_exposure_time_ms": self.exposure_spinbox.value(),
             "focus_camera_analog_gain": self.analog_gain_spinbox.value(),
             "has_reference": False,
+            "width": int(self.spinboxes["width"].value()),
+            "height": int(self.spinboxes["height"].value()),
+            "initialize_crop_width": int(self.spinboxes["initialize_crop_width"].value()),
+            "initialize_crop_height": int(self.spinboxes["initialize_crop_height"].value()),
         }
+        search_in_crop = self.search_in_crop_checkbox.isChecked()
+        if search_in_crop:
+            # The four crop spinboxes define the search region in this mode, so push the
+            # offsets too -- otherwise a crop edited but not yet applied would be searched at
+            # its old position, and the box shown would not be the box searched.
+            updates["x_offset"] = self.spinboxes["x_offset"].value()
+            updates["y_offset"] = self.spinboxes["y_offset"].value()
+        # Otherwise the offsets are left out: initialize_auto derives them from wherever it
+        # finds the spot.
+
         self.laserAutofocusController.set_laser_af_properties(updates)
-        self.laserAutofocusController.initialize_auto()
+        # The offsets and calibration this computes are not what the spinboxes hold, so the
+        # widget has to reload from the config afterwards either way.
+        initialized = self.laserAutofocusController.initialize_auto(search_within_current_crop=search_in_crop)
         self.signal_apply_settings.emit()
-        self.update_threshold_button.setEnabled(True)
-        self.update_calibration_label()
+        self._last_spot_detection = None
+        self.update_values()
+        if not initialized:
+            QMessageBox.warning(
+                self,
+                "Laser Autofocus",
+                "Initialization failed - see the log for details.\n\n"
+                "If the spot could not be found, check the focus camera exposure and the spot "
+                "detection settings. If calibration failed, the detected reflection may not be "
+                "the one that moves with focus; use Reset to Full Sensor to see all of them.",
+            )
 
     def update_threshold_settings(self):
         updates = {
@@ -3209,6 +3310,103 @@ class LaserAutofocusSettingWidget(QWidget):
         }
         self.laserAutofocusController.update_threshold_properties(updates)
 
+    def apply_crop(self):
+        """Re-program the focus camera ROI from the crop spinboxes."""
+        self._apply_crop_and_refresh(
+            lambda: self.laserAutofocusController.apply_crop(
+                self.spinboxes["x_offset"].value(),
+                self.spinboxes["y_offset"].value(),
+                int(self.spinboxes["width"].value()),
+                int(self.spinboxes["height"].value()),
+            )
+        )
+
+    def center_crop_on_last_detection(self):
+        """Shift the crop so the last detected spot sits at the center, giving it equal
+        focus travel room on both sides."""
+        if self._last_spot_detection is None:
+            QMessageBox.information(
+                self, "Laser Autofocus", "Run Spot Detection first, so there is a spot to center the crop on."
+            )
+            return
+
+        x, y, source_roi = self._last_spot_detection
+        # Width/height come from the spinboxes rather than the stored config so a size the
+        # operator has typed but not yet applied is honored by this shift.
+        if self._apply_crop_and_refresh(
+            lambda: self.laserAutofocusController.center_crop_on_point(
+                x,
+                y,
+                int(self.spinboxes["width"].value()),
+                int(self.spinboxes["height"].value()),
+                source_roi,
+            )
+        ):
+            # The coordinates describe the old crop, so they no longer mean anything once it
+            # has moved. Re-running detection is a single click.
+            self._last_spot_detection = None
+            self.center_crop_button.setEnabled(False)
+
+    def reset_crop_to_full_sensor(self):
+        """Show the whole sensor, so every candidate reflection is visible at once."""
+        sensor_width, sensor_height = self.laserAutofocusController.get_sensor_size()
+        self._apply_crop_and_refresh(lambda: self.laserAutofocusController.apply_crop(0, 0, sensor_width, sensor_height))
+
+    def _apply_crop_and_refresh(self, crop_operation) -> bool:
+        """Run a controller crop operation, then resync the widget. Returns success.
+
+        On failure the spinboxes are reloaded from the config too, so they snap back to the
+        ROI that is actually in effect rather than showing a value the camera rejected.
+        """
+        try:
+            crop_operation()
+        except Exception as e:
+            self._log.exception("Failed to apply laser AF crop")
+            QMessageBox.warning(self, "Laser Autofocus", f"Could not apply that crop:\n\n{e}")
+            self.update_values()
+            return False
+
+        self.update_values()
+        # Re-programming the ROI clears the reference, so the control widget needs to
+        # re-enable Set Reference and disable anything that depends on having one.
+        self.signal_apply_settings.emit()
+        return True
+
+    def _update_crop_status(self):
+        """Show where the crop sits, and how much focus travel it leaves before the spot
+        runs off the edge."""
+        config = self.laserAutofocusController.laser_af_properties
+        x_offset, y_offset = int(config.x_offset), int(config.y_offset)
+        width, height = int(config.width), int(config.height)
+
+        lines = [
+            f"Crop: x {x_offset}..{x_offset + width} (w {width}), y {y_offset}..{y_offset + height} (h {height})"
+        ]
+        warn = False
+
+        if self._last_spot_detection is not None:
+            spot_x, spot_y, source_roi = self._last_spot_detection
+            lines.append(f"Last spot: crop x={spot_x:.1f}  (full-sensor x={source_roi[0] + spot_x:.1f})")
+            margin_left, margin_right = spot_x, width - spot_x
+            lines.append(f"Edge margin: {margin_left:.0f} px left / {margin_right:.0f} px right")
+
+            # pixel_to_um is signed (it encodes which way the spot moves with defocus); only
+            # the magnitude matters for how far the spot can travel inside the crop.
+            um_per_px = abs(config.pixel_to_um)
+            if um_per_px > 0:
+                travel_left, travel_right = margin_left * um_per_px, margin_right * um_per_px
+                lines.append(f"Travel headroom: -{travel_left:.0f} um / +{travel_right:.0f} um")
+                if min(travel_left, travel_right) < config.laser_af_range:
+                    warn = True
+                    lines.append(f"Less headroom than the {config.laser_af_range:.0f} um AF range on one side.")
+
+        if width < 2 * config.spot_crop_size:
+            warn = True
+            lines.append(f"Crop is narrower than 2x the spot crop size ({2 * config.spot_crop_size} px).")
+
+        self.crop_status_label.setText("\n".join(lines))
+        self.crop_status_label.setStyleSheet("color: red;" if warn else "")
+
     def update_calibration_label(self):
         # Show calibration result
         # Clear previous calibration label if it exists
@@ -3217,9 +3415,15 @@ class LaserAutofocusSettingWidget(QWidget):
 
         # Create and add new calibration label
         self.calibration_label = QLabel()
-        self.calibration_label.setText(
-            f"Calibration Result: {self.laserAutofocusController.laser_af_properties.pixel_to_um:.3f} um/pixel\nPerformed at {self.laserAutofocusController.laser_af_properties.calibration_timestamp}"
+        pixel_to_um = self.laserAutofocusController.laser_af_properties.pixel_to_um
+        text = (
+            f"Calibration Result: {pixel_to_um:.3f} um/pixel\n"
+            f"Performed at {self.laserAutofocusController.laser_af_properties.calibration_timestamp}"
         )
+        if abs(pixel_to_um) > control._def.LASER_AF_MAX_PLAUSIBLE_PIXEL_TO_UM:
+            text += "\nImplausible - the detected spot barely moved and may be a static reflection."
+            self.calibration_label.setStyleSheet("color: red;")
+        self.calibration_label.setText(text)
         self.layout().addWidget(self.calibration_label)
 
     def illuminate_and_get_frame(self):
@@ -3259,12 +3463,20 @@ class LaserAutofocusSettingWidget(QWidget):
         mode = self.spot_mode_combo.currentData()
         sigma = self.spinboxes["filter_sigma"].value()
 
+        # Read the ROI from the camera rather than from the config: it is the frame these
+        # pixels are actually measured in, and stays right even if a failed crop left the
+        # camera and the config disagreeing.
+        source_roi = self.laserAutofocusController.camera.get_region_of_interest()
+
         frame = self.illuminate_and_get_frame()
         if frame is not None:
             try:
                 result = utils.find_spot_location(frame, mode=mode, params=params, filter_sigma=sigma, debug_plot=True)
                 if result is not None:
                     x, y = result  # Unpack centroid (x, y)
+                    self._last_spot_detection = (x, y, source_roi)
+                    self.center_crop_button.setEnabled(True)
+                    self._update_crop_status()
                     self.signal_laser_spot_location.emit(frame, x, y)
                 else:
                     raise Exception("No spot detection result returned")
