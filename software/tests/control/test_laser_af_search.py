@@ -66,11 +66,33 @@ class TestBackCompat:
     """The regression gate: existing objectives must search exactly as they did before."""
 
     @pytest.mark.parametrize("path", sorted(glob.glob(os.path.join(REAL_CONFIG_DIR, "*.yaml"))))
-    def test_real_configs_keep_their_search_span_and_default_step(self, path):
-        config = LaserAFConfig(**yaml.safe_load(open(path)))
-        # laser_af_range used to bound the search; taking the new field's default instead would
-        # silently widen an objective that was deliberately set narrower.
-        assert config.laser_af_search_range_um == config.laser_af_range
+    def test_real_configs_load_and_back_fill_only_what_is_missing(self, path):
+        """Every config on the machine loads, and only pre-split ones inherit the old span.
+
+        Asserts against the raw file rather than fixed numbers: once an objective has been tuned
+        through the GUI the two fields diverge legitimately, and a test pinned to today's values
+        would fail the moment someone used the feature.
+        """
+        raw = yaml.safe_load(open(path))
+        config = LaserAFConfig(**raw)
+
+        if "laser_af_search_range_um" in raw:
+            assert config.laser_af_search_range_um == raw["laser_af_search_range_um"]
+        else:
+            # Pre-split config: laser_af_range used to bound the search, so taking the field
+            # default instead would silently widen an objective deliberately set narrower.
+            assert config.laser_af_search_range_um == config.laser_af_range
+
+        if "laser_af_search_step_um" not in raw:
+            assert config.laser_af_search_step_um == float(control._def.LASER_AF_SEARCH_STEP_UM)
+        assert config.laser_af_search_step_um > 0
+        assert config.correlation_threshold <= control._def.MAX_CORRELATION_THRESHOLD
+
+    def test_pre_split_config_inherits_its_search_span(self):
+        """The upgrade path, pinned against a synthetic pre-split config rather than live state."""
+        pre_split = {"pixel_to_um": 0.5, "laser_af_range": 40.0}
+        config = LaserAFConfig(**pre_split)
+        assert config.laser_af_search_range_um == 40.0
         assert config.laser_af_search_step_um == float(control._def.LASER_AF_SEARCH_STEP_UM)
         assert config.confirm_motion_mode == LaserAFConfirmMotionMode.OFF
 
@@ -88,6 +110,78 @@ class TestBackCompat:
         assert current_z == pytest.approx(1000.0)
         assert step_used == pytest.approx(step_um)
         assert positions == pytest.approx(_legacy_search_positions(1000.0, range_um, step_um))
+
+
+class TestCorrelationThreshold:
+    def test_unsatisfiable_threshold_is_clamped_not_rejected(self):
+        # The check is `correlation >= threshold` and a live frame never correlates to exactly
+        # 1.0, so 1.0 rejects every measurement including perfect ones. Clamping rather than
+        # raising matters because ConfigRepository swallows ValidationError and would drop the
+        # whole objective's calibration.
+        config = LaserAFConfig(correlation_threshold=1.0)
+        assert config.correlation_threshold == control._def.MAX_CORRELATION_THRESHOLD
+
+    @pytest.mark.parametrize("threshold", [0.7, 0.75, 0.9, 0.99])
+    def test_reachable_thresholds_are_left_alone(self, threshold):
+        assert LaserAFConfig(correlation_threshold=threshold).correlation_threshold == threshold
+
+    def test_default_is_reachable_by_a_real_measurement(self):
+        # Good locks observed on a 0.09 um/px objective spanned 0.749-0.991, so 0.75 is a working
+        # default but only barely clears the bottom of that spread -- a noisier objective is
+        # expected to need it lowered per-objective rather than relying on this.
+        default = LaserAFConfig().correlation_threshold
+        assert default == 0.75
+        assert 0.1 <= default <= control._def.MAX_CORRELATION_THRESHOLD
+
+    def test_max_is_below_one(self):
+        assert control._def.MAX_CORRELATION_THRESHOLD < 1.0
+
+
+class TestFalseColorLut:
+    def test_offered_luts_all_resolve(self):
+        import pyqtgraph as pg
+
+        from control.core.core import ImageDisplayWindow
+
+        assert ImageDisplayWindow.FALSE_COLOR_LUTS[0] == "Grayscale"
+        for name in ImageDisplayWindow.FALSE_COLOR_LUTS[1:]:
+            lut = pg.colormap.get(name).getLookupTable(nPts=256)
+            assert lut.shape == (256, 3)
+
+    def test_a_dim_pixel_is_visible_under_false_color(self):
+        """The point of the feature: a spot peaking near the bottom of the range is nearly black
+        in grayscale but has its own hue under a colormap."""
+        import pyqtgraph as pg
+
+        lut = pg.colormap.get("inferno").getLookupTable(nPts=256)
+        dim = lut[20]
+        # Grayscale would render intensity 20 as (20, 20, 20) -- indistinguishable from black.
+        assert max(int(c) for c in dim) > 20 or max(abs(int(dim[0]) - int(dim[2])), 0) > 20
+
+    def test_grayscale_entry_clears_the_lookup_table(self):
+        from control.core.core import ImageDisplayWindow
+
+        window = MagicMock()
+        window.show_LUT = False
+        ImageDisplayWindow.set_false_color_lut(window, "Grayscale")
+        window.graphics_widget.img.setLookupTable.assert_called_once_with(None)
+
+    def test_unknown_colormap_leaves_the_display_untouched(self):
+        from control.core.core import ImageDisplayWindow
+
+        window = MagicMock()
+        window.show_LUT = False
+        ImageDisplayWindow.set_false_color_lut(window, "not-a-colormap")
+        window.graphics_widget.img.setLookupTable.assert_not_called()
+
+    def test_named_colormap_is_applied(self):
+        from control.core.core import ImageDisplayWindow
+
+        window = MagicMock()
+        window.show_LUT = False
+        ImageDisplayWindow.set_false_color_lut(window, "inferno")
+        lut = window.graphics_widget.img.setLookupTable.call_args[0][0]
+        assert lut.shape == (256, 3)
 
 
 class TestBuildSearchPositions:

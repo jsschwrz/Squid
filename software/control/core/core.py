@@ -1578,6 +1578,43 @@ class ImageDisplayWindow(QMainWindow):
         self.autoLevels = enabled
         self._log.info("set autolevel to " + str(enabled))
 
+    # Colormaps offered for false-color display, in the order they are presented. Perceptually
+    # uniform maps only -- on a jet-style map an intensity ramp reads as banded, which would
+    # invent structure in a laser spot that is not there. "Grayscale" is the None entry.
+    FALSE_COLOR_LUTS = ("Grayscale", "inferno", "viridis", "turbo", "magma")
+
+    def set_false_color_lut(self, name: Optional[str]):
+        """Apply a false-color lookup table to the displayed image.
+
+        A dim spot on a black background is nearly invisible when the display maps 0..255 to
+        black..white and the spot only reaches, say, 30. A colormap gives the low end its own
+        hue, so the same pixels read as coloured rather than almost-black. Pair it with
+        set_autolevel for the biggest gain: the colormap redistributes contrast, autolevel is
+        what creates contrast to redistribute.
+
+        name of None or "Grayscale" restores the default monochrome mapping.
+        """
+        if name is None or name == "Grayscale":
+            self.graphics_widget.img.setLookupTable(None)
+            self._log.info("set false color LUT to grayscale")
+            return
+
+        try:
+            colormap = pg.colormap.get(name)
+        except Exception:
+            self._log.exception(f"Unknown colormap {name!r}; leaving the display unchanged.")
+            return
+
+        self.graphics_widget.img.setLookupTable(colormap.getLookupTable(nPts=256))
+        # In show_LUT mode the histogram widget owns the gradient, so keep it in step or the
+        # legend beside the image would describe a different mapping than the image uses.
+        if self.show_LUT:
+            try:
+                self.LUTWidget.gradient.setColorMap(colormap)
+            except Exception:
+                self._log.debug("Could not sync the histogram gradient to the colormap", exc_info=True)
+        self._log.info(f"set false color LUT to {name}")
+
 
 class NavigationViewer(QFrame):
     signal_coordinates_clicked = Signal(float, float)  # Will emit x_mm, y_mm when clicked

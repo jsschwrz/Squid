@@ -1288,9 +1288,21 @@ class HighContentScreeningGui(QMainWindow):
 
             dock_laserfocus_liveController = dock.Dock("Laser Autofocus Settings", autoOrientation=False)
             dock_laserfocus_liveController.showTitleBar()
-            dock_laserfocus_liveController.addWidget(self.laserAutofocusSettingWidget)
+            # This panel is taller than the dock on a 1080p screen. A QVBoxLayout handed less
+            # height than its contents need squashes every row down toward zero rather than
+            # clipping, which is what makes the spinboxes and their labels unreadable. Scroll
+            # instead of squash.
+            laserfocus_settings_scroll = QScrollArea()
+            laserfocus_settings_scroll.setWidgetResizable(True)
+            laserfocus_settings_scroll.setFrameShape(QFrame.NoFrame)
+            laserfocus_settings_scroll.setWidget(self.laserAutofocusSettingWidget)
+            dock_laserfocus_liveController.addWidget(laserfocus_settings_scroll)
             dock_laserfocus_liveController.setStretch(x=100, y=100)
-            dock_laserfocus_liveController.setFixedWidth(self.laserAutofocusSettingWidget.minimumSizeHint().width())
+            # Widen the pinned column by the scrollbar, so scrolling does not eat into the controls.
+            dock_laserfocus_liveController.setFixedWidth(
+                self.laserAutofocusSettingWidget.minimumSizeHint().width()
+                + laserfocus_settings_scroll.verticalScrollBar().sizeHint().width()
+            )
 
             dock_waveform = dock.Dock("Displacement Measurement", autoOrientation=False)
             dock_waveform.showTitleBar()
@@ -1685,6 +1697,17 @@ class HighContentScreeningGui(QMainWindow):
                 self.laserAutofocusControlWidget.update_init_state
             )
             self.laserAutofocusSettingWidget.signal_laser_spot_location.connect(self.imageDisplayWindow_focus.mark_spot)
+            # Display-only, and scoped to the focus camera view: the main image display keeps its
+            # own contrast handling.
+            self.laserAutofocusSettingWidget.signal_display_lut_changed.connect(
+                self.imageDisplayWindow_focus.set_false_color_lut
+            )
+            self.laserAutofocusSettingWidget.signal_display_autolevel_changed.connect(
+                self.imageDisplayWindow_focus.set_autolevel
+            )
+            self.imageDisplayWindow_focus.set_autolevel(
+                self.laserAutofocusSettingWidget.display_autolevel_checkbox.isChecked()
+            )
             # The button lives with the settings it exercises; the plot lives where there is room.
             self.laserAutofocusSettingWidget.signal_run_af_sweep.connect(self.laserAFSweepWidget.start_sweep)
             self.laserAutofocusController.signal_af_sweep_sample.connect(self.laserAFSweepWidget.on_sweep_sample)

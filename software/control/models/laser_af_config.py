@@ -159,6 +159,34 @@ class LaserAFConfig(BaseModel):
 
     @model_validator(mode="before")
     @classmethod
+    def _clamp_unsatisfiable_correlation_threshold(cls, data: Any) -> Any:
+        """Pull a stored correlation_threshold back below 1.0.
+
+        The check is `correlation >= threshold`, and a live frame correlated against a stored
+        template never reaches exactly 1.0 -- camera noise alone keeps genuine matches in the
+        0.75-0.99 band. A threshold of 1.0 therefore rejects every measurement, including perfect
+        ones, and the failure looks like a misaligned spot rather than a bad setting.
+
+        Clamped rather than rejected: LaserAFConfig is loaded through ConfigRepository._load_yaml,
+        which swallows ValidationError and returns None, so a `le=` constraint here would silently
+        discard the whole objective's calibration over one out-of-range number.
+        """
+        if isinstance(data, dict):
+            threshold = data.get("correlation_threshold")
+            if isinstance(threshold, (int, float)) and not isinstance(threshold, bool):
+                if threshold > _def.MAX_CORRELATION_THRESHOLD:
+                    _log.warning(
+                        "Laser AF correlation_threshold was %r, which no real measurement can reach, "
+                        "so every cross-correlation check would fail. Clamping to %r.",
+                        threshold,
+                        _def.MAX_CORRELATION_THRESHOLD,
+                    )
+                    data = dict(data)
+                    data["correlation_threshold"] = _def.MAX_CORRELATION_THRESHOLD
+        return data
+
+    @model_validator(mode="before")
+    @classmethod
     def _default_search_span_from_laser_af_range(cls, data: Any) -> Any:
         """Back-fill the z-search span from laser_af_range for configs written before the split.
 

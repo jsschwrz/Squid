@@ -936,7 +936,11 @@ LASER_AF_CONFIRM_MIN_PREDICTED_PX = 4.0
 LASER_AF_CONFIRM_TOLERANCE_FRACTION = 0.35  # slack as a fraction of the predicted motion
 DISPLACEMENT_SUCCESS_WINDOW_PIXELS = 300  # Max displacement from reference x to accept detection (pixels)
 SPOT_CROP_SIZE = 100
-CORRELATION_THRESHOLD = 0.7
+CORRELATION_THRESHOLD = 0.75
+# A live frame correlated against a stored template never reaches exactly 1.0 -- camera noise alone
+# keeps real matches in the 0.75-0.99 band -- so a threshold of 1.0 rejects every measurement,
+# including perfect ones. Cap it below 1.0 so that setting is unreachable.
+MAX_CORRELATION_THRESHOLD = 0.99
 PIXEL_TO_UM_CALIBRATION_DISTANCE = 6.0
 # Connected component spot detection parameters
 LASER_AF_CC_THRESHOLD = 8  # Intensity threshold for binarization

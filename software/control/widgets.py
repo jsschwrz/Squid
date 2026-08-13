@@ -19,7 +19,7 @@ if TYPE_CHECKING:
 
 import squid.logging
 from control.core.config import ConfigRepository
-from control.core.core import TrackingController, LiveController
+from control.core.core import ImageDisplayWindow, TrackingController, LiveController
 from control.core.multi_point_controller import MultiPointController
 from control.core.mosaic_utils import format_well_id
 from control.core.geometry_utils import get_effective_well_size, calculate_well_coverage
@@ -2992,6 +2992,8 @@ class LaserAutofocusSettingWidget(QWidget):
     signal_apply_settings = Signal()
     signal_laser_spot_location = Signal(np.ndarray, float, float)
     signal_run_af_sweep = Signal()
+    signal_display_lut_changed = Signal(object)  # colormap name, or None for grayscale
+    signal_display_autolevel_changed = Signal(bool)
 
     def __init__(self, streamHandler, liveController: LiveController, laserAutofocusController, stretch=True):
         super().__init__()
@@ -3057,10 +3059,32 @@ class LaserAutofocusSettingWidget(QWidget):
         self.analog_gain_spinbox.setValue(self.laserAutofocusController.laser_af_properties.focus_camera_analog_gain)
         analog_gain_layout.addWidget(self.analog_gain_spinbox)
 
+        # Display-only controls for the focus camera image. At the short exposures the laser AF
+        # wants, the spot can peak well below the top of the dtype range and is then nearly
+        # invisible against black. These change nothing about detection -- only what is drawn.
+        display_layout = QHBoxLayout()
+        display_layout.addWidget(QLabel("Display LUT:"))
+        self.display_lut_combo = QComboBox()
+        for lut_name in ImageDisplayWindow.FALSE_COLOR_LUTS:
+            self.display_lut_combo.addItem(lut_name, lut_name)
+        self.display_lut_combo.setToolTip(
+            "False-color the focus camera image so a dim spot is visible. Display only -- spot "
+            "detection always runs on the raw frame."
+        )
+        display_layout.addWidget(self.display_lut_combo)
+        self.display_autolevel_checkbox = QCheckBox("Auto-level")
+        self.display_autolevel_checkbox.setToolTip(
+            "Stretch the display to the frame's own min/max instead of the full pixel range. This "
+            "is what actually makes a dim spot bright; the LUT then makes it easy to see."
+        )
+        self.display_autolevel_checkbox.setChecked(True)
+        display_layout.addWidget(self.display_autolevel_checkbox)
+
         # Add to live group
         live_layout.addWidget(self.btn_live)
         live_layout.addLayout(exposure_layout)
         live_layout.addLayout(analog_gain_layout)
+        live_layout.addLayout(display_layout)
         live_group.setLayout(live_layout)
 
         # Crop / ROI group. The focus camera streams only this region, so where it sits
@@ -3121,7 +3145,22 @@ class LaserAutofocusSettingWidget(QWidget):
         self._add_spinbox(
             settings_layout, "Displacement Success Window (pixels):", "displacement_success_window_pixels", 1, 1000, 0
         )
-        self._add_spinbox(settings_layout, "Correlation Threshold:", "correlation_threshold", 0.1, 1.0, 2, 0.1)
+        # Capped below 1.0 on purpose: the check is `correlation >= threshold`, and a live frame
+        # never correlates to exactly 1.0 against a stored template, so 1.0 rejects everything.
+        self._add_spinbox(
+            settings_layout,
+            "Correlation Threshold:",
+            "correlation_threshold",
+            0.1,
+            control._def.MAX_CORRELATION_THRESHOLD,
+            2,
+            0.05,
+        )
+        self.spinboxes["correlation_threshold"].setToolTip(
+            "Minimum correlation between the live spot and the stored reference for a move to be "
+            "accepted. Real matches typically land between 0.75 and 0.99; set this below the worst "
+            "correlation you see in the log for a good lock, or every move will be rejected."
+        )
         self._add_spinbox(settings_layout, "Laser AF Range (μm):", "laser_af_range", 1, 1000, 1)
         self.spinboxes["laser_af_range"].setToolTip(
             "Ceiling on an accepted displacement. A measurement larger than this is treated as "
@@ -3282,6 +3321,10 @@ class LaserAutofocusSettingWidget(QWidget):
         self.center_crop_button.clicked.connect(self.center_crop_on_last_detection)
         self.reset_crop_button.clicked.connect(self.reset_crop_to_full_sensor)
         self.run_sweep_button.clicked.connect(self.signal_run_af_sweep.emit)
+        self.display_lut_combo.currentIndexChanged.connect(
+            lambda: self.signal_display_lut_changed.emit(self.display_lut_combo.currentData())
+        )
+        self.display_autolevel_checkbox.toggled.connect(self.signal_display_autolevel_changed.emit)
         self.spinboxes["confirm_step_um"].valueChanged.connect(self._update_confirm_prediction_label)
         self._update_confirm_prediction_label()
         self.initialize_button.clicked.connect(self.apply_and_initialize)
