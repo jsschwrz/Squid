@@ -2994,6 +2994,8 @@ class LaserAutofocusSettingWidget(QWidget):
     signal_run_af_sweep = Signal()
     signal_display_lut_changed = Signal(object)  # colormap name, or None for grayscale
     signal_display_autolevel_changed = Signal(bool)
+    signal_start_crop_selection = Signal()
+    signal_stop_crop_selection = Signal()
 
     def __init__(self, streamHandler, liveController: LiveController, laserAutofocusController, stretch=True):
         super().__init__()
@@ -3112,11 +3114,21 @@ class LaserAutofocusSettingWidget(QWidget):
         self.reset_crop_button = QPushButton("Reset to Full Sensor")
         self.reset_crop_button.setToolTip("Show the whole sensor, to find which reflection actually tracks focus.")
 
+        self.select_crop_button = QPushButton("Select on Image")
+        self.select_crop_button.setCheckable(True)
+        self.select_crop_button.setToolTip(
+            "Drag a box on the focus camera image to set the crop.\n"
+            "The box fills in the offsets and size above; press Apply Crop to commit it.\n"
+            "The image shows the CURRENT crop, so to select a region outside it, press "
+            "Reset to Full Sensor first."
+        )
+
         crop_button_layout = QHBoxLayout()
         crop_button_layout.addWidget(self.apply_crop_button)
         crop_button_layout.addWidget(self.center_crop_button)
         crop_button_layout.addWidget(self.reset_crop_button)
         crop_layout.addLayout(crop_button_layout)
+        crop_layout.addWidget(self.select_crop_button)
 
         self.crop_status_label = QLabel()
         self.crop_status_label.setWordWrap(True)
@@ -3344,6 +3356,7 @@ class LaserAutofocusSettingWidget(QWidget):
         self.apply_crop_button.clicked.connect(self.apply_crop)
         self.center_crop_button.clicked.connect(self.center_crop_on_last_detection)
         self.reset_crop_button.clicked.connect(self.reset_crop_to_full_sensor)
+        self.select_crop_button.toggled.connect(self.toggle_crop_selection)
         self.run_sweep_button.clicked.connect(self.signal_run_af_sweep.emit)
         self.display_lut_combo.currentIndexChanged.connect(
             lambda: self.signal_display_lut_changed.emit(self.display_lut_combo.currentData())
@@ -3550,6 +3563,39 @@ class LaserAutofocusSettingWidget(QWidget):
         self._update_crop_status()
         self._update_confirm_prediction_label()
 
+    def toggle_crop_selection(self, enabled):
+        """Show or hide the drag-a-box crop selector on the focus camera image."""
+        if enabled:
+            self.signal_start_crop_selection.emit()
+        else:
+            self.signal_stop_crop_selection.emit()
+
+    def on_crop_selection_changed(self, x, y, width, height):
+        """A box was dragged on the focus image; fill in the crop spinboxes from it.
+
+        The box only populates the fields -- Apply Crop still commits it. That keeps one path to
+        the camera (with its clamping and reference handling) and lets the numbers be checked, or
+        nudged, before anything moves.
+
+        The displayed frame is itself a camera crop, so box coordinates are relative to it and the
+        current camera ROI supplies the offset. Read from the camera rather than the config: it is
+        the region these pixels were actually delivered in, the same discipline run_spot_detection
+        uses.
+        """
+        if not self.select_crop_button.isChecked():
+            return
+
+        try:
+            source_x_offset, source_y_offset = self.laserAutofocusController.camera.get_region_of_interest()[:2]
+        except Exception:
+            self._log.exception("Could not read the focus camera ROI; cannot place the drawn crop on the sensor.")
+            return
+
+        self.spinboxes["x_offset"].setValue(source_x_offset + x)
+        self.spinboxes["y_offset"].setValue(source_y_offset + y)
+        self.spinboxes["width"].setValue(width)
+        self.spinboxes["height"].setValue(height)
+
     def apply_crop(self):
         """Re-program the focus camera ROI from the crop spinboxes."""
         self._apply_crop_and_refresh(
@@ -3607,6 +3653,11 @@ class LaserAutofocusSettingWidget(QWidget):
             return False
 
         self.update_values()
+        # The displayed frame is now a different region, so a box drawn against the old one no
+        # longer means what it shows. Drop the selection rather than leave it pointing at pixels
+        # that have moved.
+        if self.select_crop_button.isChecked():
+            self.select_crop_button.setChecked(False)
         # Re-programming the ROI clears the reference, so the control widget needs to
         # re-enable Set Reference and disable anything that depends on having one.
         self.signal_apply_settings.emit()

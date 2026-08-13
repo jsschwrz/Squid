@@ -840,6 +840,10 @@ class TrackingWorker(QObject):
 class ImageDisplayWindow(QMainWindow):
     image_click_coordinates = Signal(int, int, int, int)
     signal_z_um_delta = Signal(float)
+    # ROI selector bounds as (x, y, width, height) in pixels of the displayed frame. The frame may
+    # itself be a camera crop, so a consumer that wants sensor coordinates has to add the offset
+    # the frame was captured at.
+    signal_roi_bounds_changed = Signal(int, int, int, int)
 
     def __init__(
         self,
@@ -1551,11 +1555,56 @@ class ImageDisplayWindow(QMainWindow):
     def update_ROI(self):
         self.roi_pos = self.ROI.pos()
         self.roi_size = self.ROI.size()
+        self.signal_roi_bounds_changed.emit(
+            int(self.roi_pos[0]), int(self.roi_pos[1]), int(self.roi_size[0]), int(self.roi_size[1])
+        )
 
     def show_ROI_selector(self):
         self.ROI.show()
 
     def hide_ROI_selector(self):
+        self.ROI.hide()
+
+    def start_roi_selection(self, x=None, y=None, width=None, height=None):
+        """Show the ROI selector, confined to the displayed image.
+
+        Without bounds the selector can be dragged off the frame entirely, and its constructor
+        default sits at (500, 500) which is outside a small crop -- so a caller that just calls
+        show_ROI_selector() on a narrow frame gets an invisible box. This places it somewhere
+        usable and stops it leaving the image.
+
+        x/y/width/height are in pixels of the displayed frame; omitted values default to the
+        middle half of the image.
+        """
+        image = self.graphics_widget.img.image
+        if image is None:
+            self._log.warning("Cannot start ROI selection before an image has been displayed.")
+            return False
+
+        image_height, image_width = image.shape[:2]
+        if width is None:
+            width = image_width // 2
+        if height is None:
+            height = image_height // 2
+        width = int(max(1, min(width, image_width)))
+        height = int(max(1, min(height, image_height)))
+        if x is None:
+            x = (image_width - width) // 2
+        if y is None:
+            y = (image_height - height) // 2
+        x = int(max(0, min(x, image_width - width)))
+        y = int(max(0, min(y, image_height - height)))
+
+        # The ImageItem sits at the origin with no transform, so view coordinates are array
+        # indices and the image rect is the bound directly.
+        self.ROI.maxBounds = QRectF(0, 0, image_width, image_height)
+        self.ROI.setPos((x, y), finish=False)
+        self.ROI.setSize((width, height), finish=False)
+        self.ROI.show()
+        self.update_ROI()
+        return True
+
+    def stop_roi_selection(self):
         self.ROI.hide()
 
     def get_roi(self):

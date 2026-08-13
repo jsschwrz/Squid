@@ -292,6 +292,8 @@ class _WidgetStub:
         self._last_spot_detection = last_detection
         self.crop_status_label = MagicMock()
         self.center_crop_button = MagicMock()
+        self.select_crop_button = MagicMock()
+        self.select_crop_button.isChecked.return_value = False
         self.spinboxes = {
             name: MagicMock(value=MagicMock(return_value=getattr(config, name)))
             for name in ("width", "height", "x_offset", "y_offset")
@@ -304,6 +306,7 @@ class _WidgetStub:
     reset_crop_to_full_sensor = LaserAutofocusSettingWidget.reset_crop_to_full_sensor
     _apply_crop_and_refresh = LaserAutofocusSettingWidget._apply_crop_and_refresh
     _update_crop_status = LaserAutofocusSettingWidget._update_crop_status
+    on_crop_selection_changed = LaserAutofocusSettingWidget.on_crop_selection_changed
 
 
 class TestWidgetCropSlots:
@@ -371,6 +374,56 @@ class TestWidgetCropSlots:
         assert "768 px left / 768 px right" in text
         assert "-384 um / +384 um" in text
         assert widget.crop_status_label.setStyleSheet.call_args[0][0] == ""
+
+    def test_drawn_box_is_placed_on_the_sensor_using_the_camera_roi(self):
+        """The displayed frame is itself a crop, so a box drawn on it is relative to that crop."""
+        widget = _WidgetStub(LaserAFConfig(x_offset=1000, y_offset=750, width=1000, height=200))
+        widget.select_crop_button.isChecked.return_value = True
+        widget.laserAutofocusController.camera.get_region_of_interest.return_value = (1000, 750, 1000, 200)
+
+        _WidgetStub.on_crop_selection_changed(widget, 120, 40, 400, 100)
+
+        widget.spinboxes["x_offset"].setValue.assert_called_once_with(1120)
+        widget.spinboxes["y_offset"].setValue.assert_called_once_with(790)
+        widget.spinboxes["width"].setValue.assert_called_once_with(400)
+        widget.spinboxes["height"].setValue.assert_called_once_with(100)
+
+    def test_a_box_drawn_on_the_full_sensor_needs_no_offset(self):
+        widget = _WidgetStub(LaserAFConfig(x_offset=0, y_offset=0, width=3088, height=2064))
+        widget.select_crop_button.isChecked.return_value = True
+        widget.laserAutofocusController.camera.get_region_of_interest.return_value = (0, 0, 3088, 2064)
+
+        _WidgetStub.on_crop_selection_changed(widget, 1520, 800, 800, 200)
+
+        widget.spinboxes["x_offset"].setValue.assert_called_once_with(1520)
+        widget.spinboxes["y_offset"].setValue.assert_called_once_with(800)
+
+    def test_box_updates_are_ignored_when_selection_is_off(self):
+        # The selector emits on every drag; a stale emission must not rewrite the spinboxes.
+        widget = _WidgetStub(LaserAFConfig(x_offset=1000, y_offset=750, width=1000, height=200))
+        widget.select_crop_button.isChecked.return_value = False
+
+        _WidgetStub.on_crop_selection_changed(widget, 120, 40, 400, 100)
+
+        widget.spinboxes["x_offset"].setValue.assert_not_called()
+
+    def test_an_unreadable_camera_roi_does_not_write_a_wrong_offset(self):
+        widget = _WidgetStub(LaserAFConfig(x_offset=1000, y_offset=750, width=1000, height=200))
+        widget.select_crop_button.isChecked.return_value = True
+        widget.laserAutofocusController.camera.get_region_of_interest.side_effect = RuntimeError("no camera")
+
+        _WidgetStub.on_crop_selection_changed(widget, 120, 40, 400, 100)
+
+        widget.spinboxes["x_offset"].setValue.assert_not_called()
+
+    def test_applying_a_crop_drops_the_drawn_selection(self):
+        # The displayed frame becomes a different region, so the box no longer means what it shows.
+        widget = _WidgetStub(LaserAFConfig(x_offset=752, y_offset=694, width=1536, height=256))
+        widget.select_crop_button.isChecked.return_value = True
+
+        widget.apply_crop()
+
+        widget.select_crop_button.setChecked.assert_called_once_with(False)
 
     def test_crop_status_flags_a_crop_too_narrow_for_the_search(self):
         # The real 40x: 0.0799 um/px means a 512 px crop sees only +/-20 um, so most of a

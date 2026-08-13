@@ -1718,6 +1718,17 @@ class HighContentScreeningGui(QMainWindow):
             # which is free on a Cephla stage but a locked round-trip on a PI one.
             self.movement_updater.position.connect(self.laserAFSweepWidget.on_stage_position)
             self.movement_updater.piezo_z_um.connect(self.laserAFSweepWidget.on_piezo_position)
+            # Drag-a-box crop selection. The box reports in pixels of the displayed frame; the
+            # settings widget adds the camera ROI offset to get sensor coordinates.
+            self.laserAutofocusSettingWidget.signal_start_crop_selection.connect(
+                self.imageDisplayWindow_focus.start_roi_selection
+            )
+            self.laserAutofocusSettingWidget.signal_stop_crop_selection.connect(
+                self.imageDisplayWindow_focus.stop_roi_selection
+            )
+            self.imageDisplayWindow_focus.signal_roi_bounds_changed.connect(
+                self.laserAutofocusSettingWidget.on_crop_selection_changed
+            )
             self.laserAutofocusSettingWidget.update_exposure_time(
                 self.laserAutofocusSettingWidget.exposure_spinbox.value()
             )
