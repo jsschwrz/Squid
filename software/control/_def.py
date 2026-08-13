@@ -931,6 +931,11 @@ LASER_AF_SEARCH_STEP_UM = 10
 # rather than pixels because pixel_to_um spans more than an order of magnitude across objectives
 # here (0.09 to 2.0 um/px), so a fixed pixel offset meant anything from 1.8 to 40 um.
 LASER_AF_DEBRIS_WARNING_OFFSET_UM = 10.0
+# Iterative correction: pixel_to_um is calibrated over a few microns near focus, so a large
+# correction extrapolates a curve with a straight line and lands short. Re-measuring and moving
+# again converges regardless, at the cost of one extra measurement per correction that engages.
+LASER_AF_ITERATIVE_CORRECTION_TOLERANCE_UM = 1.0
+LASER_AF_ITERATIVE_CORRECTION_MIN_DISPLACEMENT_UM = 10.0
 # Confirm-by-step: a confirm step predicting less spot motion than this cannot discriminate a
 # moving spot from a static one, so the check is skipped rather than guessed at.
 LASER_AF_CONFIRM_MIN_PREDICTED_PX = 4.0

@@ -97,6 +97,24 @@ class LaserAFConfig(BaseModel):
     confirm_tolerance_px: float = Field(
         4.0, gt=0, description="Absolute slack on the predicted translation, in pixels"
     )
+    # A plain bool rather than a mode enum: unlike confirm_motion_mode there is only one place
+    # this can hook in, so there is no second variant to name.
+    iterative_correction_enabled: bool = Field(
+        False,
+        description="Re-measure after a large correction and move again until the residual settles, "
+        "instead of trusting a single linear correction",
+    )
+    iterative_correction_tolerance_um: float = Field(
+        default_factory=lambda: float(_def.LASER_AF_ITERATIVE_CORRECTION_TOLERANCE_UM),
+        gt=0,
+        description="Stop iterating once the residual displacement is within this",
+    )
+    iterative_correction_min_displacement_um: float = Field(
+        default_factory=lambda: float(_def.LASER_AF_ITERATIVE_CORRECTION_MIN_DISPLACEMENT_UM),
+        gt=0,
+        description="Only iterate when the initial correction is at least this large. Below it a "
+        "single linear move is accurate, and re-measuring would cost a frame grab per FOV for nothing.",
+    )
     spot_detection_mode: SpotDetectionMode = Field(
         default_factory=lambda: SpotDetectionMode(_def.LASER_AF_SPOT_DETECTION_MODE),
         description="Spot detection mode",

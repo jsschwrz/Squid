@@ -28,6 +28,11 @@ import squid.logging
 # property of an objective, so it is not a per-objective config field.
 _CONFIRM_MAX_FAILURES = 3
 
+# How many extra measure-and-move passes a correction may take before giving up and letting the
+# cross-correlation check judge the result. A loop bound rather than a physical property, so it is
+# not a per-objective setting.
+_ITERATIVE_CORRECTION_MAX_PASSES = 3
+
 
 @dataclass
 class SweepSample:
@@ -1015,6 +1020,14 @@ class LaserAutofocusController(QObject):
         if self.piezo is not None:
             time.sleep(control._def.MULTIPOINT_PIEZO_DELAY_MS / 1000)
 
+        # A single move assumes the spot's x position is linear in z, but pixel_to_um is calibrated
+        # over a few microns near focus and the relationship bends well before the edge of the
+        # measurable range. A large correction therefore lands short, and the verification below
+        # then fails to find the spot at all. Re-measuring and moving again converges whatever the
+        # shape of the curve, since each pass starts closer to focus than the last.
+        if self._should_iterate_correction(current_displacement_um, target_um):
+            self._converge_on_target(target_um, original_z_um)
+
         # Verify using cross-correlation that spot is in same location as reference
         cc_result, correlation = self._verify_spot_alignment()
         self.signal_cross_correlation.emit(correlation)
@@ -1026,6 +1039,66 @@ class LaserAutofocusController(QObject):
         else:
             self._log.info("Cross correlation check passed - spots are well aligned")
             return True
+
+    def _should_iterate_correction(self, measured_displacement_um: float, target_um: float) -> bool:
+        """Whether the correction just made was large enough to be worth re-measuring.
+
+        Small corrections are accurate on the first move -- the calibration is linear there -- so
+        iterating would spend a frame grab per FOV to confirm something already true. Gating on
+        the size of the correction keeps the common path exactly as it was.
+        """
+        if not self.laser_af_properties.iterative_correction_enabled:
+            return False
+        correction_um = abs(target_um - measured_displacement_um)
+        return correction_um >= self.laser_af_properties.iterative_correction_min_displacement_um
+
+    def _converge_on_target(self, target_um: float, original_z_um: float) -> None:
+        """Re-measure and move again until the residual displacement settles.
+
+        Called only after a first correction has already been made. Leaves z wherever it got to;
+        the caller's cross-correlation check is what decides whether the result is acceptable, and
+        restores z if it is not. Giving up early is therefore safe -- it just means the caller
+        judges the position the first move reached.
+        """
+        for pass_number in range(1, _ITERATIVE_CORRECTION_MAX_PASSES + 1):
+            # No spot search on these passes. The previous move should have landed near focus, so a
+            # failure here means something is wrong at this position; sweeping z again would be slow
+            # and could wander away from a position that is nearly right.
+            residual_um = self.measure_displacement(search_for_spot=False)
+
+            if math.isnan(residual_um):
+                self._log.warning(
+                    f"Iterative correction pass {pass_number}: lost the spot while re-measuring; "
+                    f"leaving z where the previous move put it for the alignment check to judge."
+                )
+                return
+
+            error_um = residual_um - target_um
+            if abs(error_um) <= self.laser_af_properties.iterative_correction_tolerance_um:
+                self._log.info(
+                    f"Iterative correction converged after {pass_number} pass(es): residual "
+                    f"{error_um:+.2f} um, within {self.laser_af_properties.iterative_correction_tolerance_um} um."
+                )
+                return
+
+            if abs(residual_um) > self.laser_af_properties.laser_af_range:
+                self._log.warning(
+                    f"Iterative correction pass {pass_number}: re-measured displacement "
+                    f"({residual_um:.1f} um) is unreasonably large; stopping."
+                )
+                return
+
+            self._log.info(
+                f"Iterative correction pass {pass_number}: residual {error_um:+.2f} um, moving again."
+            )
+            self._move_z(-error_um)
+            if self.piezo is not None:
+                time.sleep(control._def.MULTIPOINT_PIEZO_DELAY_MS / 1000)
+        else:
+            self._log.warning(
+                f"Iterative correction did not settle within {_ITERATIVE_CORRECTION_MAX_PASSES} passes; "
+                f"the alignment check will decide whether the final position is usable."
+            )
 
     def _restore_to_position(self, target_z_um: float) -> None:
         """Restore z position to a specific absolute position."""

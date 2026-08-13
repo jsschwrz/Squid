@@ -285,6 +285,119 @@ class TestSearchAcceptsTheFirstDetection:
         controller._restore_to_position.assert_called()
 
 
+class TestIterativeCorrection:
+    """A large correction extrapolates a curve with a straight line and lands short.
+
+    Modelled here as a spot whose apparent displacement only shrinks by a fraction of each move,
+    which is the observable signature of the calibration bending away from focus.
+    """
+
+    def _controller(self, displacements, enabled=True, **config_kwargs):
+        settings = dict(
+            pixel_to_um=0.09,
+            x_reference=100.0,
+            has_reference=True,
+            laser_af_range=50.0,
+            iterative_correction_enabled=enabled,
+        )
+        settings.update(config_kwargs)
+        config = LaserAFConfig(**settings)
+        controller = _controller_for_search(config)
+        controller.measure_displacement = MagicMock(side_effect=displacements)
+        controller._verify_spot_alignment = MagicMock(return_value=(True, 0.95))
+        controller.signal_cross_correlation = MagicMock()
+        return controller
+
+    def test_disabled_makes_exactly_one_move(self):
+        """The default path, unchanged: measure once, move once, verify."""
+        controller = self._controller([41.0], enabled=False)
+
+        assert controller.move_to_target(0.0) is True
+
+        controller._move_z.assert_called_once_with(-41.0)
+        assert controller.measure_displacement.call_count == 1
+
+    def test_small_correction_does_not_iterate_even_when_enabled(self):
+        # Below the engage threshold the linear move is accurate, and re-measuring would cost a
+        # frame grab per FOV for nothing.
+        controller = self._controller([5.0], iterative_correction_min_displacement_um=10.0)
+
+        assert controller.move_to_target(0.0) is True
+
+        controller._move_z.assert_called_once_with(-5.0)
+        assert controller.measure_displacement.call_count == 1
+
+    def test_large_correction_converges(self):
+        # 41 um measured, but each move only closes ~75% of the gap.
+        controller = self._controller(
+            [41.0, 10.0, 2.0, 0.5],
+            iterative_correction_min_displacement_um=10.0,
+            iterative_correction_tolerance_um=1.0,
+        )
+
+        assert controller.move_to_target(0.0) is True
+
+        assert [c.args[0] for c in controller._move_z.call_args_list] == [-41.0, -10.0, -2.0]
+        assert controller.measure_displacement.call_count == 4
+
+    def test_stops_as_soon_as_it_is_within_tolerance(self):
+        controller = self._controller(
+            [41.0, 0.4], iterative_correction_min_displacement_um=10.0, iterative_correction_tolerance_um=1.0
+        )
+
+        controller.move_to_target(0.0)
+
+        controller._move_z.assert_called_once_with(-41.0)  # no second move needed
+
+    def test_honours_a_nonzero_target(self):
+        controller = self._controller(
+            [41.0, 8.0, 5.2], iterative_correction_min_displacement_um=10.0, iterative_correction_tolerance_um=1.0
+        )
+
+        controller.move_to_target(5.0)
+
+        # Each move closes the gap to the target, not to zero.
+        assert [round(c.args[0], 2) for c in controller._move_z.call_args_list] == [-36.0, -3.0]
+
+    def test_gives_up_after_the_pass_limit_and_lets_the_check_judge(self):
+        # Never converges; must not loop forever, and must still reach the alignment check.
+        controller = self._controller(
+            [41.0] * 10, iterative_correction_min_displacement_um=10.0, iterative_correction_tolerance_um=1.0
+        )
+
+        controller.move_to_target(0.0)
+
+        assert controller._move_z.call_count == 1 + 3  # first move plus the pass limit
+        controller._verify_spot_alignment.assert_called_once()
+
+    def test_a_lost_spot_mid_iteration_stops_without_restoring(self):
+        # Leaving z where the previous move put it is deliberate: the alignment check decides, and
+        # it restores on failure. Bailing out to the original z would discard a nearly-good move.
+        controller = self._controller([41.0, float("nan")], iterative_correction_min_displacement_um=10.0)
+
+        assert controller.move_to_target(0.0) is True
+
+        controller._move_z.assert_called_once_with(-41.0)
+        controller._restore_to_position.assert_not_called()
+
+    def test_does_not_run_a_spot_search_while_iterating(self):
+        # After the first move we are near focus; sweeping z again would be slow and could wander.
+        controller = self._controller(
+            [41.0, 0.2], iterative_correction_min_displacement_um=10.0, iterative_correction_tolerance_um=1.0
+        )
+
+        controller.move_to_target(0.0)
+
+        assert controller.measure_displacement.call_args_list[-1].kwargs == {"search_for_spot": False}
+
+    def test_an_implausible_re_measurement_stops_the_loop(self):
+        controller = self._controller([41.0, 500.0], iterative_correction_min_displacement_um=10.0)
+
+        controller.move_to_target(0.0)
+
+        controller._move_z.assert_called_once_with(-41.0)
+
+
 class TestDebrisWarning:
     @pytest.mark.parametrize(
         "pixel_to_um, offset_px, expect_warning",

@@ -3216,6 +3216,30 @@ class LaserAutofocusSettingWidget(QWidget):
         self.confirm_prediction_label = QLabel()
         self.confirm_prediction_label.setWordWrap(True)
         confirm_layout.addWidget(self.confirm_prediction_label)
+
+        # Iterative correction. Also opt-in, for the same reason: it costs an extra measurement on
+        # every correction that engages, and only earns that back where the calibration has stopped
+        # being linear.
+        self.iterative_correction_checkbox = QCheckBox("Iterative correction")
+        self.iterative_correction_checkbox.setToolTip(
+            "After a large correction, re-measure and move again until the residual settles.\n"
+            "pixel_to_um is calibrated over a few microns near focus, so a single linear move lands\n"
+            "short when the correction is large and the alignment check then fails to find the spot."
+        )
+        confirm_layout.addWidget(self.iterative_correction_checkbox)
+        self._add_spinbox(
+            confirm_layout, "Iterate Above (μm):", "iterative_correction_min_displacement_um", 0.5, 200, 1, step=1
+        )
+        self._add_spinbox(
+            confirm_layout, "Iterate Until Within (μm):", "iterative_correction_tolerance_um", 0.1, 20, 2, step=0.1
+        )
+        self.spinboxes["iterative_correction_min_displacement_um"].setToolTip(
+            "Only iterate when the correction is at least this large. Below it a single move is "
+            "accurate, and re-measuring would cost a frame grab per FOV for nothing."
+        )
+        self.spinboxes["iterative_correction_tolerance_um"].setToolTip(
+            "Stop once the remaining displacement is within this. Set it near your depth of field."
+        )
         confirm_group.setLayout(confirm_layout)
 
         # Create spot detection group
@@ -3418,6 +3442,9 @@ class LaserAutofocusSettingWidget(QWidget):
         confirm_index = self.confirm_mode_combo.findData(self.laserAutofocusController.laser_af_properties.confirm_motion_mode)
         if confirm_index >= 0:
             self.confirm_mode_combo.setCurrentIndex(confirm_index)
+        self.iterative_correction_checkbox.setChecked(
+            self.laserAutofocusController.laser_af_properties.iterative_correction_enabled
+        )
 
         self.update_threshold_button.setEnabled(self.laserAutofocusController.is_initialized)
         self.update_calibration_label()
@@ -3454,6 +3481,11 @@ class LaserAutofocusSettingWidget(QWidget):
             "confirm_motion_mode": self.confirm_mode_combo.currentData(),
             "confirm_step_um": self.spinboxes["confirm_step_um"].value(),
             "confirm_tolerance_px": self.spinboxes["confirm_tolerance_px"].value(),
+            "iterative_correction_enabled": self.iterative_correction_checkbox.isChecked(),
+            "iterative_correction_min_displacement_um": self.spinboxes[
+                "iterative_correction_min_displacement_um"
+            ].value(),
+            "iterative_correction_tolerance_um": self.spinboxes["iterative_correction_tolerance_um"].value(),
         }
         search_in_crop = self.search_in_crop_checkbox.isChecked()
         if search_in_crop:
@@ -3496,6 +3528,11 @@ class LaserAutofocusSettingWidget(QWidget):
             "confirm_motion_mode": self.confirm_mode_combo.currentData(),
             "confirm_step_um": self.spinboxes["confirm_step_um"].value(),
             "confirm_tolerance_px": self.spinboxes["confirm_tolerance_px"].value(),
+            "iterative_correction_enabled": self.iterative_correction_checkbox.isChecked(),
+            "iterative_correction_min_displacement_um": self.spinboxes[
+                "iterative_correction_min_displacement_um"
+            ].value(),
+            "iterative_correction_tolerance_um": self.spinboxes["iterative_correction_tolerance_um"].value(),
         }
         self.laserAutofocusController.update_threshold_properties(updates)
         self._update_crop_status()
