@@ -1712,6 +1712,12 @@ class HighContentScreeningGui(QMainWindow):
             self.laserAutofocusSettingWidget.signal_run_af_sweep.connect(self.laserAFSweepWidget.start_sweep)
             self.laserAutofocusController.signal_af_sweep_sample.connect(self.laserAFSweepWidget.on_sweep_sample)
             self.laserAutofocusController.signal_af_sweep_finished.connect(self.laserAFSweepWidget.on_sweep_finished)
+            # Marks current z on the sweep plot while focusing by hand. movement_updater already
+            # polls the stage at 10 Hz and its `position` signal had no consumers, so this needs no
+            # timer of its own -- and polling from the widget would mean calling stage.get_pos(),
+            # which is free on a Cephla stage but a locked round-trip on a PI one.
+            self.movement_updater.position.connect(self.laserAFSweepWidget.on_stage_position)
+            self.movement_updater.piezo_z_um.connect(self.laserAFSweepWidget.on_piezo_position)
             self.laserAutofocusSettingWidget.update_exposure_time(
                 self.laserAutofocusSettingWidget.exposure_spinbox.value()
             )

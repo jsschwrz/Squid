@@ -484,6 +484,124 @@ class TestXReferenceFrameConversion:
         assert config.x_reference == pytest.approx(500.0)
 
 
+class TestCurrentZMarker:
+    """The sweep plot's x-axis is offset from where the sweep started, so a marker showing current
+    z has to be placed against that origin -- and in the same piezo-vs-stage frame the sweep used.
+    """
+
+    def _widget(self, piezo=None, start_z_um=None, last_marked=None):
+        from control.widgets import LaserAFSweepWidget
+
+        widget = MagicMock()
+        widget.laserAutofocusController.piezo = piezo
+        widget._sweep_start_z_um = start_z_um
+        widget._last_marked_z_um = last_marked
+        widget._samples = []
+        widget._set_current_z = lambda z: LaserAFSweepWidget._set_current_z(widget, z)
+        return widget
+
+    def _on_sweep_sample(self, widget, sample):
+        from control.widgets import LaserAFSweepWidget
+
+        LaserAFSweepWidget.on_sweep_sample(widget, sample)
+
+    def test_origin_comes_from_the_first_sample(self):
+        # Taken from the sample rather than read live, so it is the origin the sweep actually used
+        # even if the sweep was cancelled partway.
+        widget = self._widget()
+        self._on_sweep_sample(widget, SweepSample(z_um=3380.0, dz_um=-20.0))
+
+        assert widget._sweep_start_z_um == pytest.approx(3400.0)
+
+    def test_later_samples_do_not_move_the_origin(self):
+        widget = self._widget()
+        for dz in (-20.0, -10.0, 0.0, 10.0):
+            self._on_sweep_sample(widget, SweepSample(z_um=3400.0 + dz, dz_um=dz))
+
+        assert widget._sweep_start_z_um == pytest.approx(3400.0)
+
+    def test_marker_is_placed_as_an_offset_from_the_sweep_origin(self):
+        widget = self._widget(start_z_um=3400.0)
+
+        widget._set_current_z(3418.0)
+
+        widget.current_z_line.setPos.assert_called_once_with(pytest.approx(18.0))
+        widget.current_z_line.setVisible.assert_called_once_with(True)
+
+    def test_nothing_is_drawn_before_a_sweep_exists(self):
+        widget = self._widget(start_z_um=None)
+
+        widget._set_current_z(3418.0)
+
+        widget.current_z_line.setPos.assert_not_called()
+
+    def test_a_stationary_stage_costs_no_qt_call(self):
+        # This runs at 10 Hz whether or not anything moved.
+        widget = self._widget(start_z_um=3400.0, last_marked=3418.0)
+
+        widget._set_current_z(3418.01)
+
+        widget.current_z_line.setPos.assert_not_called()
+
+    def test_a_real_move_is_drawn(self):
+        widget = self._widget(start_z_um=3400.0, last_marked=3418.0)
+
+        widget._set_current_z(3419.0)
+
+        widget.current_z_line.setPos.assert_called_once_with(pytest.approx(19.0))
+
+    def test_stage_signal_drives_the_marker_when_there_is_no_piezo(self):
+        from control.widgets import LaserAFSweepWidget
+
+        widget = self._widget(piezo=None, start_z_um=3400.0)
+
+        LaserAFSweepWidget.on_stage_position(widget, MagicMock(z_mm=3.418))
+
+        widget.current_z_line.setPos.assert_called_once_with(pytest.approx(18.0))
+
+    def test_stage_signal_is_ignored_when_a_piezo_defines_the_axis(self):
+        # The sweep recorded piezo z; stage z is a different axis, off by thousands of microns.
+        from control.widgets import LaserAFSweepWidget
+
+        widget = self._widget(piezo=MagicMock(), start_z_um=150.0)
+
+        LaserAFSweepWidget.on_stage_position(widget, MagicMock(z_mm=3.418))
+
+        widget.current_z_line.setPos.assert_not_called()
+
+    def test_piezo_signal_drives_the_marker_when_a_piezo_is_present(self):
+        from control.widgets import LaserAFSweepWidget
+
+        widget = self._widget(piezo=MagicMock(), start_z_um=150.0)
+
+        LaserAFSweepWidget.on_piezo_position(widget, 168.0)
+
+        widget.current_z_line.setPos.assert_called_once_with(pytest.approx(18.0))
+
+    def test_piezo_signal_is_ignored_when_there_is_no_piezo(self):
+        from control.widgets import LaserAFSweepWidget
+
+        widget = self._widget(piezo=None, start_z_um=3400.0)
+
+        LaserAFSweepWidget.on_piezo_position(widget, 168.0)
+
+        widget.current_z_line.setPos.assert_not_called()
+
+    def test_clear_drops_the_origin_and_hides_the_marker(self):
+        from control.widgets import LaserAFSweepWidget
+
+        widget = self._widget(start_z_um=3400.0, last_marked=3418.0)
+        widget._samples = [SweepSample(z_um=3400.0, dz_um=0.0)]
+
+        LaserAFSweepWidget.clear(widget)
+
+        assert widget._sweep_start_z_um is None
+        widget.current_z_line.setVisible.assert_called_with(False)
+        # And a stale origin cannot then place a marker against an axis that no longer exists.
+        widget._set_current_z(3418.0)
+        widget.current_z_line.setPos.assert_not_called()
+
+
 class TestDebrisWarning:
     @pytest.mark.parametrize(
         "pixel_to_um, offset_px, expect_warning",

@@ -14006,6 +14006,11 @@ class LaserAFSweepWidget(QWidget):
         self._samples = []
         self._was_main_live = False
         self._progress_dialog = None
+        # Absolute z the current sweep started from, which is what the plot's x-axis is measured
+        # against. None until a sweep produces its first sample -- before that the axis has no
+        # origin and the current-z marker would be meaningless.
+        self._sweep_start_z_um = None
+        self._last_marked_z_um = None
 
         self.init_ui()
 
@@ -14048,6 +14053,18 @@ class LaserAFSweepWidget(QWidget):
         self.plot.addItem(self.origin_line)
         self.reference_line.setVisible(False)
 
+        # Where z is right now, so focusing by hand can be read against the curve just swept.
+        # ignoreBounds because this one does leave the swept range -- without it, focusing away
+        # from the sweep would drag the plot's auto-range along and rescale the data.
+        self.current_z_line = pg.InfiniteLine(
+            angle=90,
+            pen=pg.mkPen("y", width=2),
+            label="z {value:.1f} um",
+            labelOpts={"position": 0.9, "color": "y"},
+        )
+        self.plot.addItem(self.current_z_line, ignoreBounds=True)
+        self.current_z_line.setVisible(False)
+
         layout.addWidget(self.graphics)
         self.setLayout(layout)
 
@@ -14058,6 +14075,11 @@ class LaserAFSweepWidget(QWidget):
         self._samples = []
         self.all_candidates_item.setData([], [])
         self.selected_item.setData([], [])
+        # Drop the origin with the data. A marker left over from a previous sweep would be placed
+        # against an axis that no longer exists, which reads as a real position and is not one.
+        self._sweep_start_z_um = None
+        self._last_marked_z_um = None
+        self.current_z_line.setVisible(False)
         self.status_label.setText("Cleared.")
         self.status_label.setStyleSheet("")
 
@@ -14147,7 +14169,39 @@ class LaserAFSweepWidget(QWidget):
             self._progress_dialog.close()
             self._progress_dialog = None
 
+    def on_stage_position(self, pos):
+        """Live stage position, from MovementUpdater's 10 Hz poll."""
+        if self.laserAutofocusController.piezo is not None:
+            return  # the sweep recorded piezo z; the stage number is a different axis entirely
+        self._set_current_z(pos.z_mm * 1000)
+
+    def on_piezo_position(self, z_um: float):
+        """Live piezo position, emitted when it changes."""
+        if self.laserAutofocusController.piezo is None:
+            return
+        self._set_current_z(z_um)
+
+    def _set_current_z(self, z_um: float):
+        """Place the current-z marker on the plot's offset-from-sweep-start axis."""
+        if self._sweep_start_z_um is None:
+            return  # no sweep, no axis to place it against
+
+        # This runs at 10 Hz whether or not anything moved. Comparing first keeps a stationary
+        # stage to one float subtraction per tick instead of a Qt call, the same guard
+        # ImageDisplayWindow._update_crosshair_position uses on its own hot path.
+        if self._last_marked_z_um is not None and abs(z_um - self._last_marked_z_um) < 0.05:
+            return
+
+        self._last_marked_z_um = z_um
+        self.current_z_line.setPos(z_um - self._sweep_start_z_um)
+        self.current_z_line.setVisible(True)
+
     def on_sweep_sample(self, sample):
+        if self._sweep_start_z_um is None:
+            # z_um is absolute and dz_um is its offset, so the first sample carries the origin.
+            # Taking it from the sample rather than reading z here means it is the origin the
+            # sweep actually used, even if the sweep was cancelled partway.
+            self._sweep_start_z_um = sample.z_um - sample.dz_um
         self._samples.append(sample)
         all_x, all_y, sel_x, sel_y = [], [], [], []
         for s in self._samples:

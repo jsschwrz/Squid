@@ -112,6 +112,19 @@ class LaserAutofocusController(QObject):
         """Get current profile from ConfigRepository."""
         return self._config_repo.current_profile
 
+    def get_current_z_um(self) -> float:
+        """Current z in the frame this controller works in.
+
+        The piezo when there is one, otherwise the stage. Every z value the controller records or
+        compares -- sweep sample positions, the position restored on failure, search bounds -- is in
+        this frame, and the two differ by orders of magnitude (piezo travel is a few hundred um
+        against stage z in the thousands). Anything outside the controller that wants to place a
+        value on the same axis must read it through here rather than picking a source itself.
+        """
+        if self.piezo is not None:
+            return self.piezo.position
+        return self.stage.get_pos().z_mm * 1000
+
     def get_sensor_size(self) -> Tuple[int, int]:
         """Focus camera sensor size as (width, height), captured before any crop was applied."""
         return self._sensor_size
@@ -901,10 +914,7 @@ class LaserAutofocusController(QObject):
             source_roi = None
         source_objective = self.objectiveStore.current_objective if self.objectiveStore else None
 
-        if self.piezo is not None:
-            start_z_um = self.piezo.position
-        else:
-            start_z_um = self.stage.get_pos().z_mm * 1000
+        start_z_um = self.get_current_z_um()
 
         _, step_used_um, positions_um = self._build_search_positions(range_um, step_um)
         # The search orders positions by LASER_AF_SEARCH_DOWN_FIRST so it can find a spot sooner.
@@ -1013,10 +1023,7 @@ class LaserAutofocusController(QObject):
             return False
 
         # Record original z position so we can restore it on failure
-        if self.piezo is not None:
-            original_z_um = self.piezo.position
-        else:
-            original_z_um = self.stage.get_pos().z_mm * 1000
+        original_z_um = self.get_current_z_um()
 
         current_displacement_um = self.measure_displacement()
         self._log.info(f"Current laser AF displacement: {current_displacement_um:.1f} μm")
@@ -1118,10 +1125,7 @@ class LaserAutofocusController(QObject):
 
     def _restore_to_position(self, target_z_um: float) -> None:
         """Restore z position to a specific absolute position."""
-        if self.piezo is not None:
-            current_z_um = self.piezo.position
-        else:
-            current_z_um = self.stage.get_pos().z_mm * 1000
+        current_z_um = self.get_current_z_um()
 
         move_um = target_z_um - current_z_um
         if abs(move_um) > 0.01:  # Only move if difference is significant
