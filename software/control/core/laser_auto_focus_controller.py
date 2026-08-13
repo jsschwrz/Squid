@@ -1,5 +1,7 @@
+import threading
 import time
-from typing import Optional, Tuple
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional, Tuple
 
 import cv2
 from scipy.ndimage import gaussian_filter
@@ -21,12 +23,35 @@ from squid.camera.utils import SimulatedCamera
 import squid.logging
 
 
+# How many candidates may fail the motion confirm before the search gives up. A reflection visible
+# at every z would otherwise cost a confirm step at every position. A loop bound, not a physical
+# property of an objective, so it is not a per-objective config field.
+_CONFIRM_MAX_FAILURES = 3
+
+
+@dataclass
+class SweepSample:
+    """One z position of a diagnostic AF sweep.
+
+    Holds every candidate in frame, not just the one the spot detection mode selects, because
+    the point of a sweep is to compare them: across z the sample reflection translates and a
+    static back-reflection does not.
+    """
+
+    z_um: float  # absolute z visited (piezo um, or stage um)
+    dz_um: float  # offset from the z the sweep started at
+    candidates: List[Dict[str, Any]] = field(default_factory=list)  # crop-relative, left to right
+    selected_x: Optional[float] = None  # what the configured mode would have picked, if anything
+
+
 class LaserAutofocusController(QObject):
     image_to_display = Signal(np.ndarray)
     signal_displacement_um = Signal(float)
     signal_cross_correlation = Signal(float)
     signal_piezo_position_update = Signal()  # Signal to emit piezo position updates
     signal_reference_changed = Signal(bool)  # emitted with new has_reference state
+    signal_af_sweep_sample = Signal(object)  # SweepSample, emitted per z position
+    signal_af_sweep_finished = Signal(object)  # List[SweepSample]; partial if cancelled or aborted
 
     def __init__(
         self,
@@ -525,6 +550,166 @@ class LaserAutofocusController(QObject):
         x, y = centroid
         return (x - self.laser_af_properties.x_reference) * self.laser_af_properties.pixel_to_um
 
+    def _confirm_spot_moves_with_z(self, x_before: float) -> Tuple[bool, str]:
+        """Take one small z step and check the spot translated by the predicted amount.
+
+        This is the only runtime test of the property that actually distinguishes the sample
+        reflection from a static back-reflection. The intensity, area, aspect and row filters all
+        pass a static blob that happens to sit on the same row, and the spot detection mode
+        selects positionally rather than rejecting anything. Calibration tests this once, at
+        Initialize, and nothing re-checks it afterwards.
+
+        Assumes the AF laser is already on. Always restores z before returning.
+
+        Fails OPEN -- returns True with a reason -- whenever the test could not discriminate:
+        an untrustworthy pixel_to_um, a step too small to produce measurable motion, or no room
+        to move. Failing closed in those cases would break autofocus on objectives where the
+        check simply does not apply, which is worse than not checking.
+
+        Returns (accepted, reason).
+        """
+        pixel_to_um = self.laser_af_properties.pixel_to_um
+        if (
+            not math.isfinite(pixel_to_um)
+            or pixel_to_um == 0
+            or abs(pixel_to_um) > control._def.LASER_AF_MAX_PLAUSIBLE_PIXEL_TO_UM
+        ):
+            reason = f"skipped: pixel_to_um ({pixel_to_um}) is not trustworthy"
+            self._log.warning(f"Motion confirm {reason}; accepting the candidate unchecked.")
+            return True, reason
+
+        dz_um = self.laser_af_properties.confirm_step_um
+        # Signed on purpose. pixel_to_um carries the direction the spot travels with defocus, and
+        # a spot moving the wrong way is exactly what this check exists to catch.
+        predicted_dx_px = dz_um / pixel_to_um
+
+        if abs(predicted_dx_px) < control._def.LASER_AF_CONFIRM_MIN_PREDICTED_PX:
+            reason = (
+                f"skipped: a {dz_um} um step predicts only {predicted_dx_px:.2f} px of motion at "
+                f"{pixel_to_um:.4f} um/px, below the {control._def.LASER_AF_CONFIRM_MIN_PREDICTED_PX} px "
+                f"floor. Increase the confirm step for this objective."
+            )
+            self._log.warning(f"Motion confirm {reason}")
+            return True, reason
+
+        if self.piezo is not None:
+            z_before = self.piezo.position
+            # Prefer stepping up; fall back to down if the piezo has no headroom that way.
+            if z_before + dz_um > self.piezo.range_um:
+                dz_um = -dz_um
+                predicted_dx_px = -predicted_dx_px
+            if z_before + dz_um < 0 or z_before + dz_um > self.piezo.range_um:
+                reason = "skipped: no piezo headroom for the confirm step in either direction"
+                self._log.warning(f"Motion confirm {reason}; accepting the candidate unchecked.")
+                return True, reason
+        else:
+            z_before = self.stage.get_pos().z_mm * 1000
+
+        try:
+            self._move_z(dz_um)
+            if self.piezo is not None:
+                time.sleep(control._def.MULTIPOINT_PIEZO_DELAY_MS / 1000)
+            result = self._get_laser_spot_centroid()
+        finally:
+            # Absolute restore, not _move_z(-dz_um): a clamped or partial move would otherwise
+            # leave z quietly drifted, and this runs once per candidate during an acquisition.
+            self._restore_to_position(z_before)
+
+        if result is None:
+            reason = "rejected: spot lost during the confirm step"
+            self._log.info(f"Motion confirm {reason}")
+            return False, reason
+
+        observed_dx_px = result[0] - x_before
+        tolerance_px = max(
+            self.laser_af_properties.confirm_tolerance_px,
+            control._def.LASER_AF_CONFIRM_TOLERANCE_FRACTION * abs(predicted_dx_px),
+        )
+        accepted = abs(observed_dx_px - predicted_dx_px) <= tolerance_px
+
+        self._log.info(
+            f"Motion confirm: z step {dz_um:+.2f} um predicted {predicted_dx_px:+.2f} px, "
+            f"observed {observed_dx_px:+.2f} px, tolerance {tolerance_px:.2f} px -> "
+            f"{'accepted' if accepted else 'REJECTED'}"
+        )
+        if accepted:
+            return True, "confirmed: spot translated with z"
+        return False, (
+            f"rejected: spot moved {observed_dx_px:+.2f} px where {predicted_dx_px:+.2f} px was expected"
+        )
+
+    def _build_search_positions(
+        self, range_um: Optional[float] = None, step_um: Optional[float] = None
+    ) -> Tuple[float, float, List[float]]:
+        """Build the absolute z positions the spot-search visits.
+
+        Shared by the search itself and by run_af_sweep, so the diagnostic sweep samples exactly
+        the grid the real search uses. A sweep that visited different positions than the thing it
+        is diagnosing would be worse than no sweep at all.
+
+        Returns (current_z_um, step_um_used, positions_um). Positions are ordered by
+        LASER_AF_SEARCH_DOWN_FIRST and clamped to the piezo's travel when a piezo is present.
+        """
+        if range_um is None:
+            range_um = self.laser_af_properties.laser_af_search_range_um
+        if step_um is None:
+            step_um = self.laser_af_properties.laser_af_search_step_um
+
+        # The loops below build positions by repeated subtraction, so a zero or negative step
+        # never terminates -- and this runs on the GUI thread inside measure_displacement, so it
+        # would hang the application. LaserAFConfig constrains the field to > 0; this catches
+        # anything that reaches us by another route.
+        step_um = max(float(step_um), 0.05)
+        range_um = abs(float(range_um))
+
+        if self.piezo is not None:
+            current_z_um = self.piezo.position
+            # For piezo, clamp bounds to valid piezo range (0 to range_um)
+            lower_bound_um = max(0, current_z_um - range_um)
+            upper_bound_um = min(self.piezo.range_um, current_z_um + range_um)
+        else:
+            current_z_um = self.stage.get_pos().z_mm * 1000
+            lower_bound_um = current_z_um - range_um
+            upper_bound_um = current_z_um + range_um
+
+        # Generate positions going downward (from current to lower_bound)
+        downward_positions = []
+        pos = current_z_um - step_um
+        while pos >= lower_bound_um:
+            downward_positions.append(pos)
+            pos -= step_um
+
+        # Generate positions going upward (from current to upper_bound)
+        upward_positions = []
+        pos = current_z_um + step_um
+        while pos <= upper_bound_um:
+            upward_positions.append(pos)
+            pos += step_um
+
+        # Order positions based on search direction preference
+        if control._def.LASER_AF_SEARCH_DOWN_FIRST:
+            # Search downward first, then upward
+            positions_um = downward_positions + [current_z_um] + upward_positions
+        else:
+            # Search upward first, then downward
+            positions_um = upward_positions + [current_z_um] + downward_positions
+
+        if len(positions_um) == 1:
+            self._log.warning(
+                f"Z search step ({step_um} um) is larger than the search range ({range_um} um), so the "
+                f"search will only re-check the position that already failed. Reduce the step or widen "
+                f"the range."
+            )
+        elif self.piezo is not None and (
+            lower_bound_um > current_z_um - range_um or upper_bound_um < current_z_um + range_um
+        ):
+            self._log.info(
+                f"Z search span clamped by piezo travel: requested +/-{range_um:.1f} um around "
+                f"{current_z_um:.1f}, searching {lower_bound_um:.1f}..{upper_bound_um:.1f} um."
+            )
+
+        return current_z_um, step_um, positions_um
+
     def measure_displacement(self, search_for_spot: bool = True) -> float:
         """Measure the displacement of the laser spot from the reference position.
 
@@ -548,6 +733,17 @@ class LaserAutofocusController(QObject):
         # get laser spot location
         result = self._get_laser_spot_centroid()
 
+        if result is not None and self.laser_af_properties.confirm_motion_mode == (
+            control._def.LaserAFConfirmMotionMode.ALWAYS
+        ):
+            # This path runs at every FOV of an acquisition, so the extra z step is only taken
+            # when explicitly asked for. A rejection here is not a failure -- it means whatever is
+            # at this z is not the sample reflection, which is a reason to go looking for it.
+            confirmed, reason = self._confirm_spot_moves_with_z(result[0])
+            if not confirmed:
+                self._log.warning(f"First-try candidate {reason}; falling through to the z search.")
+                result = None
+
         if result is not None:
             # Spot found on first try
             try:
@@ -566,45 +762,18 @@ class LaserAutofocusController(QObject):
             return finish_with(float("nan"))
 
         # Search for spot by scanning through z range (laser stays on during search)
-        search_step_um = 10  # Step size in micrometers
-
-        # Get current z position in um (piezo or stage)
-        if self.piezo is not None:
-            current_z_um = self.piezo.position
-            # For piezo, clamp bounds to valid piezo range (0 to range_um)
-            lower_bound_um = max(0, current_z_um - self.laser_af_properties.laser_af_range)
-            upper_bound_um = min(self.piezo.range_um, current_z_um + self.laser_af_properties.laser_af_range)
-        else:
-            current_z_um = self.stage.get_pos().z_mm * 1000
-            lower_bound_um = current_z_um - self.laser_af_properties.laser_af_range
-            upper_bound_um = current_z_um + self.laser_af_properties.laser_af_range
-
-        # Generate positions going downward (from current to lower_bound)
-        downward_positions = []
-        pos = current_z_um - search_step_um
-        while pos >= lower_bound_um:
-            downward_positions.append(pos)
-            pos -= search_step_um
-
-        # Generate positions going upward (from current to upper_bound)
-        upward_positions = []
-        pos = current_z_um + search_step_um
-        while pos <= upper_bound_um:
-            upward_positions.append(pos)
-            pos += search_step_um
-
-        # Order positions based on search direction preference
-        if control._def.LASER_AF_SEARCH_DOWN_FIRST:
-            # Search downward first, then upward
-            search_positions_um = downward_positions + [current_z_um] + upward_positions
-        else:
-            # Search upward first, then downward
-            search_positions_um = upward_positions + [current_z_um] + downward_positions
+        current_z_um, search_step_um, search_positions_um = self._build_search_positions()
 
         self._log.info(
             f"Starting spot search ({'downward' if control._def.LASER_AF_SEARCH_DOWN_FIRST else 'upward'} first): "
             f"positions {search_positions_um} um"
         )
+
+        # A candidate whose displacement is further from the reference than one search step could
+        # not have been reached by the step that just happened, so it is a different spot.
+        accept_window_um = search_step_um * (1.0 + control._def.LASER_AF_SEARCH_ACCEPT_TOLERANCE_FRACTION)
+        confirm_mode = self.laser_af_properties.confirm_motion_mode
+        confirm_failures = 0
 
         current_pos_um = current_z_um  # Track where we are
 
@@ -629,11 +798,29 @@ class LaserAutofocusController(QObject):
                 continue
 
             displacement_um = self._get_displacement_from_centroid(result)
-            if abs(displacement_um) > search_step_um + 4:
+            if abs(displacement_um) > accept_window_um:
                 self._log.info(
                     f"Z search: spot at {target_pos_um:.1f} um has displacement {displacement_um:.1f} um (out of range)"
                 )
                 continue
+
+            if confirm_mode in (
+                control._def.LaserAFConfirmMotionMode.SEARCH_ONLY,
+                control._def.LaserAFConfirmMotionMode.ALWAYS,
+            ):
+                confirmed, reason = self._confirm_spot_moves_with_z(result[0])
+                if not confirmed:
+                    confirm_failures += 1
+                    self._log.warning(f"Z search: candidate at {target_pos_um:.1f} um {reason}")
+                    if confirm_failures >= _CONFIRM_MAX_FAILURES:
+                        self._log.error(
+                            f"Candidates were found at {confirm_failures} z positions but none translated "
+                            f"with z. That is the signature of a static back-reflection rather than the "
+                            f"sample reflection. Run Test AF Sweep to see which reflections are in frame."
+                        )
+                        # Fall through to the shared restore-and-NaN tail below.
+                        break
+                    continue
 
             self._log.info(f"Z search: spot found at {target_pos_um:.1f} um, displacement {displacement_um:.1f} um")
             try:
@@ -651,6 +838,144 @@ class LaserAutofocusController(QObject):
         except TimeoutError:
             self._log.exception("Turning off AF laser timed out! Laser may still be on.")
         return finish_with(float("nan"))
+
+    def _spot_detection_params(self, row_tolerance: Optional[float] = None) -> Dict[str, Any]:
+        """The cc_* parameter dict passed to the detection functions."""
+        return {
+            "threshold": self.laser_af_properties.cc_threshold,
+            "min_area": self.laser_af_properties.cc_min_area,
+            "max_area": self.laser_af_properties.cc_max_area,
+            "row_tolerance": (
+                self.laser_af_properties.cc_row_tolerance if row_tolerance is None else row_tolerance
+            ),
+            "max_aspect_ratio": self.laser_af_properties.cc_max_aspect_ratio,
+        }
+
+    def run_af_sweep(
+        self,
+        range_um: Optional[float] = None,
+        step_um: Optional[float] = None,
+        keep_running: Optional[threading.Event] = None,
+    ) -> List[SweepSample]:
+        """Step z across the search range, recording every candidate spot at each position.
+
+        A diagnostic, not a measurement: it writes no configuration, sets no reference, and
+        restores z when it finishes. What it produces is the one piece of evidence the rest of
+        the system cannot supply -- how each reflection in frame behaves as a function of z. The
+        sample reflection traces a line whose slope is 1/pixel_to_um; a static back-reflection
+        traces a flat one. Nothing in the normal detection path can tell them apart.
+
+        Returns the samples collected, which may be partial if cancelled via keep_running or
+        aborted because the crop or objective changed underneath it.
+        """
+        samples: List[SweepSample] = []
+
+        # Latch what the coordinates are relative to. apply_crop() reprograms the camera ROI, and
+        # changing objective reloads the whole config; either landing mid-sweep would splice two
+        # coordinate frames into one plot without any visible sign.
+        try:
+            source_roi = self.camera.get_region_of_interest()
+        except Exception:
+            source_roi = None
+        source_objective = self.objectiveStore.current_objective if self.objectiveStore else None
+
+        if self.piezo is not None:
+            start_z_um = self.piezo.position
+        else:
+            start_z_um = self.stage.get_pos().z_mm * 1000
+
+        _, step_used_um, positions_um = self._build_search_positions(range_um, step_um)
+        # The search orders positions by LASER_AF_SEARCH_DOWN_FIRST so it can find a spot sooner.
+        # A sweep visits all of them regardless, and wants a monotone z axis to plot against.
+        positions_um = sorted(positions_um)
+
+        self._log.info(
+            f"Starting AF sweep: {len(positions_um)} positions, step {step_used_um} um, "
+            f"{positions_um[0]:.1f}..{positions_um[-1]:.1f} um."
+        )
+
+        self.camera.enable_callbacks(False)
+        try:
+            self._turn_on_laser()
+        except TimeoutError:
+            self._log.exception("Turning on AF laser timed out, cannot run AF sweep.")
+            self.signal_af_sweep_finished.emit(samples)
+            return samples
+
+        current_pos_um = start_z_um
+        try:
+            for target_pos_um in positions_um:
+                if keep_running is not None and not keep_running.is_set():
+                    self._log.info("AF sweep cancelled.")
+                    break
+
+                if source_roi is not None:
+                    try:
+                        if self.camera.get_region_of_interest() != source_roi:
+                            self._log.warning("Camera ROI changed during AF sweep; aborting, results are partial.")
+                            break
+                    except Exception:
+                        pass
+                if source_objective is not None and self.objectiveStore is not None:
+                    if self.objectiveStore.current_objective != source_objective:
+                        self._log.warning("Objective changed during AF sweep; aborting, results are partial.")
+                        break
+
+                move_um = target_pos_um - current_pos_um
+                if move_um != 0:
+                    self._move_z(move_um)
+                    current_pos_um = target_pos_um
+                    if self.piezo is not None:
+                        time.sleep(control._def.MULTIPOINT_PIEZO_DELAY_MS / 1000)
+
+                # One frame per position, not laser_af_averaging_n. Candidates from different
+                # frames do not correspond to one another, so there is nothing to average -- and
+                # averaging would trade a three-fold slower sweep for no extra information.
+                image = self.get_new_frame()
+                if image is None:
+                    image = self.get_new_frame()
+                if image is None:
+                    self._log.warning(f"AF sweep: no frame at {target_pos_um:.1f} um")
+                    samples.append(SweepSample(z_um=target_pos_um, dz_um=target_pos_um - start_z_um))
+                    self.signal_af_sweep_sample.emit(samples[-1])
+                    continue
+
+                self.image = image.copy()
+                candidates = utils.find_all_spot_locations(
+                    image,
+                    params=self._spot_detection_params(),
+                    filter_sigma=self.laser_af_properties.filter_sigma,
+                )
+
+                selected_x = None
+                if candidates:
+                    try:
+                        selected_x = utils.select_spot_by_mode(
+                            candidates, self.laser_af_properties.get_spot_detection_mode()
+                        )["x"]
+                    except (ValueError, NotImplementedError):
+                        # e.g. SINGLE mode with several candidates. The candidates are still worth
+                        # recording -- that the mode cannot choose is itself the finding.
+                        selected_x = None
+
+                sample = SweepSample(
+                    z_um=target_pos_um,
+                    dz_um=target_pos_um - start_z_um,
+                    candidates=candidates,
+                    selected_x=selected_x,
+                )
+                samples.append(sample)
+                self.signal_af_sweep_sample.emit(sample)
+        finally:
+            try:
+                self._turn_off_laser()
+            except TimeoutError:
+                self._log.exception("Turning off AF laser timed out! Laser may still be on.")
+            self._restore_to_position(start_z_um)
+            self._log.info(f"AF sweep finished: {len(samples)} positions sampled, z restored.")
+            self.signal_af_sweep_finished.emit(samples)
+
+        return samples
 
     def move_to_target(self, target_um: float) -> bool:
         """Move the stage to reach a target displacement from reference position.

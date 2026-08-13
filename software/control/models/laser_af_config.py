@@ -12,7 +12,7 @@ import numpy as np
 from pydantic import BaseModel, Field, model_validator
 
 import control._def as _def
-from control._def import SpotDetectionMode
+from control._def import LaserAFConfirmMotionMode, SpotDetectionMode
 import squid.logging
 
 _log = squid.logging.get_logger(__name__)
@@ -71,6 +71,31 @@ class LaserAFConfig(BaseModel):
     )
     laser_af_averaging_n: int = Field(
         default_factory=lambda: _def.LASER_AF_AVERAGING_N, description="Number of measurements to average"
+    )
+    laser_af_search_range_um: float = Field(
+        default_factory=lambda: float(_def.LASER_AF_RANGE),
+        gt=0,
+        description="Half-span of the z spot-search, in um. Bounds only the search; laser_af_range "
+        "remains the ceiling on an accepted displacement.",
+    )
+    laser_af_search_step_um: float = Field(
+        default_factory=lambda: float(_def.LASER_AF_SEARCH_STEP_UM),
+        gt=0,
+        description="Z step of the spot-search, in um. Must be > 0: the search builds its positions "
+        "by repeated subtraction, so zero would not terminate.",
+    )
+    confirm_motion_mode: LaserAFConfirmMotionMode = Field(
+        default=LaserAFConfirmMotionMode.OFF,
+        description="When to verify that a detected spot translates with defocus",
+    )
+    confirm_step_um: float = Field(
+        2.0,
+        gt=0,
+        description="Extra z step used to confirm the spot translates with z. Must be large enough "
+        "that dz/pixel_to_um is measurable, which differs by an order of magnitude between objectives.",
+    )
+    confirm_tolerance_px: float = Field(
+        4.0, gt=0, description="Absolute slack on the predicted translation, in pixels"
     )
     spot_detection_mode: SpotDetectionMode = Field(
         default_factory=lambda: SpotDetectionMode(_def.LASER_AF_SPOT_DETECTION_MODE),
@@ -131,6 +156,26 @@ class LaserAFConfig(BaseModel):
     reference_image_dtype: Optional[str] = Field(None, description="Data type of reference image array")
 
     model_config = {"extra": "forbid"}
+
+    @model_validator(mode="before")
+    @classmethod
+    def _default_search_span_from_laser_af_range(cls, data: Any) -> Any:
+        """Back-fill the z-search span from laser_af_range for configs written before the split.
+
+        laser_af_range used to bound the search as well as cap an accepted displacement. Configs
+        saved then carry a deliberately chosen value -- the 40x objective is set to 40 um, not the
+        100 um default -- so taking the field default here would silently widen that objective's
+        search on the first launch after upgrade. Carrying the old value across means an existing
+        profile behaves identically until someone edits the new setting.
+
+        Deliberately a separate validator from _migrate_legacy_line_profile_config: that one
+        early-returns when no legacy keys are present, which is the common case here. The two touch
+        disjoint keys, so the order pydantic runs them in does not matter.
+        """
+        if isinstance(data, dict) and "laser_af_search_range_um" not in data and "laser_af_range" in data:
+            data = dict(data)
+            data["laser_af_search_range_um"] = data["laser_af_range"]
+        return data
 
     @model_validator(mode="before")
     @classmethod

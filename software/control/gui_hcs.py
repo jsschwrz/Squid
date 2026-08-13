@@ -1049,6 +1049,13 @@ class HighContentScreeningGui(QMainWindow):
                 self.laserAutofocusController,
                 self.liveController,
                 liveControlWidget=self.liveControlWidget,
+                multipointController=self.multipointController,
+            )
+            self.laserAFSweepWidget = widgets.LaserAFSweepWidget(
+                self.laserAutofocusController,
+                self.liveController,
+                laserAutofocusSettingWidget=self.laserAutofocusSettingWidget,
+                multipointController=self.multipointController,
             )
             self.imageDisplayWindow_focus = core.ImageDisplayWindow(liveController=self.liveController)
 
@@ -1296,11 +1303,19 @@ class HighContentScreeningGui(QMainWindow):
             dock_displayMeasurement.setStretch(x=100, y=40)
             dock_displayMeasurement.setFixedWidth(self.displacementMeasurementWidget.minimumSizeHint().width())
 
+            # The sweep plot goes under the focus image rather than into the settings dock, whose
+            # width is pinned above -- a plot in there would widen that column permanently.
+            dock_laserfocus_sweep = dock.Dock("Laser AF Sweep", autoOrientation=False)
+            dock_laserfocus_sweep.showTitleBar()
+            dock_laserfocus_sweep.addWidget(self.laserAFSweepWidget)
+            dock_laserfocus_sweep.setStretch(x=100, y=50)
+
             laserfocus_dockArea = dock.DockArea()
             laserfocus_dockArea.addDock(dock_laserfocus_image_display)
             laserfocus_dockArea.addDock(
                 dock_laserfocus_liveController, "right", relativeTo=dock_laserfocus_image_display
             )
+            laserfocus_dockArea.addDock(dock_laserfocus_sweep, "bottom", relativeTo=dock_laserfocus_image_display)
             if SHOW_LEGACY_DISPLACEMENT_MEASUREMENT_WINDOWS:
                 laserfocus_dockArea.addDock(dock_waveform, "bottom", relativeTo=dock_laserfocus_liveController)
                 laserfocus_dockArea.addDock(dock_displayMeasurement, "bottom", relativeTo=dock_waveform)
@@ -1670,6 +1685,10 @@ class HighContentScreeningGui(QMainWindow):
                 self.laserAutofocusControlWidget.update_init_state
             )
             self.laserAutofocusSettingWidget.signal_laser_spot_location.connect(self.imageDisplayWindow_focus.mark_spot)
+            # The button lives with the settings it exercises; the plot lives where there is room.
+            self.laserAutofocusSettingWidget.signal_run_af_sweep.connect(self.laserAFSweepWidget.start_sweep)
+            self.laserAutofocusController.signal_af_sweep_sample.connect(self.laserAFSweepWidget.on_sweep_sample)
+            self.laserAutofocusController.signal_af_sweep_finished.connect(self.laserAFSweepWidget.on_sweep_finished)
             self.laserAutofocusSettingWidget.update_exposure_time(
                 self.laserAutofocusSettingWidget.exposure_spinbox.value()
             )

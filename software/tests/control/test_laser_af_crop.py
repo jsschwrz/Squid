@@ -5,6 +5,7 @@ pixel-to-um calibration sanity guard. The controller tests build minimal stubs r
 than a full Microscope so they stay fast and hardware-free.
 """
 
+import re
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -370,6 +371,63 @@ class TestWidgetCropSlots:
         assert "768 px left / 768 px right" in text
         assert "-384 um / +384 um" in text
         assert widget.crop_status_label.setStyleSheet.call_args[0][0] == ""
+
+    def test_crop_status_flags_a_crop_too_narrow_for_the_search(self):
+        # The real 40x: 0.0799 um/px means a 512 px crop sees only +/-20 um, so most of a
+        # 40 um search runs where the spot cannot be.
+        widget = _WidgetStub(
+            LaserAFConfig(width=512, height=100, pixel_to_um=0.07986, laser_af_search_range_um=40.0)
+        )
+
+        widget._update_crop_status()
+
+        text = widget.crop_status_label.setText.call_args[0][0]
+        assert "TOO NARROW" in text
+        assert "red" in widget.crop_status_label.setStyleSheet.call_args[0][0]
+
+    def test_crop_status_advises_but_does_not_alarm_on_an_over_wide_crop(self):
+        # The real 20x: 5.2x wider than the search needs. Worth saying, not worth a warning.
+        widget = _WidgetStub(
+            LaserAFConfig(width=1536, height=256, pixel_to_um=0.6754, laser_af_search_range_um=100.0)
+        )
+
+        widget._update_crop_status()
+
+        text = widget.crop_status_label.setText.call_args[0][0]
+        assert "wider than the search needs" in text
+        assert widget.crop_status_label.setStyleSheet.call_args[0][0] == ""
+
+    def test_crop_status_stays_quiet_on_a_moderately_wide_crop(self):
+        # The real 4x: 3.7x, below the advisory factor. Flagging every objective would make the
+        # advice meaningless.
+        widget = _WidgetStub(
+            LaserAFConfig(width=1536, height=256, pixel_to_um=0.4820, laser_af_search_range_um=100.0)
+        )
+
+        widget._update_crop_status()
+
+        text = widget.crop_status_label.setText.call_args[0][0]
+        assert "wider than the search needs" not in text
+        assert "TOO NARROW" not in text
+
+    def test_crop_status_suggests_a_camera_legal_width(self):
+        widget = _WidgetStub(
+            LaserAFConfig(width=512, height=100, pixel_to_um=0.07986, laser_af_search_range_um=40.0)
+        )
+
+        widget._update_crop_status()
+
+        text = widget.crop_status_label.setText.call_args[0][0]
+        suggested = int(re.search(r"Widen the crop to ~(\d+) px", text).group(1))
+        # clamp_roi snaps width to a multiple of 8, so any other suggestion would be silently changed.
+        assert suggested % 8 == 0
+
+    def test_crop_status_survives_an_uncalibrated_objective(self):
+        widget = _WidgetStub(LaserAFConfig(width=1536, height=256, pixel_to_um=0.0))
+
+        widget._update_crop_status()  # must not raise
+
+        assert "TOO NARROW" not in widget.crop_status_label.setText.call_args[0][0]
 
     def test_crop_status_flags_a_spot_with_less_headroom_than_the_af_range(self):
         # The hardware case: the spot 14 px from the crop edge, at 0.5 um/px, leaves 7 um of

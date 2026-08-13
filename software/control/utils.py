@@ -233,6 +233,195 @@ def serialize_for_yaml(obj):
     return obj
 
 
+def _resolve_spot_detection_params(params: Optional[dict]) -> dict:
+    """Merge caller-supplied spot detection params over the _def defaults."""
+    resolved = {
+        "threshold": LASER_AF_CC_THRESHOLD,
+        "min_area": LASER_AF_CC_MIN_AREA,
+        "max_area": LASER_AF_CC_MAX_AREA,
+        "row_tolerance": LASER_AF_CC_ROW_TOLERANCE,
+        "max_aspect_ratio": LASER_AF_CC_MAX_ASPECT_RATIO,
+    }
+    if params is not None:
+        resolved.update(params)
+    return resolved
+
+
+def _prepare_working_image(image: np.ndarray, filter_sigma: Optional[int], threshold: float) -> np.ndarray:
+    """Optionally Gaussian-filter the frame, then reject it if nothing is above threshold.
+
+    Raises:
+        ValueError: if the brightest pixel is at or below the threshold.
+    """
+    working_image = image.copy()
+    if filter_sigma is not None and filter_sigma > 0:
+        filtered = gaussian_filter(working_image.astype(float), sigma=filter_sigma)
+        working_image = np.clip(filtered, 0, 255).astype(np.uint8)
+
+    # Quick check - if max intensity below threshold, no spot visible
+    if working_image.max() <= threshold:
+        raise ValueError("No spot detected: max intensity below threshold")
+
+    return working_image
+
+
+def _collect_valid_spots(working_image: np.ndarray, p: dict) -> Tuple[List[dict], np.ndarray, np.ndarray, int, float]:
+    """Binarize, label, and filter connected components down to plausible spot candidates.
+
+    Returns (valid_spots sorted left-to-right by column, binary, labels, num_labels, expected_row).
+    Each candidate carries its boolean `mask`, which callers that retain candidates should drop --
+    it is a full-frame array per candidate.
+    """
+    # Binarize the image
+    binary = (working_image > p["threshold"]).astype(np.uint8)
+
+    # Find connected components
+    num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(binary, connectivity=8)
+
+    # Expected row position (center of image)
+    expected_row = working_image.shape[0] / 2.0
+
+    # Filter valid components and collect spot candidates
+    valid_spots = []
+    for i in range(1, num_labels):  # Skip background (label 0)
+        area = stats[i, cv2.CC_STAT_AREA]
+        cx, cy = centroids[i]
+        width = stats[i, cv2.CC_STAT_WIDTH]
+        height = stats[i, cv2.CC_STAT_HEIGHT]
+
+        # Size filter
+        if area < p["min_area"] or area > p["max_area"]:
+            continue
+
+        # Row position filter
+        if abs(cy - expected_row) > p["row_tolerance"]:
+            continue
+
+        # Aspect ratio filter (max of w/h or h/w, so always >= 1)
+        aspect_ratio = max(width / height, height / width) if height > 0 and width > 0 else float("inf")
+        if aspect_ratio > p["max_aspect_ratio"]:
+            continue
+
+        # Calculate mean intensity of this component for sorting
+        component_mask = labels == i
+        intensity = working_image[component_mask].mean()
+
+        valid_spots.append(
+            {
+                "label": i,
+                "col": cx,
+                "row": cy,
+                "area": area,
+                "intensity": intensity,
+                "aspect_ratio": aspect_ratio,
+                "mask": component_mask,
+            }
+        )
+
+    # Sort spots by x-coordinate (column) for mode-based selection
+    valid_spots.sort(key=lambda s: s["col"])
+
+    return valid_spots, binary, labels, num_labels, expected_row
+
+
+def select_spot_by_mode(sorted_spots: List[dict], mode: SpotDetectionMode) -> dict:
+    """Pick which of several candidates a SpotDetectionMode selects.
+
+    `sorted_spots` must already be ordered left-to-right. Selection is purely positional -- it
+    never rejects a candidate on merit, so a mode cannot protect against a spurious reflection.
+
+    Raises:
+        ValueError: for SINGLE with more than one candidate, or an unknown mode.
+        NotImplementedError: for MULTI_SECOND_RIGHT.
+    """
+    if mode == SpotDetectionMode.SINGLE:
+        if len(sorted_spots) > 1:
+            raise ValueError(f"Found {len(sorted_spots)} spots but expected single spot")
+        return sorted_spots[0]
+    elif mode == SpotDetectionMode.DUAL_LEFT:
+        return sorted_spots[0]  # Leftmost
+    elif mode == SpotDetectionMode.DUAL_RIGHT:
+        return sorted_spots[-1]  # Rightmost
+    elif mode == SpotDetectionMode.MULTI_RIGHT:
+        return sorted_spots[-1]  # Rightmost
+    elif mode == SpotDetectionMode.MULTI_SECOND_RIGHT:
+        raise NotImplementedError("MULTI_SECOND_RIGHT is not supported")
+    else:
+        raise ValueError(f"Unknown spot detection mode: {mode}")
+
+
+def _weighted_centroid(working_image: np.ndarray, component_mask: np.ndarray, spot: dict) -> Tuple[float, float]:
+    """Intensity-weighted centroid of one component, for sub-pixel accuracy.
+
+    Falls back to the component's geometric centroid when every pixel has the same intensity.
+    """
+    y_coords, x_coords = np.where(component_mask)
+    intensities = working_image[component_mask].astype(float)
+
+    # Subtract background (minimum intensity in component)
+    intensities = intensities - intensities.min()
+
+    sum_intensity = intensities.sum()
+    if sum_intensity == 0:
+        # Fall back to geometric centroid if all intensities are equal
+        return spot["col"], spot["row"]
+    return (x_coords * intensities).sum() / sum_intensity, (y_coords * intensities).sum() / sum_intensity
+
+
+def find_all_spot_locations(
+    image: np.ndarray,
+    params: Optional[dict] = None,
+    filter_sigma: Optional[int] = None,
+    max_candidates: int = 32,
+) -> List[dict]:
+    """Every candidate that passes the cc_* filters, left to right -- not just the selected one.
+
+    find_spot_location answers "where is the spot", which presupposes the answer. This answers
+    "what is in frame", which is what you need to tell a real reflection from a static one: swept
+    across z, the real spot traces a sloped line and a back-reflection traces a flat one.
+
+    Unlike find_spot_location this never raises for an empty or spotless frame -- a z position
+    where nothing is visible is ordinary data for a sweep, not an error. Returned dicts carry
+    x, y (sub-pixel weighted centroid, in the frame's own coordinates), col, row, area, intensity
+    and aspect_ratio; the internal boolean mask is dropped, since retaining one full-frame array
+    per candidate across a long sweep would be a real memory cost.
+
+    Over-exposed frames can yield very many components, so the list is capped at max_candidates,
+    keeping the brightest.
+    """
+    if image is None or not isinstance(image, np.ndarray) or image.size == 0:
+        raise ValueError("Invalid input image")
+
+    p = _resolve_spot_detection_params(params)
+
+    try:
+        working_image = _prepare_working_image(image, filter_sigma, p["threshold"])
+    except ValueError:
+        return []
+
+    valid_spots, _, _, _, _ = _collect_valid_spots(working_image, p)
+
+    if len(valid_spots) > max_candidates:
+        valid_spots = sorted(valid_spots, key=lambda s: s["intensity"], reverse=True)[:max_candidates]
+        valid_spots.sort(key=lambda s: s["col"])
+
+    candidates = []
+    for spot in valid_spots:
+        centroid_x, centroid_y = _weighted_centroid(working_image, spot["mask"], spot)
+        candidates.append(
+            {
+                "x": float(centroid_x),
+                "y": float(centroid_y),
+                "col": float(spot["col"]),
+                "row": float(spot["row"]),
+                "area": int(spot["area"]),
+                "intensity": float(spot["intensity"]),
+                "aspect_ratio": float(spot["aspect_ratio"]),
+            }
+        )
+    return candidates
+
+
 def find_spot_location(
     image: np.ndarray,
     mode: SpotDetectionMode = SpotDetectionMode.SINGLE,
@@ -269,112 +458,20 @@ def find_spot_location(
         raise ValueError("Invalid input image")
 
     # Default parameters for connected component detection
-    default_params = {
-        "threshold": LASER_AF_CC_THRESHOLD,
-        "min_area": LASER_AF_CC_MIN_AREA,
-        "max_area": LASER_AF_CC_MAX_AREA,
-        "row_tolerance": LASER_AF_CC_ROW_TOLERANCE,
-        "max_aspect_ratio": LASER_AF_CC_MAX_ASPECT_RATIO,
-    }
-
-    if params is not None:
-        default_params.update(params)
-    p = default_params
+    p = _resolve_spot_detection_params(params)
 
     try:
-        # Apply Gaussian filter if requested
-        working_image = image.copy()
-        if filter_sigma is not None and filter_sigma > 0:
-            filtered = gaussian_filter(working_image.astype(float), sigma=filter_sigma)
-            working_image = np.clip(filtered, 0, 255).astype(np.uint8)
+        working_image = _prepare_working_image(image, filter_sigma, p["threshold"])
 
-        # Quick check - if max intensity below threshold, no spot visible
-        if working_image.max() <= p["threshold"]:
-            raise ValueError("No spot detected: max intensity below threshold")
-
-        # Binarize the image
-        binary = (working_image > p["threshold"]).astype(np.uint8)
-
-        # Find connected components
-        num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(binary, connectivity=8)
-
-        # Expected row position (center of image)
-        expected_row = working_image.shape[0] / 2.0
-
-        # Filter valid components and collect spot candidates
-        valid_spots = []
-        for i in range(1, num_labels):  # Skip background (label 0)
-            area = stats[i, cv2.CC_STAT_AREA]
-            cx, cy = centroids[i]
-            width = stats[i, cv2.CC_STAT_WIDTH]
-            height = stats[i, cv2.CC_STAT_HEIGHT]
-
-            # Size filter
-            if area < p["min_area"] or area > p["max_area"]:
-                continue
-
-            # Row position filter
-            if abs(cy - expected_row) > p["row_tolerance"]:
-                continue
-
-            # Aspect ratio filter (max of w/h or h/w, so always >= 1)
-            aspect_ratio = max(width / height, height / width) if height > 0 and width > 0 else float("inf")
-            if aspect_ratio > p["max_aspect_ratio"]:
-                continue
-
-            # Calculate mean intensity of this component for sorting
-            component_mask = labels == i
-            intensity = working_image[component_mask].mean()
-
-            valid_spots.append(
-                {
-                    "label": i,
-                    "col": cx,
-                    "row": cy,
-                    "area": area,
-                    "intensity": intensity,
-                    "mask": component_mask,
-                }
-            )
+        valid_spots, binary, labels, num_labels, expected_row = _collect_valid_spots(working_image, p)
 
         if len(valid_spots) == 0:
             raise ValueError("No valid spots detected after filtering")
 
-        # Sort spots by x-coordinate (column) for mode-based selection
-        valid_spots.sort(key=lambda s: s["col"])
-
-        # Handle different spot detection modes
-        if mode == SpotDetectionMode.SINGLE:
-            if len(valid_spots) > 1:
-                raise ValueError(f"Found {len(valid_spots)} spots but expected single spot")
-            selected_spot = valid_spots[0]
-        elif mode == SpotDetectionMode.DUAL_LEFT:
-            selected_spot = valid_spots[0]  # Leftmost
-        elif mode == SpotDetectionMode.DUAL_RIGHT:
-            selected_spot = valid_spots[-1]  # Rightmost
-        elif mode == SpotDetectionMode.MULTI_RIGHT:
-            selected_spot = valid_spots[-1]  # Rightmost
-        elif mode == SpotDetectionMode.MULTI_SECOND_RIGHT:
-            raise NotImplementedError("MULTI_SECOND_RIGHT is not supported")
-        else:
-            raise ValueError(f"Unknown spot detection mode: {mode}")
+        selected_spot = select_spot_by_mode(valid_spots, mode)
 
         # Calculate intensity-weighted centroid for sub-pixel accuracy
-        component_mask = selected_spot["mask"]
-        y_coords, x_coords = np.where(component_mask)
-        intensities = working_image[component_mask].astype(float)
-
-        # Subtract background (minimum intensity in component)
-        intensities = intensities - intensities.min()
-
-        sum_intensity = intensities.sum()
-        if sum_intensity == 0:
-            # Fall back to geometric centroid if all intensities are equal
-            centroid_x = selected_spot["col"]
-            centroid_y = selected_spot["row"]
-        else:
-            centroid_x = (x_coords * intensities).sum() / sum_intensity
-            centroid_y = (y_coords * intensities).sum() / sum_intensity
+        centroid_x, centroid_y = _weighted_centroid(working_image, selected_spot["mask"], selected_spot)
 
         if debug_plot:
             _show_connected_components_debug_plot(

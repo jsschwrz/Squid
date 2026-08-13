@@ -1,6 +1,7 @@
 import configparser
 import enum
 import gc
+import threading
 import os
 import json
 import yaml
@@ -2978,12 +2979,19 @@ class StageUtils(QDialog):
         self.signal_scanning_position_reached.emit()
 
 
+# How many times wider than the z search needs a crop must be before the settings widget mentions
+# it. Every stock 1536 px crop is several times wider than needed, so a lower factor would flag
+# every objective on the machine and the advice would stop meaning anything.
+_CROP_WIDTH_ADVISORY_FACTOR = 4.0
+
+
 class LaserAutofocusSettingWidget(QWidget):
 
     signal_newExposureTime = Signal(float)
     signal_newAnalogGain = Signal(float)
     signal_apply_settings = Signal()
     signal_laser_spot_location = Signal(np.ndarray, float, float)
+    signal_run_af_sweep = Signal()
 
     def __init__(self, streamHandler, liveController: LiveController, laserAutofocusController, stretch=True):
         super().__init__()
@@ -3115,9 +3123,61 @@ class LaserAutofocusSettingWidget(QWidget):
         )
         self._add_spinbox(settings_layout, "Correlation Threshold:", "correlation_threshold", 0.1, 1.0, 2, 0.1)
         self._add_spinbox(settings_layout, "Laser AF Range (μm):", "laser_af_range", 1, 1000, 1)
+        self.spinboxes["laser_af_range"].setToolTip(
+            "Ceiling on an accepted displacement. A measurement larger than this is treated as "
+            "implausible and refused. This no longer bounds the z search -- see Z Search Range."
+        )
+
+        # The z spot-search, which runs when detection fails at the current z.
+        self._add_spinbox(settings_layout, "Z Search Range (μm):", "laser_af_search_range_um", 1, 1000, 1, step=5)
+        self._add_spinbox(settings_layout, "Z Search Step (μm):", "laser_af_search_step_um", 0.1, 100, 2, step=0.5)
+        self.spinboxes["laser_af_search_range_um"].setToolTip(
+            "How far either side of the current z to look for a lost spot. The spot must stay "
+            "inside the crop across this whole span to be found -- the crop status above says "
+            "whether it can."
+        )
+        self.spinboxes["laser_af_search_step_um"].setToolTip(
+            "Z increment of the search. Also scales the window within which a candidate's "
+            "displacement is accepted, so a finer step is both slower and stricter."
+        )
+        self.run_sweep_button = QPushButton("Test AF Sweep")
+        self.run_sweep_button.setToolTip(
+            "Step z across the search range and plot every reflection in frame against z.\n"
+            "The sample reflection traces a sloped line; a static back-reflection traces a flat one.\n"
+            "Reads nothing back into the configuration."
+        )
+        settings_layout.addWidget(self.run_sweep_button)
+
         self.update_threshold_button = QPushButton("Apply without Re-initialization")
         settings_layout.addWidget(self.update_threshold_button)
         settings_group.setLayout(settings_layout)
+
+        # Motion confirm group. Off by default: this is the only check that costs an extra z move,
+        # and on the first-try path it is paid at every FOV of an acquisition.
+        confirm_group = QFrame()
+        confirm_group.setFrameStyle(QFrame.Panel | QFrame.Raised)
+        confirm_layout = QVBoxLayout()
+        confirm_mode_layout = QHBoxLayout()
+        confirm_mode_layout.addWidget(QLabel("Confirm Spot Moves With Z:"))
+        self.confirm_mode_combo = QComboBox()
+        for confirm_mode in LaserAFConfirmMotionMode:
+            self.confirm_mode_combo.addItem(confirm_mode.value, confirm_mode)
+        self.confirm_mode_combo.setToolTip(
+            "Verify a detected spot translates with defocus before trusting it.\n"
+            "off: no check.\n"
+            "search_only: check candidates found by the z search, which runs only after a failure.\n"
+            "always: also check every first-try detection, which costs an extra z step at every FOV."
+        )
+        confirm_mode_layout.addWidget(self.confirm_mode_combo)
+        confirm_layout.addLayout(confirm_mode_layout)
+        self._add_spinbox(confirm_layout, "Confirm Step (μm):", "confirm_step_um", 0.1, 50, 2, step=0.5)
+        self._add_spinbox(confirm_layout, "Confirm Tolerance (pixels):", "confirm_tolerance_px", 0.5, 200, 1, step=1)
+        # A confirm step is only meaningful if it predicts measurable motion, and what counts as
+        # measurable differs by an order of magnitude between objectives. Show the number.
+        self.confirm_prediction_label = QLabel()
+        self.confirm_prediction_label.setWordWrap(True)
+        confirm_layout.addWidget(self.confirm_prediction_label)
+        confirm_group.setLayout(confirm_layout)
 
         # Create spot detection group
         spot_detection_group = QFrame()
@@ -3202,6 +3262,7 @@ class LaserAutofocusSettingWidget(QWidget):
         layout.addWidget(live_group)
         layout.addWidget(crop_group)
         layout.addWidget(non_threshold_group)
+        layout.addWidget(confirm_group)
         layout.addWidget(settings_group)
         layout.addWidget(spot_detection_group)
         layout.addWidget(initialize_group)
@@ -3220,6 +3281,9 @@ class LaserAutofocusSettingWidget(QWidget):
         self.apply_crop_button.clicked.connect(self.apply_crop)
         self.center_crop_button.clicked.connect(self.center_crop_on_last_detection)
         self.reset_crop_button.clicked.connect(self.reset_crop_to_full_sensor)
+        self.run_sweep_button.clicked.connect(self.signal_run_af_sweep.emit)
+        self.spinboxes["confirm_step_um"].valueChanged.connect(self._update_confirm_prediction_label)
+        self._update_confirm_prediction_label()
         self.initialize_button.clicked.connect(self.apply_and_initialize)
         self.characterization_checkbox.toggled.connect(self.toggle_characterization_mode)
 
@@ -3307,10 +3371,16 @@ class LaserAutofocusSettingWidget(QWidget):
         if index >= 0:
             self.spot_mode_combo.setCurrentIndex(index)
 
+        # Update motion confirm mode
+        confirm_index = self.confirm_mode_combo.findData(self.laserAutofocusController.laser_af_properties.confirm_motion_mode)
+        if confirm_index >= 0:
+            self.confirm_mode_combo.setCurrentIndex(confirm_index)
+
         self.update_threshold_button.setEnabled(self.laserAutofocusController.is_initialized)
         self.update_calibration_label()
         self.center_crop_button.setEnabled(self._last_spot_detection is not None)
         self._update_crop_status()
+        self._update_confirm_prediction_label()
 
     def apply_and_initialize(self):
         self.clear_labels()
@@ -3336,6 +3406,11 @@ class LaserAutofocusSettingWidget(QWidget):
             "height": int(self.spinboxes["height"].value()),
             "initialize_crop_width": int(self.spinboxes["initialize_crop_width"].value()),
             "initialize_crop_height": int(self.spinboxes["initialize_crop_height"].value()),
+            "laser_af_search_range_um": self.spinboxes["laser_af_search_range_um"].value(),
+            "laser_af_search_step_um": self.spinboxes["laser_af_search_step_um"].value(),
+            "confirm_motion_mode": self.confirm_mode_combo.currentData(),
+            "confirm_step_um": self.spinboxes["confirm_step_um"].value(),
+            "confirm_tolerance_px": self.spinboxes["confirm_tolerance_px"].value(),
         }
         search_in_crop = self.search_in_crop_checkbox.isChecked()
         if search_in_crop:
@@ -3370,8 +3445,18 @@ class LaserAutofocusSettingWidget(QWidget):
             "displacement_success_window_pixels": int(self.spinboxes["displacement_success_window_pixels"].value()),
             "correlation_threshold": self.spinboxes["correlation_threshold"].value(),
             "laser_af_range": self.spinboxes["laser_af_range"].value(),
+            # The search and confirm settings belong here rather than only on the Initialize path:
+            # they are what gets tuned repeatedly, and re-initializing would discard the
+            # calibration and reference being tuned against.
+            "laser_af_search_range_um": self.spinboxes["laser_af_search_range_um"].value(),
+            "laser_af_search_step_um": self.spinboxes["laser_af_search_step_um"].value(),
+            "confirm_motion_mode": self.confirm_mode_combo.currentData(),
+            "confirm_step_um": self.spinboxes["confirm_step_um"].value(),
+            "confirm_tolerance_px": self.spinboxes["confirm_tolerance_px"].value(),
         }
         self.laserAutofocusController.update_threshold_properties(updates)
+        self._update_crop_status()
+        self._update_confirm_prediction_label()
 
     def apply_crop(self):
         """Re-program the focus camera ROI from the crop spinboxes."""
@@ -3435,6 +3520,31 @@ class LaserAutofocusSettingWidget(QWidget):
         self.signal_apply_settings.emit()
         return True
 
+    def _update_confirm_prediction_label(self):
+        """Show how much spot motion the confirm step predicts, in pixels.
+
+        Whether the check can discriminate at all depends on pixel_to_um: the same 2 um step
+        predicts 25 px at a high-sensitivity objective and 1 px at a low-sensitivity one, and
+        below a few pixels the check is guessing. Showing the number turns an invisible mis-tune
+        into a visible one.
+        """
+        config = self.laserAutofocusController.laser_af_properties
+        um_per_px = abs(config.pixel_to_um)
+        step_um = self.spinboxes["confirm_step_um"].value()
+
+        if not (um_per_px > 0 and math.isfinite(um_per_px)):
+            self.confirm_prediction_label.setText("Predicted motion unknown until pixel_to_um is calibrated.")
+            self.confirm_prediction_label.setStyleSheet("")
+            return
+
+        predicted_px = step_um / um_per_px
+        floor_px = control._def.LASER_AF_CONFIRM_MIN_PREDICTED_PX
+        self.confirm_prediction_label.setText(
+            f"A {step_um:.2f} um step predicts {predicted_px:.1f} px of spot motion."
+            + ("" if predicted_px >= floor_px else f" Below the {floor_px:.0f} px floor: the check will be skipped.")
+        )
+        self.confirm_prediction_label.setStyleSheet("" if predicted_px >= floor_px else "color: red;")
+
     def _update_crop_status(self):
         """Show where the crop sits, and how much focus travel it leaves before the spot
         runs off the edge."""
@@ -3447,6 +3557,39 @@ class LaserAutofocusSettingWidget(QWidget):
         ]
         warn = False
 
+        # What the crop can see, against what the search needs. These diverge badly on a
+        # high-sensitivity objective: at 0.08 um/px a 512 px crop covers only +/-20 um, so a
+        # 40 um search spends most of its positions where the spot cannot possibly be. Shown
+        # unconditionally, not just after a detection, so it is visible on profile load.
+        um_per_px = abs(config.pixel_to_um)
+        search_range_um = config.laser_af_search_range_um
+        if um_per_px > 0 and math.isfinite(um_per_px):
+            visible_um = (width / 2.0) * um_per_px
+            needed_px = 2.0 * search_range_um / um_per_px
+            # clamp_roi and initialize_manual both snap width to a multiple of 8, so a suggestion
+            # that is not already a multiple of 8 is one the camera would silently change.
+            suggested_px = int(math.ceil(needed_px * 1.25 / 8) * 8)
+            lines.append(
+                f"Crop sees ±{visible_um:.0f} um at {um_per_px:.4f} um/px; "
+                f"the ±{search_range_um:.0f} um search needs ≥{needed_px:.0f} px of width."
+            )
+            if width < needed_px:
+                warn = True
+                blind_um = search_range_um - visible_um
+                lines.append(
+                    f"TOO NARROW: beyond ±{visible_um:.0f} um the spot leaves the crop, so the outer "
+                    f"{blind_um:.0f} um of the search can never see it. Widen the crop to ~{suggested_px} px, "
+                    f"or cut the search range to {visible_um:.0f} um."
+                )
+            elif width > needed_px * _CROP_WIDTH_ADVISORY_FACTOR:
+                # Advice, not an alarm: the stock 1536 px crop is several times wider than the
+                # search needs on every objective, and the extra width is only a liability if
+                # there are stray reflections in it.
+                lines.append(
+                    f"Crop is {width / needed_px:.1f}x wider than the search needs; the extra width only "
+                    f"admits stray reflections. ~{suggested_px} px would do."
+                )
+
         if self._last_spot_detection is not None:
             spot_x, spot_y, source_roi = self._last_spot_detection
             lines.append(f"Last spot: crop x={spot_x:.1f}  (full-sensor x={source_roi[0] + spot_x:.1f})")
@@ -3455,13 +3598,12 @@ class LaserAutofocusSettingWidget(QWidget):
 
             # pixel_to_um is signed (it encodes which way the spot moves with defocus); only
             # the magnitude matters for how far the spot can travel inside the crop.
-            um_per_px = abs(config.pixel_to_um)
             if um_per_px > 0:
                 travel_left, travel_right = margin_left * um_per_px, margin_right * um_per_px
                 lines.append(f"Travel headroom: -{travel_left:.0f} um / +{travel_right:.0f} um")
-                if min(travel_left, travel_right) < config.laser_af_range:
+                if min(travel_left, travel_right) < search_range_um:
                     warn = True
-                    lines.append(f"Less headroom than the {config.laser_af_range:.0f} um AF range on one side.")
+                    lines.append(f"Less headroom than the {search_range_um:.0f} um search range on one side.")
 
         if width < 2 * config.spot_crop_size:
             warn = True
@@ -13570,6 +13712,7 @@ class LaserAutofocusControlWidget(QFrame):
         laserAutofocusController,
         liveController: LiveController,
         liveControlWidget=None,
+        multipointController=None,
         main=None,
         *args,
         **kwargs,
@@ -13578,6 +13721,9 @@ class LaserAutofocusControlWidget(QFrame):
         self._log = squid.logging.get_logger(self.__class__.__name__)
         self.laserAutofocusController = laserAutofocusController
         self.liveController: LiveController = liveController
+        # Both buttons on this widget move z. Doing that underneath a running acquisition would
+        # corrupt it; nothing prevented that before. Optional so tests can omit it.
+        self.multipointController = multipointController
         # Optional handle on the LiveControlWidget so 'Set Reference' can step the
         # stage back to the offset=0 baseline before capturing the reference (and
         # restore the applied channel offset after). May be None in tests / contexts
@@ -13644,13 +13790,26 @@ class LaserAutofocusControlWidget(QFrame):
         self.btn_measure_displacement.setEnabled(self.laserAutofocusController.laser_af_properties.has_reference)
         self.btn_move_to_target.setEnabled(self.laserAutofocusController.laser_af_properties.has_reference)
 
+    def _refuse_if_acquiring(self) -> bool:
+        """True (and warns) when an acquisition is running, so z must not be moved."""
+        if self.multipointController is not None and self.multipointController.acquisition_in_progress():
+            QMessageBox.warning(
+                self, "Laser Autofocus", "Cannot move the stage from here while an acquisition is running."
+            )
+            return True
+        return False
+
     def move_to_target(self):
+        if self._refuse_if_acquiring():
+            return
         was_live = self.liveController.is_live
         if was_live:
             self.liveController.stop_live()
-        self.laserAutofocusController.move_to_target(self.entry_target.value())
-        if was_live:
-            self.liveController.start_live()
+        try:
+            self.laserAutofocusController.move_to_target(self.entry_target.value())
+        finally:
+            if was_live:
+                self.liveController.start_live()
 
     def on_set_reference_clicked(self):
         """Handle set reference button click.
@@ -13705,18 +13864,268 @@ class LaserAutofocusControlWidget(QFrame):
             self.liveController.start_live()
 
     def on_measure_displacement_clicked(self):
+        if self._refuse_if_acquiring():
+            return
         was_live = self.liveController.is_live
         if was_live:
             self.liveController.stop_live()
-        result = self.laserAutofocusController.measure_displacement()
+        try:
+            result = self.laserAutofocusController.measure_displacement()
+        finally:
+            # Restore live even if the measurement raised; otherwise a failure silently leaves
+            # the stream stopped and the next operation looks broken for an unrelated reason.
+            if was_live:
+                self.liveController.start_live()
         if math.isnan(result):
             QMessageBox.warning(
                 self,
                 "Measurement Failed",
                 "Could not measure displacement. Please ensure the reference position is set.",
             )
-        if was_live:
-            self.liveController.start_live()
+
+
+class LaserAFSweepWidget(QWidget):
+    """Plots every reflection in the focus camera's crop against z.
+
+    Answers the one question the normal detection path cannot: which of the things in frame is
+    the sample reflection. Across a z sweep the real spot traces a line whose slope is
+    1/pixel_to_um, while a static back-reflection traces a flat one. The fitted slope is also an
+    independent check on the stored calibration -- if they disagree, the calibration measured
+    something other than one spot moving.
+    """
+
+    def __init__(
+        self,
+        laserAutofocusController,
+        liveController,
+        laserAutofocusSettingWidget=None,
+        multipointController=None,
+        parent=None,
+    ):
+        super().__init__(parent)
+        self._log = squid.logging.get_logger(self.__class__.__name__)
+        self.laserAutofocusController = laserAutofocusController
+        self.liveController = liveController
+        self.laserAutofocusSettingWidget = laserAutofocusSettingWidget
+        self.multipointController = multipointController
+
+        self._keep_running = threading.Event()
+        self._thread = None
+        self._samples = []
+        self._was_main_live = False
+        self._progress_dialog = None
+
+        self.init_ui()
+
+    def init_ui(self):
+        layout = QVBoxLayout()
+
+        button_layout = QHBoxLayout()
+        self.btn_run = QPushButton("Test AF Sweep")
+        self.btn_run.setStyleSheet("background-color: #C2C2FF")
+        self.btn_clear = QPushButton("Clear")
+        button_layout.addWidget(self.btn_run)
+        button_layout.addWidget(self.btn_clear)
+        layout.addLayout(button_layout)
+
+        self.status_label = QLabel("Sweep z across the search range to see which reflections track focus.")
+        self.status_label.setWordWrap(True)
+        layout.addWidget(self.status_label)
+
+        self.graphics = pg.GraphicsLayoutWidget()
+        self.plot = self.graphics.addPlot()
+        self.plot.setLabel("bottom", "z offset from sweep start", units="um")
+        self.plot.setLabel("left", "spot x in crop", units="px")
+        self.plot.showGrid(x=True, y=True, alpha=0.3)
+        self.plot.addLegend()
+
+        # Two series created once and driven by setData. Calling plot() per sample would add a
+        # new item every time and leak them for the life of the window.
+        self.all_candidates_item = pg.ScatterPlotItem(
+            size=5, pen=None, brush=pg.mkBrush(150, 150, 150, 180), name="all candidates"
+        )
+        self.selected_item = pg.ScatterPlotItem(
+            size=9, pen=None, brush=pg.mkBrush(0, 140, 255, 220), name="selected by mode"
+        )
+        self.plot.addItem(self.all_candidates_item)
+        self.plot.addItem(self.selected_item)
+
+        self.reference_line = pg.InfiniteLine(angle=0, pen=pg.mkPen("g", style=Qt.DashLine))
+        self.origin_line = pg.InfiniteLine(angle=90, pen=pg.mkPen(120, 120, 120, 150, style=Qt.DashLine), pos=0)
+        self.plot.addItem(self.reference_line)
+        self.plot.addItem(self.origin_line)
+        self.reference_line.setVisible(False)
+
+        layout.addWidget(self.graphics)
+        self.setLayout(layout)
+
+        self.btn_run.clicked.connect(self.start_sweep)
+        self.btn_clear.clicked.connect(self.clear)
+
+    def clear(self):
+        self._samples = []
+        self.all_candidates_item.setData([], [])
+        self.selected_item.setData([], [])
+        self.status_label.setText("Cleared.")
+        self.status_label.setStyleSheet("")
+
+    def start_sweep(self):
+        if self._thread is not None and self._thread.is_alive():
+            return
+
+        # This drives z. Doing that underneath a running acquisition would corrupt it, and
+        # nothing else in the laser AF widgets checks.
+        if self.multipointController is not None and self.multipointController.acquisition_in_progress():
+            QMessageBox.warning(self, "Laser Autofocus", "Cannot run an AF sweep while an acquisition is running.")
+            return
+
+        if not self.laserAutofocusController.is_initialized:
+            QMessageBox.warning(
+                self, "Laser Autofocus", "Initialize the laser autofocus before running a sweep."
+            )
+            return
+
+        config = self.laserAutofocusController.laser_af_properties
+        if self.laserAutofocusController.piezo is None:
+            # Without a piezo this moves the objective itself, and a high-NA objective sits within
+            # tens of microns of the coverslip. Make the operator say yes to the actual number.
+            answer = QMessageBox.question(
+                self,
+                "Laser Autofocus",
+                f"There is no piezo, so this sweep will move the Z STAGE by "
+                f"±{config.laser_af_search_range_um:.1f} um from the current position.\n\n"
+                f"Confirm the objective has that much clearance before continuing.",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            if answer != QMessageBox.Yes:
+                return
+
+        self.clear()
+        self.reference_line.setVisible(config.has_reference and config.x_reference is not None)
+        if config.has_reference and config.x_reference is not None:
+            self.reference_line.setPos(config.x_reference)
+        # Show the full crop, so how much of it the spot never reaches is visible.
+        self.plot.setYRange(0, int(config.width))
+
+        # Both streams contend for the AF laser over the same microcontroller link.
+        self._was_main_live = self.liveController.is_live
+        try:
+            if self.laserAutofocusSettingWidget is not None:
+                self.laserAutofocusSettingWidget.stop_live()
+            if self._was_main_live:
+                self.liveController.stop_live()
+        except Exception:
+            self._log.exception("Failed to stop live before AF sweep")
+
+        self.btn_run.setEnabled(False)
+        self.status_label.setText("Sweeping...")
+        self.status_label.setStyleSheet("")
+
+        self._keep_running.set()
+        self._show_progress_dialog()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def _run(self):
+        try:
+            self.laserAutofocusController.run_af_sweep(keep_running=self._keep_running)
+        except Exception:
+            # signal_af_sweep_finished still fires from run_af_sweep's finally, so the UI recovers.
+            self._log.exception("AF sweep failed")
+
+    def cancel(self):
+        self._keep_running.clear()
+
+    def _show_progress_dialog(self):
+        from qtpy.QtWidgets import QProgressDialog
+
+        self._progress_dialog = QProgressDialog("Running AF sweep (moving Z)...", "Stop", 0, 0, self)
+        self._progress_dialog.setWindowTitle("Laser Autofocus")
+        # Non-modal and always-on-top: the operator must be able to see that z is moving, and to
+        # reach the stop button, without the dialog blocking the plot updating behind it.
+        self._progress_dialog.setWindowModality(Qt.NonModal)
+        self._progress_dialog.setWindowFlags(self._progress_dialog.windowFlags() | Qt.WindowStaysOnTopHint)
+        self._progress_dialog.setMinimumDuration(0)
+        self._progress_dialog.canceled.connect(self.cancel)
+        self._progress_dialog.show()
+
+    def _hide_progress_dialog(self):
+        if self._progress_dialog is not None:
+            self._progress_dialog.close()
+            self._progress_dialog = None
+
+    def on_sweep_sample(self, sample):
+        self._samples.append(sample)
+        all_x, all_y, sel_x, sel_y = [], [], [], []
+        for s in self._samples:
+            for candidate in s.candidates:
+                all_x.append(s.dz_um)
+                all_y.append(candidate["x"])
+            if s.selected_x is not None:
+                sel_x.append(s.dz_um)
+                sel_y.append(s.selected_x)
+        self.all_candidates_item.setData(all_x, all_y)
+        self.selected_item.setData(sel_x, sel_y)
+
+    def on_sweep_finished(self, samples):
+        self._hide_progress_dialog()
+        self.btn_run.setEnabled(True)
+        if self._was_main_live:
+            try:
+                self.liveController.start_live()
+            except Exception:
+                self._log.exception("Failed to restore live after AF sweep")
+            self._was_main_live = False
+
+        self.status_label.setText(self._summarize(samples))
+
+    def _summarize(self, samples) -> str:
+        """Fit the selected branch against z and compare the slope to the stored calibration."""
+        points = [(s.dz_um, s.selected_x) for s in samples if s.selected_x is not None]
+        positions_with_any = sum(1 for s in samples if s.candidates)
+        header = f"{len(samples)} z positions, {positions_with_any} with a detected spot."
+
+        if len(points) < 2:
+            return (
+                f"{header} Not enough detections to fit a slope. If the plot is empty, the spot is "
+                f"outside the crop across this whole range -- check the crop status in the settings panel."
+            )
+
+        dz = np.array([p[0] for p in points], dtype=float)
+        x = np.array([p[1] for p in points], dtype=float)
+        if float(np.ptp(dz)) == 0:
+            return f"{header} All detections at one z; cannot fit a slope."
+
+        slope_px_per_um = float(np.polyfit(dz, x, 1)[0])
+        stored = self.laserAutofocusController.laser_af_properties.pixel_to_um
+
+        if abs(slope_px_per_um) < 1e-6:
+            return (
+                f"{header} Slope {slope_px_per_um:.3f} px/um - this branch does NOT move with z, so it "
+                f"is a static reflection, not the sample reflection. Reposition the crop onto a "
+                f"reflection that tracks focus."
+            )
+
+        measured_um_per_px = 1.0 / slope_px_per_um
+        agreement = ""
+        if stored not in (0, None) and math.isfinite(stored):
+            rel = abs(measured_um_per_px - stored) / abs(stored)
+            agreement = (
+                f" Stored pixel_to_um = {stored:.4f} ({'agrees within' if rel < 0.1 else 'DISAGREES by'} "
+                f"{rel * 100:.0f}%)."
+            )
+        return (
+            f"{header} Slope {slope_px_per_um:.2f} px/um -> {measured_um_per_px:.4f} um/px.{agreement}"
+        )
+
+    def closeEvent(self, event):
+        # Emitting a signal into a destroyed widget is a hard crash, not an exception.
+        self._keep_running.clear()
+        if self._thread is not None and self._thread.is_alive():
+            self._thread.join(timeout=5.0)
+        self._hide_progress_dialog()
+        super().closeEvent(event)
 
 
 class WellplateFormatWidget(QWidget):

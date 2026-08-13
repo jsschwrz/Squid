@@ -399,6 +399,24 @@ class SpotDetectionMode(Enum):
     MULTI_SECOND_RIGHT = "multi_second_right"
 
 
+class LaserAFConfirmMotionMode(Enum):
+    """When to verify that a detected spot actually translates with defocus.
+
+    The sample reflection moves along x as z changes; a static back-reflection does not.
+    None of the intensity, area, aspect or row filters can tell them apart, so this is a
+    separate check that costs an extra z step.
+
+    OFF: never verify (historical behaviour)
+    SEARCH_ONLY: verify candidates found by the z spot-search, which only runs after a
+        first-try detection failure, so the cost is paid rarely
+    ALWAYS: also verify the first-try detection, which runs at every FOV of an acquisition
+    """
+
+    OFF = "off"
+    SEARCH_ONLY = "search_only"
+    ALWAYS = "always"
+
+
 class FileSavingOption(Enum):
     """File saving options.
 
@@ -906,6 +924,16 @@ LASER_AF_CROP_WIDTH = 1536
 LASER_AF_CROP_HEIGHT = 256
 LASER_AF_SPOT_DETECTION_MODE = SpotDetectionMode.DUAL_LEFT.value
 LASER_AF_RANGE = 100
+# Z spot-search: how far to look for a lost spot, and how finely. The range is separate from
+# LASER_AF_RANGE, which stays the "implausible displacement" ceiling in move_to_target.
+LASER_AF_SEARCH_STEP_UM = 10
+# A candidate is accepted when its displacement is within step * (1 + this) of the reference.
+# 0.4 reproduces the historical hard-coded `search_step_um + 4` at the historical 10 um step.
+LASER_AF_SEARCH_ACCEPT_TOLERANCE_FRACTION = 0.4
+# Confirm-by-step: a confirm step predicting less spot motion than this cannot discriminate a
+# moving spot from a static one, so the check is skipped rather than guessed at.
+LASER_AF_CONFIRM_MIN_PREDICTED_PX = 4.0
+LASER_AF_CONFIRM_TOLERANCE_FRACTION = 0.35  # slack as a fraction of the predicted motion
 DISPLACEMENT_SUCCESS_WINDOW_PIXELS = 300  # Max displacement from reference x to accept detection (pixels)
 SPOT_CROP_SIZE = 100
 CORRELATION_THRESHOLD = 0.7
