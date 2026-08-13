@@ -1111,6 +1111,15 @@ class MicroscopeControlServer:
         self.multipoint_controller.set_Nt(yaml_data.nt)
         self.multipoint_controller.set_deltat(yaml_data.delta_t_s)
 
+        # z_stack.config ("FROM BOTTOM" / "FROM CENTER" / "FROM TOP") was parsed but never
+        # applied here, so a headless YAML run always stacked from the bottom regardless of
+        # what it asked for.  set_z_stacking_config takes an index into Z_STACKING_CONFIG_MAP.
+        stacking_index = next(
+            (i for i, name in control._def.Z_STACKING_CONFIG_MAP.items() if name == yaml_data.z_stacking_config),
+            0,
+        )
+        self.multipoint_controller.set_z_stacking_config(stacking_index)
+
         # Set autofocus flags
         self.multipoint_controller.do_autofocus = yaml_data.contrast_af
         self.multipoint_controller.do_reflection_af = yaml_data.laser_af
