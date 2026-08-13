@@ -235,12 +235,71 @@ class TestBuildSearchPositions:
             LaserAFConfig(laser_af_search_range_um=bad_range)
 
 
-class TestAcceptWindow:
-    @pytest.mark.parametrize("step_um, expected", [(10.0, 14.0), (3.0, 4.2), (0.5, 0.7)])
-    def test_window_scales_with_step(self, step_um, expected):
-        # At the historical 10 um step this must reproduce the historical `step + 4`.
-        window = step_um * (1.0 + control._def.LASER_AF_SEARCH_ACCEPT_TOLERANCE_FRACTION)
-        assert window == pytest.approx(expected)
+class TestSearchAcceptsTheFirstDetection:
+    """There is deliberately no displacement window inside the search loop.
+
+    A step-derived window silently tightened to 2.8 um when the step was set to 2 um, discarding
+    real detections at 3-25 um and making the search succeed only if it happened to land within
+    one step of focus. The frame-level pixel window, the laser_af_range ceiling and the
+    cross-correlation check cover what it was doing.
+    """
+
+    def _controller(self, centroids, **config_kwargs):
+        config = LaserAFConfig(
+            pixel_to_um=0.5,
+            x_reference=100.0,
+            has_reference=True,
+            laser_af_search_range_um=30.0,
+            laser_af_search_step_um=2.0,
+            **config_kwargs,
+        )
+        controller = _controller_for_search(config)
+        controller._get_laser_spot_centroid = MagicMock(side_effect=centroids)
+        controller._turn_on_laser = MagicMock()
+        controller._turn_off_laser = MagicMock()
+        controller.signal_displacement_um = MagicMock()
+        return controller
+
+    @pytest.mark.parametrize("displacement_px", [10.0, 30.0, 50.0])
+    def test_a_distant_detection_is_returned_rather_than_stepped_past(self, displacement_px):
+        # 50 px at 0.5 um/px is 25 um -- far outside any step-derived window, and exactly the kind
+        # of detection that was being discarded.
+        controller = self._controller(centroids=[None, (100.0 + displacement_px, 50.0)])
+
+        result = controller.measure_displacement()
+
+        assert result == pytest.approx(displacement_px * 0.5)
+
+    def test_the_search_stops_at_the_first_detection(self):
+        controller = self._controller(centroids=[None, (140.0, 50.0), (100.0, 50.0)])
+
+        controller.measure_displacement()
+
+        # Two calls: the failed first try, then the first search position that saw anything.
+        assert controller._get_laser_spot_centroid.call_count == 2
+
+    def test_a_search_that_never_detects_still_fails(self):
+        controller = self._controller(centroids=[None] * 60)
+
+        assert math.isnan(controller.measure_displacement())
+        controller._restore_to_position.assert_called()
+
+
+class TestDebrisWarning:
+    @pytest.mark.parametrize(
+        "pixel_to_um, offset_px, expect_warning",
+        [
+            # 40x: a 20 px offset is 1.8 um, well within a normal lock -- must not warn.
+            (0.0911, 20.0, False),
+            (0.0911, 150.0, True),  # 13.7 um -- genuinely off
+            # 10x: 20 px is 40 um, badly off -- the old fixed pixel threshold barely caught it.
+            (1.9827, 20.0, True),
+            (1.9827, 3.0, False),  # 5.9 um
+        ],
+    )
+    def test_threshold_means_the_same_distance_on_every_objective(self, pixel_to_um, offset_px, expect_warning):
+        offset_um = offset_px * abs(pixel_to_um)
+        assert (offset_um > control._def.LASER_AF_DEBRIS_WARNING_OFFSET_UM) is expect_warning
 
 
 class TestFindAllSpotLocations:

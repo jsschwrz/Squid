@@ -927,9 +927,10 @@ LASER_AF_RANGE = 100
 # Z spot-search: how far to look for a lost spot, and how finely. The range is separate from
 # LASER_AF_RANGE, which stays the "implausible displacement" ceiling in move_to_target.
 LASER_AF_SEARCH_STEP_UM = 10
-# A candidate is accepted when its displacement is within step * (1 + this) of the reference.
-# 0.4 reproduces the historical hard-coded `search_step_um + 4` at the historical 10 um step.
-LASER_AF_SEARCH_ACCEPT_TOLERANCE_FRACTION = 0.4
+# Warn when the spot sits this far from the reference after a move-to-target. Expressed in microns
+# rather than pixels because pixel_to_um spans more than an order of magnitude across objectives
+# here (0.09 to 2.0 um/px), so a fixed pixel offset meant anything from 1.8 to 40 um.
+LASER_AF_DEBRIS_WARNING_OFFSET_UM = 10.0
 # Confirm-by-step: a confirm step predicting less spot motion than this cannot discriminate a
 # moving spot from a static one, so the check is skipped rather than guessed at.
 LASER_AF_CONFIRM_MIN_PREDICTED_PX = 4.0

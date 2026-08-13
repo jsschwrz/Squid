@@ -769,9 +769,6 @@ class LaserAutofocusController(QObject):
             f"positions {search_positions_um} um"
         )
 
-        # A candidate whose displacement is further from the reference than one search step could
-        # not have been reached by the step that just happened, so it is a different spot.
-        accept_window_um = search_step_um * (1.0 + control._def.LASER_AF_SEARCH_ACCEPT_TOLERANCE_FRACTION)
         confirm_mode = self.laser_af_properties.confirm_motion_mode
         confirm_failures = 0
 
@@ -797,12 +794,16 @@ class LaserAutofocusController(QObject):
                 self._log.info(f"Z search: no valid spot at {target_pos_um:.1f} um")
                 continue
 
+            # The first genuine detection wins. There is deliberately no displacement window here:
+            # _get_laser_spot_centroid already discards anything further than
+            # displacement_success_window_pixels from the reference, move_to_target refuses a
+            # displacement beyond laser_af_range, and the cross-correlation check after the move
+            # restores z if the spot turns out to be the wrong one. A fourth window at this layer
+            # added nothing those three do not cover, and because it was derived from the search
+            # step it silently tightened to 2.8 um when the step was set to 2 um -- discarding real
+            # detections at 3-25 um and making the search succeed only if it happened to land
+            # within one step of focus.
             displacement_um = self._get_displacement_from_centroid(result)
-            if abs(displacement_um) > accept_window_um:
-                self._log.info(
-                    f"Z search: spot at {target_pos_um:.1f} um has displacement {displacement_um:.1f} um (out of range)"
-                )
-                continue
 
             if confirm_mode in (
                 control._def.LaserAFConfirmMotionMode.SEARCH_ONLY,
@@ -1213,12 +1214,20 @@ class LaserAutofocusController(QObject):
         center_x = int(self.laser_af_properties.x_reference)
         center_y = int(current_image.shape[0] / 2)
 
-        # Log if detected spot is far from reference (potential debris/contamination)
+        # Log if detected spot is far from reference (potential debris/contamination).
+        #
+        # Thresholded in microns, not pixels: this check runs after move_to_target has already
+        # moved to the target displacement, so what matters is the residual defocus, and
+        # pixel_to_um spans more than an order of magnitude across the objectives on one machine.
+        # A fixed 20 px meant 40 um on a low-sensitivity objective and 1.8 um on a high-sensitivity
+        # one, where it fired on essentially every successful lock.
         spot_offset = abs(current_peak_x - self.laser_af_properties.x_reference)
-        if spot_offset > 20:  # pixels
+        spot_offset_um = spot_offset * abs(self.laser_af_properties.pixel_to_um)
+        if spot_offset_um > control._def.LASER_AF_DEBRIS_WARNING_OFFSET_UM:
             self._log.warning(
-                f"Detected spot at x={current_peak_x:.1f} is {spot_offset:.1f} pixels from reference "
-                f"x={self.laser_af_properties.x_reference:.1f} - possible debris/contamination"
+                f"Detected spot at x={current_peak_x:.1f} is {spot_offset:.1f} pixels "
+                f"({spot_offset_um:.1f} um) from reference x={self.laser_af_properties.x_reference:.1f} "
+                f"- possible debris/contamination"
             )
 
         x_start = max(0, center_x - self.laser_af_properties.spot_crop_size // 2)
