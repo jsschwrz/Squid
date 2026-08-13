@@ -177,6 +177,55 @@ class LaserAFConfig(BaseModel):
 
     @model_validator(mode="before")
     @classmethod
+    def _repair_crop_relative_x_reference(cls, data: Any) -> Any:
+        """Recover an x_reference that was written in the crop-relative frame.
+
+        On disk x_reference is full-sensor, so it must lie inside the crop -- a reference the
+        detector can never see is meaningless. Saves that skipped the memory -> disk conversion
+        wrote the crop-relative value instead, which is short by exactly x_offset, and loading it
+        subtracts x_offset a second time and puts the reference off the crop entirely.
+
+        A value at or above x_offset is left alone. The two frames overlap there whenever
+        x_offset < width, so a plausible-looking number could belong to either and guessing would
+        risk breaking a good config. Only a value *below* x_offset is unambiguously wrong -- no
+        correct full-sensor reference can sit left of the crop -- and even then it is only rewritten
+        when adding x_offset back lands inside the crop.
+        """
+        if not isinstance(data, dict):
+            return data
+
+        x_reference = data.get("x_reference")
+        x_offset = data.get("x_offset")
+        width = data.get("width")
+        if not all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in (x_reference, x_offset, width)):
+            return data
+        if x_offset <= 0 or x_reference is None or x_offset <= x_reference:
+            return data
+
+        repaired = x_reference + x_offset
+        if x_offset <= repaired <= x_offset + width:
+            _log.warning(
+                "Laser AF x_reference of %.1f sits outside the crop (%.0f..%.0f), which means it was "
+                "saved in the crop-relative frame. Repairing to %.1f.",
+                x_reference,
+                x_offset,
+                x_offset + width,
+                repaired,
+            )
+            data = dict(data)
+            data["x_reference"] = repaired
+        else:
+            _log.warning(
+                "Laser AF x_reference of %.1f sits outside the crop (%.0f..%.0f) and cannot be "
+                "repaired unambiguously. Re-set the reference for this objective.",
+                x_reference,
+                x_offset,
+                x_offset + width,
+            )
+        return data
+
+    @model_validator(mode="before")
+    @classmethod
     def _clamp_unsatisfiable_correlation_threshold(cls, data: Any) -> Any:
         """Pull a stored correlation_threshold back below 1.0.
 

@@ -398,6 +398,92 @@ class TestIterativeCorrection:
         controller._move_z.assert_called_once_with(-41.0)
 
 
+class TestXReferenceFrameConversion:
+    """x_reference is crop-relative in memory and full-sensor on disk.
+
+    Saving the model directly writes the wrong frame, and the next load subtracts x_offset a
+    second time -- moving the reference off the crop entirely, where nothing can ever match it.
+    """
+
+    @staticmethod
+    def _in_memory(x_reference_full_sensor=1543.0, **kwargs):
+        """A config in the in-memory frame, built the way initialize_manual builds it.
+
+        model_copy rather than direct construction, because construction runs the repair validator
+        -- which is correct to do for a value read off disk, and wrong for one already converted.
+        Production only ever reaches the in-memory frame through model_copy, so this matches it.
+        """
+        settings = dict(x_offset=1000.0, width=1000, x_reference=x_reference_full_sensor)
+        settings.update(kwargs)
+        on_disk = LaserAFConfig(**settings)
+        return on_disk.model_copy(update={"x_reference": on_disk.x_reference - on_disk.x_offset})
+
+    def _controller(self, config):
+        controller = _make_controller(config)
+        controller.objectiveStore.current_objective = "40x"
+        return controller
+
+    def test_save_converts_back_to_the_full_sensor_frame(self):
+        controller = self._controller(self._in_memory(1543.0))
+        assert controller.laser_af_properties.x_reference == pytest.approx(543.0)  # crop-relative
+
+        controller._save_current_config()
+
+        saved = controller._config_repo.save_laser_af_config.call_args[0][2]
+        assert saved.x_reference == pytest.approx(1543.0)
+
+    def test_a_round_trip_through_save_and_load_is_stable(self):
+        """The property that was broken: tuning repeatedly must not walk the reference away."""
+        controller = self._controller(self._in_memory(1543.0))
+
+        for _ in range(5):
+            controller._save_current_config()
+            saved = controller._config_repo.save_laser_af_config.call_args[0][2]
+            # initialize_manual's disk -> memory conversion
+            controller.laser_af_properties = saved.model_copy(
+                update={"x_reference": saved.x_reference - saved.x_offset}
+            )
+
+        assert controller.laser_af_properties.x_reference == pytest.approx(543.0)
+
+    def test_update_threshold_properties_no_longer_corrupts_the_reference(self):
+        # This is the "Apply without Re-initialization" path, pressed repeatedly while tuning.
+        controller = self._controller(self._in_memory(1543.0))
+
+        controller.update_threshold_properties({"correlation_threshold": 0.8})
+
+        saved = controller._config_repo.save_laser_af_config.call_args[0][2]
+        assert saved.x_reference == pytest.approx(1543.0)
+        assert saved.correlation_threshold == 0.8
+
+    def test_missing_reference_stays_missing(self):
+        controller = self._controller(LaserAFConfig(x_offset=1000.0, width=1000, x_reference=None))
+
+        controller._save_current_config()
+
+        assert controller._config_repo.save_laser_af_config.call_args[0][2].x_reference is None
+
+    def test_load_repairs_a_reference_stored_in_the_crop_relative_frame(self):
+        # The value actually found on the machine: crop 1000..2000, reference stored as 543.66.
+        config = LaserAFConfig(x_offset=1000.0, width=1000, x_reference=543.6563556340321)
+        assert config.x_reference == pytest.approx(1543.6563556340321)
+
+    def test_load_leaves_a_correct_reference_alone(self):
+        config = LaserAFConfig(x_offset=1000.0, width=1000, x_reference=1543.0)
+        assert config.x_reference == pytest.approx(1543.0)
+
+    def test_load_does_not_guess_where_the_frames_overlap(self):
+        # crop 100..1636, so 500 is a plausible full-sensor reference. Rewriting it would break a
+        # config that was fine.
+        config = LaserAFConfig(x_offset=100.0, width=1536, x_reference=500.0)
+        assert config.x_reference == pytest.approx(500.0)
+
+    def test_load_reports_but_does_not_rewrite_an_unrepairable_reference(self):
+        # Below the crop, but adding x_offset overshoots it too -- no safe correction exists.
+        config = LaserAFConfig(x_offset=1000.0, width=100, x_reference=500.0)
+        assert config.x_reference == pytest.approx(500.0)
+
+
 class TestDebrisWarning:
     @pytest.mark.parametrize(
         "pixel_to_um, offset_px, expect_warning",

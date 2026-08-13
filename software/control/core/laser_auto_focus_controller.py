@@ -329,10 +329,7 @@ class LaserAutofocusController(QObject):
             return False
 
         # Save configuration
-        if self._current_profile:
-            self._config_repo.save_laser_af_config(
-                self._current_profile, self.objectiveStore.current_objective, self.laser_af_properties
-            )
+        self._save_current_config()
 
         return True
 
@@ -516,10 +513,7 @@ class LaserAutofocusController(QObject):
         )
 
         # Update cache
-        if self.objectiveStore and self._current_profile:
-            self._config_repo.save_laser_af_config(
-                self._current_profile, self.objectiveStore.current_objective, self.laser_af_properties
-            )
+        self._save_current_config()
 
         return True
 
@@ -531,10 +525,7 @@ class LaserAutofocusController(QObject):
     def update_threshold_properties(self, updates: dict) -> None:
         """Update threshold properties. Save settings without re-initializing."""
         self.laser_af_properties = self.laser_af_properties.model_copy(update=updates)
-        if self._current_profile and self.objectiveStore:
-            self._config_repo.save_laser_af_config(
-                self._current_profile, self.objectiveStore.current_objective, self.laser_af_properties
-            )
+        self._save_current_config()
         self._log.info("Updated threshold properties")
 
     def _turn_on_laser(self) -> None:
@@ -844,6 +835,31 @@ class LaserAutofocusController(QObject):
         except TimeoutError:
             self._log.exception("Turning off AF laser timed out! Laser may still be on.")
         return finish_with(float("nan"))
+
+    def _save_current_config(self) -> None:
+        """Persist laser_af_properties, converting x_reference back to the on-disk frame.
+
+        x_reference is crop-relative in memory and full-sensor on disk. initialize_manual does
+        disk -> memory by subtracting x_offset; this is the only memory -> disk conversion, so
+        every save of laser_af_properties must go through here. Saving the model directly writes a
+        crop-relative number into a field that will be decremented by x_offset again on the next
+        load, which silently moves the reference off the crop entirely.
+        """
+        if not (self._current_profile and self.objectiveStore and self.objectiveStore.current_objective):
+            return
+
+        x_reference = self.laser_af_properties.x_reference
+        save_config = self.laser_af_properties.model_copy(
+            update={
+                "x_reference": None if x_reference is None else x_reference + self.laser_af_properties.x_offset
+            }
+        )
+        if self.laser_af_properties.has_reference and self.reference_crop is not None:
+            save_config.set_reference_image(self.reference_crop)
+
+        self._config_repo.save_laser_af_config(
+            self._current_profile, self.objectiveStore.current_objective, save_config
+        )
 
     def _spot_detection_params(self, row_tolerance: Optional[float] = None) -> Dict[str, Any]:
         """The cc_* parameter dict passed to the detection functions."""

@@ -3533,6 +3533,18 @@ class LaserAutofocusSettingWidget(QWidget):
                 "iterative_correction_min_displacement_um"
             ].value(),
             "iterative_correction_tolerance_um": self.spinboxes["iterative_correction_tolerance_um"].value(),
+            # Spot detection settings belong here too. _get_laser_spot_centroid rebuilds its
+            # parameter dict on every call, so none of these need Initialize to take effect -- and
+            # requiring Initialize to change one meant discarding the calibration and reference
+            # being tuned against, so in practice they silently reverted instead.
+            "cc_threshold": self.spinboxes["cc_threshold"].value(),
+            "cc_min_area": int(self.spinboxes["cc_min_area"].value()),
+            "cc_max_area": int(self.spinboxes["cc_max_area"].value()),
+            "cc_row_tolerance": self.spinboxes["cc_row_tolerance"].value(),
+            "cc_max_aspect_ratio": self.spinboxes["cc_max_aspect_ratio"].value(),
+            "filter_sigma": self.spinboxes["filter_sigma"].value(),
+            "spot_detection_mode": self.spot_mode_combo.currentData(),
+            "spot_crop_size": int(self.spinboxes["spot_crop_size"].value()),
         }
         self.laserAutofocusController.update_threshold_properties(updates)
         self._update_crop_status()
