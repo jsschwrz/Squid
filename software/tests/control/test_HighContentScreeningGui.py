@@ -217,6 +217,41 @@ def test_core_failure_stops_the_sweep(qtbot, monkeypatch, confirm_exit_yes):
     assert reporter.get("illumination_controller").state is StepState.PENDING
 
 
+def test_default_dz_follows_the_objective(qtbot, confirm_exit_yes):
+    """Every z-step box starts at the current objective's Nyquist-ish step and re-seeds
+    when the objective changes — a step chosen for a 4x is the wrong sampling on a 40x."""
+    scope = control.microscope.Microscope.build_from_global_config(True)
+    win = control.gui_hcs.HighContentScreeningGui(microscope=scope, is_simulation=True)
+    qtbot.add_widget(win)
+
+    # Changing the objective also repaints the navigation viewer's FOV box, which needs a
+    # stage position; nothing has moved in this test, so seed one or redraw_fov raises in
+    # the Qt event loop (NavigationViewer.x_mm starts as None).
+    win.navigationViewer.x_mm, win.navigationViewer.y_mm = 20.0, 20.0
+
+    objectives = win.objectiveStore.objectives_dict
+    # Two objectives far enough apart in NA that their defaults cannot coincide.
+    low_na, high_na = sorted(objectives, key=lambda name: objectives[name]["NA"])[:: len(objectives) - 1]
+    expected_low = control._def.nyquist_dz_um(objectives[low_na]["NA"])
+    expected_high = control._def.nyquist_dz_um(objectives[high_na]["NA"])
+    assert expected_low != expected_high
+
+    dz_entries = [
+        win.autofocusWidget.entry_delta,
+        win.wellplateMultiPointWidget.entry_deltaZ,
+        win.flexibleMultiPointWidget.entry_deltaZ,
+    ]
+
+    win.objectivesWidget.dropdown.setCurrentText(low_na)
+    for entry in dz_entries:
+        # Tolerance covers the widgets snapping the step to a whole Z microstep (~0.04 um).
+        assert entry.value() == pytest.approx(expected_low, abs=0.05), f"{entry} did not follow {low_na}"
+
+    win.objectivesWidget.dropdown.setCurrentText(high_na)
+    for entry in dz_entries:
+        assert entry.value() == pytest.approx(expected_high, abs=0.05), f"{entry} did not follow {high_na}"
+
+
 def test_devices_are_registered_for_teardown(qtbot, confirm_exit_yes):
     """An abort mid-build has no Microscope to close, so the reporter's registry
     is the only handle on what was opened."""
