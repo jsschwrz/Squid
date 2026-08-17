@@ -14081,6 +14081,10 @@ class LaserAFSweepWidget(QWidget):
     something other than one spot moving.
     """
 
+    # "This session" is the life of the process, so this is deliberately class-level rather than
+    # per-instance: it must survive the widget being rebuilt, and it must not persist to config.
+    _suppress_range_warning = False
+
     def __init__(
         self,
         laserAutofocusController,
@@ -14178,6 +14182,15 @@ class LaserAFSweepWidget(QWidget):
         self.status_label.setText("Cleared.")
         self.status_label.setStyleSheet("")
 
+    def _active_z_device_name(self) -> str:
+        """Name of whatever the sweep will actually drive.
+
+        Mirrors LaserAutofocusController.get_current_z_um: the piezo when there is one, otherwise
+        the stage. Read from the controller rather than hardcoded so the message cannot claim the
+        wrong device on a machine configured differently.
+        """
+        return "Piezo" if self.laserAutofocusController.piezo is not None else "Z Stage"
+
     def start_sweep(self):
         if self._thread is not None and self._thread.is_alive():
             return
@@ -14195,20 +14208,26 @@ class LaserAFSweepWidget(QWidget):
             return
 
         config = self.laserAutofocusController.laser_af_properties
-        if self.laserAutofocusController.piezo is None:
+        if self.laserAutofocusController.piezo is None and not LaserAFSweepWidget._suppress_range_warning:
             # Without a piezo this moves the objective itself, and a high-NA objective sits within
             # tens of microns of the coverslip. Make the operator say yes to the actual number.
-            answer = QMessageBox.question(
-                self,
-                "Laser Autofocus",
-                f"There is no piezo, so this sweep will move the Z STAGE by "
-                f"±{config.laser_af_search_range_um:.1f} um from the current position.\n\n"
-                f"Confirm the objective has that much clearance before continuing.",
-                QMessageBox.Yes | QMessageBox.No,
-                QMessageBox.No,
+            box = QMessageBox(self)
+            box.setIcon(QMessageBox.Question)
+            box.setWindowTitle("Laser Autofocus")
+            box.setText(
+                f"The sweep will move the {self._active_z_device_name()} by "
+                f"±{config.laser_af_search_range_um:.1f} um."
             )
-            if answer != QMessageBox.Yes:
+            box.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
+            box.setDefaultButton(QMessageBox.No)
+            dont_show_again = QCheckBox("Do not show this message again this session")
+            box.setCheckBox(dont_show_again)
+            if box.exec_() != QMessageBox.Yes:
                 return
+            # Latched only on a yes. A no means the clearance was wrong, and skipping the warning
+            # on the next attempt is the opposite of what that answer meant.
+            if dont_show_again.isChecked():
+                LaserAFSweepWidget._suppress_range_warning = True
 
         self.clear()
         self.reference_line.setVisible(config.has_reference and config.x_reference is not None)
