@@ -49,6 +49,25 @@ class SweepSample:
     selected_x: Optional[float] = None  # what the configured mode would have picked, if anything
 
 
+@dataclass
+class SpotOverlayResult:
+    """What the detector makes of one frame, in that frame's own pixel coordinates.
+
+    A read-only verdict for display: computing it moves nothing, writes no configuration and
+    changes no state. What makes it worth having separately from the numbers measure_displacement
+    returns is failure_reason -- a measurement that fails reports only that it failed, while this
+    says which of the three ways it failed, which is the part that tells you what to change.
+    """
+
+    candidates: List[Dict[str, Any]] = field(default_factory=list)  # left to right, as detected
+    selected_x: Optional[float] = None  # what the configured mode picks, if it can pick
+    selected_y: Optional[float] = None
+    reference_x: Optional[float] = None  # the reference plane's spot x, when one has been set
+    window_px: Optional[float] = None  # half-width of the accept window around reference_x
+    displacement_um: Optional[float] = None  # signed, relative to the reference; None without one
+    failure_reason: Optional[str] = None  # None when this frame would have produced a measurement
+
+
 class LaserAutofocusController(QObject):
     image_to_display = Signal(np.ndarray)
     signal_displacement_um = Signal(float)
@@ -885,6 +904,63 @@ class LaserAutofocusController(QObject):
             ),
             "max_aspect_ratio": self.laser_af_properties.cc_max_aspect_ratio,
         }
+
+    def classify_frame_spots(self, image: np.ndarray) -> SpotOverlayResult:
+        """Run the detector over one frame and report what it found, without touching anything.
+
+        Coordinates come back in the frame's own pixel space, so the caller must pass the same
+        array it is displaying -- a camera crop and a center-crop are different coordinate frames
+        and nothing in the result says which one it is.
+
+        The three failure modes are the three ways measure_displacement can come back empty, and
+        they call for different fixes: no candidates means the cc_* thresholds or the crop are
+        wrong, an unchoosable set means the spot detection mode does not match what is in frame,
+        and a selection outside the window means AF is looking at the right spot but too far from
+        the reference to accept it.
+        """
+        config = self.laser_af_properties
+        reference_x = config.x_reference if config.has_reference else None
+        window_px = float(config.displacement_success_window_pixels) if reference_x is not None else None
+
+        try:
+            candidates = utils.find_all_spot_locations(
+                image,
+                params=self._spot_detection_params(),
+                filter_sigma=config.filter_sigma,
+            )
+        except ValueError:
+            # An unusable frame -- empty, or not an array. Ordinary here: the stream can hand us
+            # one between a crop change and the first frame in the new geometry.
+            return SpotOverlayResult(reference_x=reference_x, window_px=window_px, failure_reason="no frame")
+
+        result = SpotOverlayResult(candidates=candidates, reference_x=reference_x, window_px=window_px)
+
+        if not candidates:
+            result.failure_reason = "no spot detected"
+            return result
+
+        try:
+            selected = utils.select_spot_by_mode(candidates, config.get_spot_detection_mode())
+        except (ValueError, NotImplementedError) as e:
+            # e.g. SINGLE mode with several candidates. The candidates are still worth drawing --
+            # that the mode cannot choose between them is exactly what the operator needs to see.
+            result.failure_reason = f"{len(candidates)} candidates, mode cannot choose: {e}"
+            return result
+
+        result.selected_x = float(selected["x"])
+        result.selected_y = float(selected["y"])
+
+        if reference_x is not None:
+            offset_px = result.selected_x - reference_x
+            if config.pixel_to_um:
+                result.displacement_um = offset_px * config.pixel_to_um
+            if abs(offset_px) > window_px:
+                result.failure_reason = (
+                    f"spot {abs(offset_px):.0f} px from reference, outside the "
+                    f"{window_px:.0f} px window -- AF would reject this frame"
+                )
+
+        return result
 
     def run_af_sweep(
         self,

@@ -3028,6 +3028,12 @@ class LaserAutofocusSettingWidget(QWidget):
     signal_display_autolevel_changed = Signal(bool)
     signal_start_crop_selection = Signal()
     signal_stop_crop_selection = Signal()
+    signal_live_detection_enabled = Signal(bool)
+    signal_live_detection_rate = Signal(float)
+
+    # Fast enough to follow a focus knob by eye, slow enough to leave the GUI thread alone. Only a
+    # ceiling in any case -- LaserAFSpotOverlay spaces runs by their measured cost as well.
+    LIVE_DETECTION_DEFAULT_RATE_HZ = 5.0
 
     def __init__(self, streamHandler, liveController: LiveController, laserAutofocusController, stretch=True):
         super().__init__()
@@ -3114,11 +3120,45 @@ class LaserAutofocusSettingWidget(QWidget):
         self.display_autolevel_checkbox.setChecked(True)
         display_layout.addWidget(self.display_autolevel_checkbox)
 
+        # Live spot detection. Draws what the detector makes of each frame straight onto the focus
+        # camera image, so a failure can be seen where it happens rather than inferred from a log
+        # line. Off by default: it is diagnostic, and it costs GUI-thread time on every frame it
+        # runs on.
+        detection_layout = QHBoxLayout()
+        self.live_detection_checkbox = QCheckBox("Live spot detection")
+        self.live_detection_checkbox.setToolTip(
+            "Overlay every detected spot, the one the current mode selects, the reference position "
+            "and the displacement window onto the focus camera image.\n"
+            "Reads nothing back into the configuration and moves nothing -- it shows what a "
+            "measurement taken on this frame would have found."
+        )
+        detection_layout.addWidget(self.live_detection_checkbox)
+        detection_layout.addWidget(QLabel("Rate (Hz):"))
+        self.detection_rate_spinbox = QDoubleSpinBox()
+        self.detection_rate_spinbox.setKeyboardTracking(False)
+        self.detection_rate_spinbox.setRange(0.5, 20.0)
+        self.detection_rate_spinbox.setSingleStep(0.5)
+        self.detection_rate_spinbox.setDecimals(1)
+        self.detection_rate_spinbox.setValue(self.LIVE_DETECTION_DEFAULT_RATE_HZ)
+        self.detection_rate_spinbox.setToolTip(
+            "Ceiling on how often the overlay re-runs detection. It is only a ceiling: detection "
+            "is timed and spaced so it never takes more than about a quarter of the GUI thread, "
+            "which matters most on a full-sensor crop."
+        )
+        detection_layout.addWidget(self.detection_rate_spinbox)
+
+        # Speaks up only when a frame would fail. A running commentary on frames that are fine
+        # would train the eye to ignore it.
+        self.live_detection_status_label = QLabel()
+        self.live_detection_status_label.setWordWrap(True)
+
         # Add to live group
         live_layout.addWidget(self.btn_live)
         live_layout.addLayout(exposure_layout)
         live_layout.addLayout(analog_gain_layout)
         live_layout.addLayout(display_layout)
+        live_layout.addLayout(detection_layout)
+        live_layout.addWidget(self.live_detection_status_label)
         live_group.setLayout(live_layout)
 
         # Crop / ROI group. The focus camera streams only this region, so where it sits
@@ -3394,6 +3434,8 @@ class LaserAutofocusSettingWidget(QWidget):
             lambda: self.signal_display_lut_changed.emit(self.display_lut_combo.currentData())
         )
         self.display_autolevel_checkbox.toggled.connect(self.signal_display_autolevel_changed.emit)
+        self.live_detection_checkbox.toggled.connect(self.signal_live_detection_enabled.emit)
+        self.detection_rate_spinbox.valueChanged.connect(self.signal_live_detection_rate.emit)
         self.spinboxes["confirm_step_um"].valueChanged.connect(self._update_confirm_prediction_label)
         self._update_confirm_prediction_label()
         self.initialize_button.clicked.connect(self.apply_and_initialize)
@@ -3435,6 +3477,11 @@ class LaserAutofocusSettingWidget(QWidget):
 
         # Store spinbox reference
         self.spinboxes[property_name] = spinbox
+
+    def show_live_detection_status(self, status: str):
+        """Display why the current frame would fail laser AF, or nothing when it would not."""
+        self.live_detection_status_label.setText(status)
+        self.live_detection_status_label.setStyleSheet("color: #C00000;" if status else "")
 
     def toggle_live(self, pressed):
         if pressed:
@@ -14069,6 +14116,103 @@ class LaserAutofocusControlWidget(QFrame):
                 "Measurement Failed",
                 "Could not measure displacement. Please ensure the reference position is set.",
             )
+
+
+class LaserAFSpotOverlay(QObject):
+    """Paces live spot detection and pushes each verdict onto the focus camera image display.
+
+    The sweep plot shows how reflections behave against z; this shows what the detector makes of
+    the frame in front of you right now, which is the half you need to see *where* laser AF is
+    failing rather than only that it did.
+
+    It deliberately owns no detection logic of its own -- LaserAutofocusController.
+    classify_frame_spots decides everything, so the overlay cannot drift out of agreement with
+    what a real measurement would have done. What lives here is pacing, because this runs on the
+    GUI thread: every frame that arrives is a chance to do work, and doing it on all of them
+    would compete with the redraw those same frames trigger.
+    """
+
+    signal_status = Signal(str)  # failure reason for the current frame, or "" when it would pass
+
+    # Ceiling on the share of the thread detection may use. The crop is normally 1536x256 and
+    # detection costs a few ms, but Reset to Full Sensor makes the same call an order of
+    # magnitude more expensive -- and that is precisely when someone is diagnosing and wants the
+    # view to stay responsive. Measuring each run and spacing the next one accordingly adapts to
+    # the crop actually in use instead of guessing a safe fixed rate for the worst case.
+    _DUTY_CYCLE = 0.25
+
+    # Backoff after classify_frame_spots raises. Long enough that a persistent failure cannot
+    # spin, short enough that a transient one recovers without a toggle.
+    _ERROR_BACKOFF_S = 2.0
+
+    def __init__(self, laserAutofocusController, imageDisplayWindow, rate_hz: float = 5.0, parent=None):
+        super().__init__(parent)
+        self._log = squid.logging.get_logger(self.__class__.__name__)
+        self.laserAutofocusController = laserAutofocusController
+        self.imageDisplayWindow = imageDisplayWindow
+        self._enabled = False
+        self._rate_hz = max(float(rate_hz), 0.1)
+        self._next_allowed_s = 0.0
+        self._last_status = None
+
+    def _now(self) -> float:
+        """One monotonic, high-resolution clock for both pacing and timing.
+
+        perf_counter rather than monotonic: on Windows monotonic can be far coarser than the few
+        milliseconds a detection takes, which would make every run measure as zero and defeat the
+        duty-cycle spacing entirely.
+        """
+        return time.perf_counter()
+
+    def set_enabled(self, enabled: bool):
+        self._enabled = bool(enabled)
+        if self._enabled:
+            self._next_allowed_s = 0.0  # act on the next frame rather than waiting out a stale gap
+        else:
+            self.imageDisplayWindow.clear_spot_overlay()
+            self._emit_status("")
+
+    def set_rate_hz(self, rate_hz: float):
+        self._rate_hz = max(float(rate_hz), 0.1)
+
+    def on_frame(self, image):
+        """Slot for every signal that feeds the focus camera display.
+
+        Frames arriving inside the throttle interval are dropped rather than queued: the overlay
+        is a view of the present, so the useful frame is always the newest one.
+        """
+        if not self._enabled or image is None:
+            return
+
+        started_s = self._now()
+        if started_s < self._next_allowed_s:
+            return
+
+        try:
+            result = self.laserAutofocusController.classify_frame_spots(image)
+        except Exception:
+            self._log.exception("Live spot detection failed; backing off.")
+            self._next_allowed_s = self._now() + self._ERROR_BACKOFF_S
+            self._emit_status("live spot detection failed - see the log")
+            return
+
+        elapsed_s = self._now() - started_s
+        self._next_allowed_s = self._now() + max(1.0 / self._rate_hz, elapsed_s / self._DUTY_CYCLE)
+
+        self.imageDisplayWindow.set_spot_overlay(
+            candidates=[(c["x"], c["y"]) for c in result.candidates],
+            selected=(result.selected_x, result.selected_y) if result.selected_x is not None else None,
+            reference_x=result.reference_x,
+            window_px=result.window_px,
+            failed=result.failure_reason is not None,
+        )
+        self._emit_status(result.failure_reason or "")
+
+    def _emit_status(self, status: str):
+        # Only on change: at several hertz an unchanged string would repaint the label for nothing.
+        if status != self._last_status:
+            self._last_status = status
+            self.signal_status.emit(status)
 
 
 class LaserAFSweepWidget(QWidget):

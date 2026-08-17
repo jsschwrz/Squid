@@ -1060,6 +1060,13 @@ class HighContentScreeningGui(QMainWindow):
                 multipointController=self.multipointController,
             )
             self.imageDisplayWindow_focus = core.ImageDisplayWindow(liveController=self.liveController)
+            # Built here rather than in __init__ because the line above replaces the display window
+            # made there, and the overlay has to draw on the one that is actually shown.
+            self.laserAFSpotOverlay = widgets.LaserAFSpotOverlay(
+                self.laserAutofocusController,
+                self.imageDisplayWindow_focus,
+                rate_hz=self.laserAutofocusSettingWidget.detection_rate_spinbox.value(),
+            )
 
         if RUN_FLUIDICS:
             self.fluidicsWidget = widgets.FluidicsWidget(self.fluidics)
@@ -1758,6 +1765,16 @@ class HighContentScreeningGui(QMainWindow):
             )
             self.streamHandler_focus_camera.image_to_display.connect(self.imageDisplayWindow_focus.display_image)
 
+            # Live spot detection overlay. Fed from both frame sources, and connected after the
+            # display_image slots above so the frame is on screen before the markers move onto it.
+            # The controller source is the valuable one: those are the frames a real measurement
+            # ran on, including one per FOV of an acquisition, so a failure is visible where and
+            # when it happened rather than only in the log.
+            self.laserAutofocusSettingWidget.signal_live_detection_enabled.connect(self.laserAFSpotOverlay.set_enabled)
+            self.laserAutofocusSettingWidget.signal_live_detection_rate.connect(self.laserAFSpotOverlay.set_rate_hz)
+            self.laserAFSpotOverlay.signal_status.connect(self.laserAutofocusSettingWidget.show_live_detection_status)
+            self.streamHandler_focus_camera.image_to_display.connect(self.laserAFSpotOverlay.on_frame)
+
             self.streamHandler_focus_camera.image_to_display.connect(
                 self.displacementMeasurementController.update_measurement
             )
@@ -1766,6 +1783,7 @@ class HighContentScreeningGui(QMainWindow):
                 self.displacementMeasurementWidget.display_readings
             )
             self.laserAutofocusController.image_to_display.connect(self.imageDisplayWindow_focus.display_image)
+            self.laserAutofocusController.image_to_display.connect(self.laserAFSpotOverlay.on_frame)
 
             # Add connection for piezo position updates
             if self.piezoWidget:
@@ -2694,6 +2712,10 @@ class HighContentScreeningGui(QMainWindow):
 
             if not is_laser_focus_tab:
                 self.laserAutofocusSettingWidget.stop_live()
+                # Leave the checkbox alone -- coming back to the tab should restore what the
+                # operator chose -- but drop the markers, which would otherwise be left sitting
+                # over whatever frame the display last held.
+                self.imageDisplayWindow_focus.clear_spot_overlay()
 
         # Only show well selector in Live View tab if it was previously shown
         if self.imageDisplayTabs.tabText(index) == "Live View":

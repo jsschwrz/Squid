@@ -890,6 +890,13 @@ class ImageDisplayWindow(QMainWindow):
         self.crosshair_h = None  # horizontal line, positioned at image center y
         self._crosshair_shape = None  # (h, w) the lines are currently centered on
 
+        # Laser AF spot overlay state, created lazily by _ensure_spot_overlay_items on the first
+        # set_spot_overlay call. Only the focus camera view ever draws these.
+        self.spot_candidates_item = None  # every spot the detector found in frame
+        self.spot_selected_item = None  # the one the configured spot detection mode picked
+        self.spot_reference_line = None  # x_reference, i.e. the focus plane
+        self.spot_window_region = None  # the displacement window AF will accept a spot within
+
         # Create main layout
         layout = QVBoxLayout()
         layout.setContentsMargins(0, 0, 0, 0)
@@ -1519,33 +1526,118 @@ class ImageDisplayWindow(QMainWindow):
             self.update_line_profile()
 
     def mark_spot(self, image: np.ndarray, x: float, y: float):
-        """Mark the detected laserspot location on the image.
+        """Show `image` and mark one detected spot on it.
 
-        Args:
-            image: Image to mark
-            x: x-coordinate of the spot
-            y: y-coordinate of the spot
-
-        Returns:
-            Image with marked spot
+        The marker is a graphics item over the image rather than pixels drawn into it. Painting
+        it in would mean converting to 3-channel BGR, which silently defeats both the false-color
+        LUT and auto-level -- and it would survive only until the next live frame overwrote it.
         """
-        # Draw a green crosshair at the specified x,y coordinates
-        crosshair_size = 10  # Size of crosshair lines in pixels
-        crosshair_color = (0, 255, 0)  # Green in BGR format
-        crosshair_thickness = 1
-        x = int(round(x))
-        y = int(round(y))
+        self.display_image(image)
+        self.set_spot_overlay(selected=(x, y))
 
-        # Convert grayscale to BGR
-        marked_image = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
+    # Overlay colors are deliberately the ones LaserAFSweepWidget plots with, so a candidate has
+    # the same color on the image as it does on the sweep plot.
+    _SPOT_CANDIDATE_BRUSH = (150, 150, 150, 180)
+    _SPOT_SELECTED_BRUSH = (0, 140, 255, 220)
+    _SPOT_FAILED_BRUSH = (255, 60, 60, 230)
 
-        # Draw horizontal line
-        cv2.line(marked_image, (x - crosshair_size, y), (x + crosshair_size, y), crosshair_color, crosshair_thickness)
+    def _ensure_spot_overlay_items(self):
+        """Create the spot overlay items on first use. Idempotent.
 
-        # Draw vertical line
-        cv2.line(marked_image, (x, y - crosshair_size), (x, y + crosshair_size), crosshair_color, crosshair_thickness)
+        Built lazily for the same reason as the crosshair: a window that never shows an overlay
+        pays nothing for it.
+        """
+        if self.spot_candidates_item is not None:
+            return
 
-        self.display_image(marked_image)
+        self.spot_candidates_item = pg.ScatterPlotItem(
+            size=14, pen=pg.mkPen(self._SPOT_CANDIDATE_BRUSH, width=1), brush=None, symbol="o"
+        )
+        self.spot_selected_item = pg.ScatterPlotItem(
+            size=18, pen=pg.mkPen(self._SPOT_SELECTED_BRUSH, width=2), brush=None, symbol="+"
+        )
+        self.spot_reference_line = pg.InfiniteLine(angle=90, movable=False, pen=pg.mkPen("g", style=Qt.DashLine))
+        self.spot_window_region = pg.LinearRegionItem(orientation="vertical", movable=False)
+        self.spot_window_region.setBrush(pg.mkBrush(0, 200, 0, 30))
+        self.spot_window_region.setZValue(15)  # under the markers, over the image
+
+        view = self._active_view()
+        for item in (
+            self.spot_window_region,
+            self.spot_reference_line,
+            self.spot_candidates_item,
+            self.spot_selected_item,
+        ):
+            if item.zValue() == 0:
+                item.setZValue(21)  # above the crosshair (20) and the ROI (10)
+            # A ScatterPlotItem accepts a left-click that lands on one of its points, which would
+            # swallow it before the view saw it -- and clicks on this view start a stage move, a
+            # line-profiler line, or a crop drag. Taking no buttons at all keeps the overlay
+            # purely something to look at.
+            item.setAcceptedMouseButtons(Qt.NoButton)
+            item.setAcceptHoverEvents(False)
+            item.hide()
+            # ignoreBounds so turning the overlay on never changes the current zoom.
+            view.addItem(item, ignoreBounds=True)
+
+    def set_spot_overlay(self, candidates=None, selected=None, reference_x=None, window_px=None, failed=False):
+        """Draw what the laser AF detector made of the frame currently on display.
+
+        Coordinates are pixels of the displayed frame. The ImageItem sits at the origin with no
+        transform, so those are view coordinates directly -- the same assumption
+        start_roi_selection relies on. The caller must therefore pass results measured on the
+        frame it displayed, not on some other crop of the sensor.
+
+        candidates: sequence of (x, y) for every spot in frame; selected: the (x, y) the
+        configured mode picked, or None; reference_x / window_px: the accept window, omitted when
+        no reference has been set; failed: draw the selection in the failure color.
+        """
+        self._ensure_spot_overlay_items()
+
+        candidates = list(candidates or [])
+        if candidates:
+            self.spot_candidates_item.setData([float(c[0]) for c in candidates], [float(c[1]) for c in candidates])
+            self.spot_candidates_item.show()
+        else:
+            self.spot_candidates_item.setData([], [])
+            self.spot_candidates_item.hide()
+
+        if selected is not None:
+            color = self._SPOT_FAILED_BRUSH if failed else self._SPOT_SELECTED_BRUSH
+            self.spot_selected_item.setPen(pg.mkPen(color, width=2))
+            self.spot_selected_item.setData([float(selected[0])], [float(selected[1])])
+            self.spot_selected_item.show()
+        else:
+            self.spot_selected_item.setData([], [])
+            self.spot_selected_item.hide()
+
+        if reference_x is not None:
+            self.spot_reference_line.setPos(float(reference_x))
+            self.spot_reference_line.show()
+            if window_px is not None:
+                self.spot_window_region.setRegion(
+                    (float(reference_x) - float(window_px), float(reference_x) + float(window_px))
+                )
+                self.spot_window_region.show()
+            else:
+                self.spot_window_region.hide()
+        else:
+            self.spot_reference_line.hide()
+            self.spot_window_region.hide()
+
+    def clear_spot_overlay(self):
+        """Hide every overlay item. Safe before any overlay has been drawn."""
+        if self.spot_candidates_item is None:
+            return
+        self.spot_candidates_item.setData([], [])
+        self.spot_selected_item.setData([], [])
+        for item in (
+            self.spot_candidates_item,
+            self.spot_selected_item,
+            self.spot_reference_line,
+            self.spot_window_region,
+        ):
+            item.hide()
 
     def update_contrast_limits(self):
         if self.show_LUT and self.contrastManager and self.contrastManager.acquisition_dtype:
