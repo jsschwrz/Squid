@@ -1000,8 +1000,12 @@ class ImageDisplayWindow(QMainWindow):
         self.roi_size = (500, 500)
         self.ROI = pg.ROI(self.roi_pos, self.roi_size, scaleSnap=True, translateSnap=True)
         self.ROI.setZValue(10)
-        self.ROI.addScaleHandle((0, 0), (1, 1))
-        self.ROI.addScaleHandle((1, 1), (0, 0))
+        # Handles on the lower-left / upper-right diagonal, because that is the diagonal the laser
+        # AF spot travels along as focus changes: framing the crop means dragging the two corners
+        # the spot runs between, and handles on the other diagonal have to be fought across it.
+        # The view is y-inverted, so ROI-local y=0 is the top edge.
+        self.ROI.addScaleHandle((0, 1), (1, 0))  # lower-left, scaling about the upper-right
+        self.ROI.addScaleHandle((1, 0), (0, 1))  # upper-right, scaling about the lower-left
         self.graphics_widget.view.addItem(self.ROI)
         self.ROI.hide()
         self.ROI.sigRegionChanged.connect(self.update_ROI)
@@ -1657,6 +1661,12 @@ class ImageDisplayWindow(QMainWindow):
     def hide_ROI_selector(self):
         self.ROI.hide()
 
+    # Starting size of the drag-a-box selector, in pixels of the displayed frame. A fixed size
+    # rather than a fraction of the frame: as a fraction it opened at half the sensor after Reset
+    # to Full Sensor, which is nowhere near any crop worth applying, so every use began by
+    # dragging it far smaller. Clamped to the frame below, so it still behaves on a small crop.
+    DEFAULT_ROI_SELECTION_SIZE = 1000
+
     def start_roi_selection(self, x=None, y=None, width=None, height=None):
         """Show the ROI selector, confined to the displayed image.
 
@@ -1665,8 +1675,8 @@ class ImageDisplayWindow(QMainWindow):
         show_ROI_selector() on a narrow frame gets an invisible box. This places it somewhere
         usable and stops it leaving the image.
 
-        x/y/width/height are in pixels of the displayed frame; omitted values default to the
-        middle half of the image.
+        x/y/width/height are in pixels of the displayed frame; omitted values default to a
+        DEFAULT_ROI_SELECTION_SIZE box in the middle of the image.
         """
         image = self.graphics_widget.img.image
         if image is None:
@@ -1675,9 +1685,9 @@ class ImageDisplayWindow(QMainWindow):
 
         image_height, image_width = image.shape[:2]
         if width is None:
-            width = image_width // 2
+            width = self.DEFAULT_ROI_SELECTION_SIZE
         if height is None:
-            height = image_height // 2
+            height = self.DEFAULT_ROI_SELECTION_SIZE
         width = int(max(1, min(width, image_width)))
         height = int(max(1, min(height, image_height)))
         if x is None:
