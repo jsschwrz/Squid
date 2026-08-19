@@ -332,7 +332,6 @@ def select_spot_by_mode(sorted_spots: List[dict], mode: SpotDetectionMode) -> di
 
     Raises:
         ValueError: for SINGLE with more than one candidate, or an unknown mode.
-        NotImplementedError: for MULTI_SECOND_RIGHT.
     """
     if mode == SpotDetectionMode.SINGLE:
         if len(sorted_spots) > 1:
@@ -342,10 +341,6 @@ def select_spot_by_mode(sorted_spots: List[dict], mode: SpotDetectionMode) -> di
         return sorted_spots[0]  # Leftmost
     elif mode == SpotDetectionMode.DUAL_RIGHT:
         return sorted_spots[-1]  # Rightmost
-    elif mode == SpotDetectionMode.MULTI_RIGHT:
-        return sorted_spots[-1]  # Rightmost
-    elif mode == SpotDetectionMode.MULTI_SECOND_RIGHT:
-        raise NotImplementedError("MULTI_SECOND_RIGHT is not supported")
     else:
         raise ValueError(f"Unknown spot detection mode: {mode}")
 

@@ -1717,7 +1717,6 @@ class HighContentScreeningGui(QMainWindow):
             self.laserAutofocusSettingWidget.signal_apply_settings.connect(
                 self.laserAutofocusControlWidget.update_init_state
             )
-            self.laserAutofocusSettingWidget.signal_laser_spot_location.connect(self.imageDisplayWindow_focus.mark_spot)
             # Display-only, and scoped to the focus camera view: the main image display keeps its
             # own contrast handling.
             self.laserAutofocusSettingWidget.signal_display_lut_changed.connect(
@@ -1729,8 +1728,7 @@ class HighContentScreeningGui(QMainWindow):
             self.imageDisplayWindow_focus.set_autolevel(
                 self.laserAutofocusSettingWidget.display_autolevel_checkbox.isChecked()
             )
-            # The button lives with the settings it exercises; the plot lives where there is room.
-            self.laserAutofocusSettingWidget.signal_run_af_sweep.connect(self.laserAFSweepWidget.start_sweep)
+            # The sweep is driven from its own dock, which is where the plot it produces lives.
             self.laserAutofocusController.signal_af_sweep_sample.connect(self.laserAFSweepWidget.on_sweep_sample)
             self.laserAutofocusController.signal_af_sweep_finished.connect(self.laserAFSweepWidget.on_sweep_finished)
             # Marks current z on the sweep plot while focusing by hand. movement_updater already
@@ -1773,6 +1771,10 @@ class HighContentScreeningGui(QMainWindow):
             self.laserAutofocusSettingWidget.signal_live_detection_enabled.connect(self.laserAFSpotOverlay.set_enabled)
             self.laserAutofocusSettingWidget.signal_live_detection_rate.connect(self.laserAFSpotOverlay.set_rate_hz)
             self.laserAFSpotOverlay.signal_status.connect(self.laserAutofocusSettingWidget.show_live_detection_status)
+            self.laserAFSpotOverlay.signal_spot_detected.connect(self.laserAutofocusSettingWidget.on_live_spot_detected)
+            # The checkbox defaults to on, and the overlay defaults to off, so seed it the way
+            # the autolevel checkbox above is seeded.
+            self.laserAFSpotOverlay.set_enabled(self.laserAutofocusSettingWidget.live_detection_checkbox.isChecked())
             self.streamHandler_focus_camera.image_to_display.connect(self.laserAFSpotOverlay.on_frame)
 
             self.streamHandler_focus_camera.image_to_display.connect(

@@ -383,20 +383,21 @@ class CMD_EXECUTION_STATUS:
 
 
 class SpotDetectionMode(Enum):
-    """Specifies which spot to detect when multiple spots are present.
+    """Which candidate to select when the detector finds more than one spot.
 
-    SINGLE: Expect and detect single spot
-    DUAL_RIGHT: In dual-spot case, use rightmost spot
-    DUAL_LEFT: In dual-spot case, use leftmost spot
-    MULTI_RIGHT: In multi-spot case, use rightmost spot
-    MULTI_SECOND_RIGHT: In multi-spot case, use spot immediately left of rightmost spot
+    Selection is purely positional; none of these rejects a candidate on merit.
+
+    SINGLE: expect exactly one spot, and fail if more than one is found
+    DUAL_LEFT: use the leftmost spot
+    DUAL_RIGHT: use the rightmost spot
+
+    multi_right and multi_second_right were retired; configs naming them are rewritten by
+    LaserAFConfig._migrate_retired_spot_detection_modes.
     """
 
     SINGLE = "single"
     DUAL_RIGHT = "dual_right"
     DUAL_LEFT = "dual_left"
-    MULTI_RIGHT = "multi_right"
-    MULTI_SECOND_RIGHT = "multi_second_right"
 
 
 class LaserAFConfirmMotionMode(Enum):

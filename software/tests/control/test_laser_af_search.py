@@ -26,12 +26,14 @@ from control.models import LaserAFConfig
 from tests.control.test_laser_af_crop import SENSOR_HEIGHT, SENSOR_WIDTH, _make_controller
 from tests.control.test_utils import create_test_image
 
-REAL_CONFIG_DIR = os.path.join(
+# Every profile on the machine, not one hard-coded name. This pointed at a "Test" profile that
+# has never existed on disk, so the glob returned [] and the regression gate below collected zero
+# cases and passed vacuously. test_there_are_real_configs_to_check keeps that from recurring.
+REAL_CONFIG_ROOT = os.path.join(
     os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
     "user_profiles",
-    "Test",
-    "laser_af_configs",
 )
+REAL_CONFIG_PATHS = sorted(glob.glob(os.path.join(REAL_CONFIG_ROOT, "*", "laser_af_configs", "*.yaml")))
 
 
 def _legacy_search_positions(current_z_um, range_um, step_um, down_first=True):
@@ -66,7 +68,11 @@ def _controller_for_search(config, z_um=1000.0, piezo=None):
 class TestBackCompat:
     """The regression gate: existing objectives must search exactly as they did before."""
 
-    @pytest.mark.parametrize("path", sorted(glob.glob(os.path.join(REAL_CONFIG_DIR, "*.yaml"))))
+    def test_there_are_real_configs_to_check(self):
+        """The gate below is parametrized over a glob; an empty glob would pass silently."""
+        assert REAL_CONFIG_PATHS, f"no laser AF configs found under {REAL_CONFIG_ROOT}"
+
+    @pytest.mark.parametrize("path", REAL_CONFIG_PATHS)
     def test_real_configs_load_and_back_fill_only_what_is_missing(self, path):
         """Every config on the machine loads, and only pre-split ones inherit the old span.
 

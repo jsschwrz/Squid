@@ -38,6 +38,13 @@ _LEGACY_LINE_PROFILE_FIELDS = frozenset(
 
 _migration_warned: set = set()
 
+# Spot detection modes that used to be selectable and are now gone, mapped to the surviving
+# member with the closest behaviour. See _migrate_retired_spot_detection_modes.
+_RETIRED_SPOT_DETECTION_MODES = {
+    "multi_right": "dual_right",
+    "multi_second_right": "dual_right",
+}
+
 
 class LaserAFConfig(BaseModel):
     """
@@ -336,6 +343,45 @@ class LaserAFConfig(BaseModel):
                 "_def and this objective should be re-tuned. Re-save the config to remove "
                 "this warning.",
                 ", ".join(sorted(present)),
+            )
+        return data
+
+    @model_validator(mode="before")
+    @classmethod
+    def _migrate_retired_spot_detection_modes(cls, data: Any) -> Any:
+        """Rewrite spot_detection_mode values that no longer exist in the enum.
+
+        Both retired members selected a spot positionally, like the members that remain:
+
+        - ``multi_right`` was byte-identical to ``dual_right`` -- both returned the rightmost
+          candidate -- so this mapping is behaviour-preserving.
+        - ``multi_second_right`` never had an implementation; select_spot_by_mode raised
+          NotImplementedError for it, so any objective carrying it could not focus at all.
+          ``dual_right`` is the nearest working behaviour, and it is logged because it is a
+          real change rather than a rename.
+
+        Without this, an unrecognised value would raise ValidationError, and
+        ``ConfigRepository._load_yaml`` swallows that and returns None -- so the objective would
+        come up with no laser AF config, silently losing its calibration and reference image.
+        """
+        if not isinstance(data, dict):
+            return data
+
+        mode = data.get("spot_detection_mode")
+        if mode not in _RETIRED_SPOT_DETECTION_MODES:
+            return data
+
+        replacement = _RETIRED_SPOT_DETECTION_MODES[mode]
+        data = dict(data)
+        data["spot_detection_mode"] = replacement
+
+        if mode not in _migration_warned:
+            _migration_warned.add(mode)
+            _log.warning(
+                "Laser AF spot_detection_mode %r has been retired; using %r instead. "
+                "Re-save the config to remove this warning.",
+                mode,
+                replacement,
             )
         return data
 

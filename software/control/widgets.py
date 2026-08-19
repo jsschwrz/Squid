@@ -3022,13 +3022,22 @@ _CROP_WIDTH_ADVISORY_FACTOR = 4.0
 _CALIBRATION_DISPLACEMENT_ADVISORY_PX = 10.0
 
 
+# What each spot detection mode is called on screen. The stored values stay "single" /
+# "dual_left" / "dual_right" so existing per-objective YAML keeps loading; only the wording
+# changes. "dual_" is a historical prefix -- the modes are positional and work with any number
+# of candidates, which the old names implied they did not.
+_SPOT_MODE_LABELS = {
+    SpotDetectionMode.DUAL_LEFT: "Leftmost spot",
+    SpotDetectionMode.DUAL_RIGHT: "Rightmost spot",
+    SpotDetectionMode.SINGLE: "Exactly one spot (fail if more)",
+}
+
+
 class LaserAutofocusSettingWidget(QWidget):
 
     signal_newExposureTime = Signal(float)
     signal_newAnalogGain = Signal(float)
     signal_apply_settings = Signal()
-    signal_laser_spot_location = Signal(np.ndarray, float, float)
-    signal_run_af_sweep = Signal()
     signal_display_lut_changed = Signal(object)  # colormap name, or None for grayscale
     signal_display_autolevel_changed = Signal(bool)
     signal_start_crop_selection = Signal()
@@ -3039,6 +3048,11 @@ class LaserAutofocusSettingWidget(QWidget):
     # Fast enough to follow a focus knob by eye, slow enough to leave the GUI thread alone. Only a
     # ceiling in any case -- LaserAFSpotOverlay spaces runs by their measured cost as well.
     LIVE_DETECTION_DEFAULT_RATE_HZ = 5.0
+
+    # How often the crop status label may be rebuilt from live detections. The label is several
+    # lines of computed advice; at the overlay's rate it would be redrawn far faster than anyone
+    # reads it, and the numbers on it move slowly.
+    _CROP_STATUS_REFRESH_INTERVAL_S = 0.5
 
     def __init__(self, streamHandler, liveController: LiveController, laserAutofocusController, stretch=True):
         super().__init__()
@@ -3063,9 +3077,14 @@ class LaserAutofocusSettingWidget(QWidget):
         # camera ROI those coordinates were measured in, so a later crop change cannot cause
         # them to be reinterpreted against the wrong frame.
         self._last_spot_detection = None
+        self._next_crop_status_refresh_s = 0.0
         self.init_ui()
-        self.update_calibration_label()
-        self._update_crop_status()
+        # Seed every control from the stored config, not just the ones _add_spinbox filled in.
+        # The confirm-mode combo and the iterative-correction checkbox are only read back in
+        # update_values(), which is otherwise wired to profile/objective *changes* -- so without
+        # this they showed a hard-coded default at launch, and the first Initialize or Apply
+        # wrote that default back over the objective's saved value.
+        self.update_values()
 
     def init_ui(self):
         layout = QVBoxLayout()
@@ -3131,6 +3150,7 @@ class LaserAutofocusSettingWidget(QWidget):
         # runs on.
         detection_layout = QHBoxLayout()
         self.live_detection_checkbox = QCheckBox("Live spot detection")
+        self.live_detection_checkbox.setChecked(True)
         self.live_detection_checkbox.setToolTip(
             "Overlay every detected spot, the one the current mode selects, the reference position "
             "and the displacement window onto the focus camera image.\n"
@@ -3212,43 +3232,47 @@ class LaserAutofocusSettingWidget(QWidget):
         crop_layout.addWidget(self.crop_status_label)
         crop_group.setLayout(crop_layout)
 
-        # Non-threshold property group
-        non_threshold_group = QFrame()
-        non_threshold_group.setFrameStyle(QFrame.Panel | QFrame.Raised)
-        non_threshold_layout = QVBoxLayout()
-
-        # Add non-threshold property spinboxes
-        self._add_spinbox(non_threshold_layout, "Spot Crop Size (pixels):", "spot_crop_size", 1, 500, 0)
-        self._add_spinbox(
-            non_threshold_layout,
-            "Calibration Distance (μm):",
-            "pixel_to_um_calibration_distance",
-            0.1,
-            control._def.PIXEL_TO_UM_CALIBRATION_DISTANCE_MAX,
-            2,
-        )
-        self.spinboxes["pixel_to_um_calibration_distance"].setToolTip(
-            "The z move Initialize makes to calibrate um-per-pixel. It must be large enough to shift "
-            "the spot by a readable number of pixels, which depends entirely on the objective: a few "
-            "microns suffice at 20x, while a 4x needs hundreds. The line below says what the current "
-            "value predicts."
-        )
-        # The number that decides whether calibration can work at all, and it is not derivable by
-        # eye: the same distance moves the spot 250 px on one objective and half a pixel on another.
-        self.calibration_distance_label = QLabel()
-        self.calibration_distance_label.setWordWrap(True)
-        non_threshold_layout.addWidget(self.calibration_distance_label)
-        non_threshold_group.setLayout(non_threshold_layout)
-
         # Settings group
         settings_group = QFrame()
         settings_group.setFrameStyle(QFrame.Panel | QFrame.Raised)
         settings_layout = QVBoxLayout()
+        # What the detector is looking for. These take effect through Apply without
+        # Re-initialization, so they can be tuned against the live overlay without
+        # discarding the calibration and reference being tuned against.
+
+        # Add connected component spot detection related spinboxes
+        self._add_spinbox(settings_layout, "CC Threshold:", "cc_threshold", 0, 255, 0)
+        self._add_spinbox(settings_layout, "CC Min Area (pixels):", "cc_min_area", 1, 1000, 0)
+        self._add_spinbox(settings_layout, "CC Max Area (pixels):", "cc_max_area", 100, 50000, 0)
+        self._add_spinbox(settings_layout, "CC Row Tolerance (pixels):", "cc_row_tolerance", 1, 200, 0)
+        self._add_spinbox(settings_layout, "CC Max Aspect Ratio:", "cc_max_aspect_ratio", 1.0, 10.0, 1, 0.5)
+        self._add_spinbox(settings_layout, "Filter Sigma:", "filter_sigma", 0, 100, 1, allow_none=True)
+
+        # Spot detection mode combo box
+        spot_mode_layout = QHBoxLayout()
+        spot_mode_layout.addWidget(QLabel("Spot Detection Mode:"))
+        self.spot_mode_combo = QComboBox()
+        for mode in SpotDetectionMode:
+            self.spot_mode_combo.addItem(_SPOT_MODE_LABELS[mode], mode)
+        current_index = self.spot_mode_combo.findData(
+            self.laserAutofocusController.laser_af_properties.spot_detection_mode
+        )
+        self.spot_mode_combo.setCurrentIndex(current_index)
+        self.spot_mode_combo.setToolTip(
+            "Which candidate to use when more than one reflection is in frame.\n"
+            "Selection is positional only -- it cannot tell a sample reflection from a spurious "
+            "one, so use the crop and Test AF Sweep to decide which is which."
+        )
+        spot_mode_layout.addWidget(self.spot_mode_combo)
+        settings_layout.addLayout(spot_mode_layout)
+
+
 
         # Add threshold property spinboxes
-        self._add_spinbox(settings_layout, "Laser AF Averaging N:", "laser_af_averaging_n", 1, 100, 0)
-        self._add_spinbox(
-            settings_layout, "Displacement Success Window (pixels):", "displacement_success_window_pixels", 1, 1000, 0
+        self._add_spinbox(settings_layout, "Spot Crop Size (pixels):", "spot_crop_size", 1, 500, 0)
+        self.spinboxes["spot_crop_size"].setToolTip(
+            "Side of the square template cropped around the reference spot and compared against "
+            "the live frame by the correlation check."
         )
         # Capped below 1.0 on purpose: the check is `correlation >= threshold`, and a live frame
         # never correlates to exactly 1.0 against a stored template, so 1.0 rejects everything.
@@ -3266,10 +3290,24 @@ class LaserAutofocusSettingWidget(QWidget):
             "accepted. Real matches typically land between 0.75 and 0.99; set this below the worst "
             "correlation you see in the log for a good lock, or every move will be rejected."
         )
-        self._add_spinbox(settings_layout, "Laser AF Range (μm):", "laser_af_range", 1, 1000, 1)
+        self._add_spinbox(settings_layout, "Max Accepted Displacement (μm):", "laser_af_range", 1, 1000, 1)
         self.spinboxes["laser_af_range"].setToolTip(
-            "Ceiling on an accepted displacement. A measurement larger than this is treated as "
-            "implausible and refused. This no longer bounds the z search -- see Z Search Range."
+            "Ceiling on an accepted measurement. A displacement larger than this is treated as "
+            "implausible and the move is refused. It bounds no search and moves nothing -- how far "
+            "z is searched for a lost spot is Z Search Range, below."
+        )
+        self._add_spinbox(
+            settings_layout, "Displacement Success Window (pixels):", "displacement_success_window_pixels", 1, 1000, 0
+        )
+        # In pixels because that is what the detector measures, but nobody reasons about focus in
+        # pixels -- so say what it is worth in microns at the current calibration.
+        self.success_window_label = QLabel()
+        self.success_window_label.setWordWrap(True)
+        settings_layout.addWidget(self.success_window_label)
+        self._add_spinbox(settings_layout, "Laser AF Averaging N:", "laser_af_averaging_n", 1, 100, 0)
+        self.spinboxes["laser_af_averaging_n"].setToolTip(
+            "Frames averaged per measurement. They are taken at one z, so this averages sensor "
+            "noise only -- it cannot distinguish one reflection from another."
         )
 
         # The z spot-search, which runs when detection fails at the current z.
@@ -3281,26 +3319,21 @@ class LaserAutofocusSettingWidget(QWidget):
             "whether it can."
         )
         self.spinboxes["laser_af_search_step_um"].setToolTip(
-            "Z increment of the search. Also scales the window within which a candidate's "
-            "displacement is accepted, so a finer step is both slower and stricter."
+            "Z increment of the search. A finer step visits more z positions, so the search "
+            "takes longer but is less likely to step over the spot entirely."
         )
-        self.run_sweep_button = QPushButton("Test AF Sweep")
-        self.run_sweep_button.setToolTip(
-            "Step z across the search range and plot every reflection in frame against z.\n"
-            "The sample reflection traces a sloped line; a static back-reflection traces a flat one.\n"
-            "Reads nothing back into the configuration."
-        )
-        settings_layout.addWidget(self.run_sweep_button)
-
         self.update_threshold_button = QPushButton("Apply without Re-initialization")
         settings_layout.addWidget(self.update_threshold_button)
         settings_group.setLayout(settings_layout)
 
-        # Motion confirm group. Off by default: this is the only check that costs an extra z move,
-        # and on the first-try path it is paid at every FOV of an acquisition.
-        confirm_group = QFrame()
-        confirm_group.setFrameStyle(QFrame.Panel | QFrame.Raised)
-        confirm_layout = QVBoxLayout()
+        # Advanced. Everything here is off in every shipped objective profile and costs an extra
+        # measurement or z move at each FOV when switched on, so it is collapsed by default: it is
+        # for diagnosis, not for the normal path. Test AF Sweep and the live overlay answer the
+        # same "is this the right reflection" question without paying anything per FOV.
+        advanced_group = QGroupBox("Advanced")
+        advanced_group.setCheckable(True)
+        advanced_group.setChecked(False)
+        advanced_layout = QVBoxLayout()
         confirm_mode_layout = QHBoxLayout()
         confirm_mode_layout.addWidget(QLabel("Confirm Spot Moves With Z:"))
         self.confirm_mode_combo = QComboBox()
@@ -3313,14 +3346,14 @@ class LaserAutofocusSettingWidget(QWidget):
             "always: also check every first-try detection, which costs an extra z step at every FOV."
         )
         confirm_mode_layout.addWidget(self.confirm_mode_combo)
-        confirm_layout.addLayout(confirm_mode_layout)
-        self._add_spinbox(confirm_layout, "Confirm Step (μm):", "confirm_step_um", 0.1, 50, 2, step=0.5)
-        self._add_spinbox(confirm_layout, "Confirm Tolerance (pixels):", "confirm_tolerance_px", 0.5, 200, 1, step=1)
+        advanced_layout.addLayout(confirm_mode_layout)
+        self._add_spinbox(advanced_layout, "Confirm Step (μm):", "confirm_step_um", 0.1, 50, 2, step=0.5)
+        self._add_spinbox(advanced_layout, "Confirm Tolerance (pixels):", "confirm_tolerance_px", 0.5, 200, 1, step=1)
         # A confirm step is only meaningful if it predicts measurable motion, and what counts as
         # measurable differs by an order of magnitude between objectives. Show the number.
         self.confirm_prediction_label = QLabel()
         self.confirm_prediction_label.setWordWrap(True)
-        confirm_layout.addWidget(self.confirm_prediction_label)
+        advanced_layout.addWidget(self.confirm_prediction_label)
 
         # Iterative correction. Also opt-in, for the same reason: it costs an extra measurement on
         # every correction that engages, and only earns that back where the calibration has stopped
@@ -3331,12 +3364,12 @@ class LaserAutofocusSettingWidget(QWidget):
             "pixel_to_um is calibrated over a few microns near focus, so a single linear move lands\n"
             "short when the correction is large and the alignment check then fails to find the spot."
         )
-        confirm_layout.addWidget(self.iterative_correction_checkbox)
+        advanced_layout.addWidget(self.iterative_correction_checkbox)
         self._add_spinbox(
-            confirm_layout, "Iterate Above (μm):", "iterative_correction_min_displacement_um", 0.5, 200, 1, step=1
+            advanced_layout, "Iterate Above (μm):", "iterative_correction_min_displacement_um", 0.5, 200, 1, step=1
         )
         self._add_spinbox(
-            confirm_layout, "Iterate Until Within (μm):", "iterative_correction_tolerance_um", 0.1, 20, 2, step=0.1
+            advanced_layout, "Iterate Until Within (μm):", "iterative_correction_tolerance_um", 0.1, 20, 2, step=0.1
         )
         self.spinboxes["iterative_correction_min_displacement_um"].setToolTip(
             "Only iterate when the correction is at least this large. Below it a single move is "
@@ -3345,59 +3378,31 @@ class LaserAutofocusSettingWidget(QWidget):
         self.spinboxes["iterative_correction_tolerance_um"].setToolTip(
             "Stop once the remaining displacement is within this. Set it near your depth of field."
         )
-        confirm_group.setLayout(confirm_layout)
-
-        # Create spot detection group
-        spot_detection_group = QFrame()
-        spot_detection_group.setFrameStyle(QFrame.Panel | QFrame.Raised)
-        spot_detection_layout = QVBoxLayout()
-
-        # Add connected component spot detection related spinboxes
-        self._add_spinbox(spot_detection_layout, "CC Threshold:", "cc_threshold", 0, 255, 0)
-        self._add_spinbox(spot_detection_layout, "CC Min Area (pixels):", "cc_min_area", 1, 1000, 0)
-        self._add_spinbox(spot_detection_layout, "CC Max Area (pixels):", "cc_max_area", 100, 50000, 0)
-        self._add_spinbox(spot_detection_layout, "CC Row Tolerance (pixels):", "cc_row_tolerance", 1, 200, 0)
-        self._add_spinbox(spot_detection_layout, "CC Max Aspect Ratio:", "cc_max_aspect_ratio", 1.0, 10.0, 1, 0.5)
-        self._add_spinbox(spot_detection_layout, "Filter Sigma:", "filter_sigma", 0, 100, 1, allow_none=True)
-
-        # Spot detection mode combo box
-        spot_mode_layout = QHBoxLayout()
-        spot_mode_layout.addWidget(QLabel("Spot Detection Mode:"))
-        self.spot_mode_combo = QComboBox()
-        _HIDDEN_SPOT_MODES = {SpotDetectionMode.MULTI_SECOND_RIGHT}
-        for mode in SpotDetectionMode:
-            if mode not in _HIDDEN_SPOT_MODES:
-                self.spot_mode_combo.addItem(mode.value, mode)
-        current_index = self.spot_mode_combo.findData(
-            self.laserAutofocusController.laser_af_properties.spot_detection_mode
+        # Characterization mode writes a focus camera frame next to every acquired FOV. That is a
+        # diagnostic cost paid across a whole run, so it belongs behind the same fold.
+        self.characterization_checkbox = QCheckBox("Laser AF Characterization Mode")
+        self.characterization_checkbox.setChecked(self.laserAutofocusController.characterization_mode)
+        self.characterization_checkbox.setToolTip(
+            "Save the focus camera image alongside every acquired FOV, for diagnosing laser AF "
+            "after a run. Costs a file per FOV."
         )
-        self.spot_mode_combo.setCurrentIndex(current_index)
-        spot_mode_layout.addWidget(self.spot_mode_combo)
-        spot_detection_layout.addLayout(spot_mode_layout)
+        advanced_layout.addWidget(self.characterization_checkbox)
 
-        # Add Run Spot Detection button. It grabs a single triggered frame, so it can only
-        # run while live is stopped -- which it is at construction.
-        self.run_spot_detection_button = QPushButton("Run Spot Detection")
-        self.run_spot_detection_button.setEnabled(not self.liveController.is_live)
-        spot_detection_layout.addWidget(self.run_spot_detection_button)
-        spot_detection_group.setLayout(spot_detection_layout)
+        # Collapse by showing/hiding one container rather than walking the layout: most of these
+        # controls are label+spinbox pairs living in nested layouts, and hiding only the direct
+        # children would leave every spinbox on screen under a collapsed heading.
+        self.advanced_body = QWidget()
+        self.advanced_body.setLayout(advanced_layout)
+        advanced_outer = QVBoxLayout()
+        advanced_outer.setContentsMargins(0, 0, 0, 0)
+        advanced_outer.addWidget(self.advanced_body)
+        advanced_group.setLayout(advanced_outer)
+        self.advanced_body.setVisible(advanced_group.isChecked())
+        advanced_group.toggled.connect(self.advanced_body.setVisible)
 
         # Initialize button
         initialize_group = QFrame()
         initialize_layout = QVBoxLayout()
-        init_search_tooltip = (
-            "Search window used by Initialize, centered on the SENSOR rather than on the spot. "
-            "Shrinking it can exclude an off-center spot entirely."
-        )
-        self._add_spinbox(
-            initialize_layout, "Init Search Width (pixels):", "initialize_crop_width", 16, sensor_width, 0, step=8
-        )
-        self._add_spinbox(
-            initialize_layout, "Init Search Height (pixels):", "initialize_crop_height", 16, sensor_height, 0, step=2
-        )
-        self.spinboxes["initialize_crop_width"].setToolTip(init_search_tooltip)
-        self.spinboxes["initialize_crop_height"].setToolTip(init_search_tooltip)
-
         self.search_in_crop_checkbox = QCheckBox("Search within current crop")
         self.search_in_crop_checkbox.setToolTip(
             "Use the crop above as the search region for Initialize, and leave it in place.\n"
@@ -3406,35 +3411,43 @@ class LaserAutofocusSettingWidget(QWidget):
             "to wherever it finds a spot."
         )
         initialize_layout.addWidget(self.search_in_crop_checkbox)
-        # The init search window only applies to the sensor-centered search.
-        self.search_in_crop_checkbox.toggled.connect(
-            lambda checked: [
-                self.spinboxes["initialize_crop_width"].setEnabled(not checked),
-                self.spinboxes["initialize_crop_height"].setEnabled(not checked),
-            ]
+
+        self._add_spinbox(
+            initialize_layout,
+            "Calibration Distance (um):",
+            "pixel_to_um_calibration_distance",
+            0.1,
+            control._def.PIXEL_TO_UM_CALIBRATION_DISTANCE_MAX,
+            2,
         )
+        self.spinboxes["pixel_to_um_calibration_distance"].setToolTip(
+            "The z move Initialize makes to calibrate um-per-pixel. It must be large enough to shift "
+            "the spot by a readable number of pixels, which depends entirely on the objective: a few "
+            "microns suffice at 20x, while a 4x needs hundreds. The line below says what the current "
+            "value predicts."
+        )
+        # The number that decides whether calibration can work at all, and it is not derivable by
+        # eye: the same distance moves the spot 250 px on one objective and half a pixel on another.
+        self.calibration_distance_label = QLabel()
+        self.calibration_distance_label.setWordWrap(True)
+        initialize_layout.addWidget(self.calibration_distance_label)
+
         self.initialize_button = QPushButton("Initialize")
         self.initialize_button.setStyleSheet("background-color: #C2C2FF")
         initialize_layout.addWidget(self.initialize_button)
+        self.calibration_label = QLabel()
+        self.calibration_label.setWordWrap(True)
+        initialize_layout.addWidget(self.calibration_label)
         initialize_group.setLayout(initialize_layout)
 
-        # Add Laser AF Characterization Mode checkbox
-        characterization_group = QFrame()
-        characterization_layout = QHBoxLayout()
-        self.characterization_checkbox = QCheckBox("Laser AF Characterization Mode")
-        self.characterization_checkbox.setChecked(self.laserAutofocusController.characterization_mode)
-        characterization_layout.addWidget(self.characterization_checkbox)
-        characterization_group.setLayout(characterization_layout)
-
         # Add to main layout
+        # Top to bottom in the order the panel is worked through: see the spot, frame it,
+        # calibrate against it, then tune what the detector makes of it.
         layout.addWidget(live_group)
         layout.addWidget(crop_group)
-        layout.addWidget(non_threshold_group)
-        layout.addWidget(confirm_group)
-        layout.addWidget(settings_group)
-        layout.addWidget(spot_detection_group)
         layout.addWidget(initialize_group)
-        layout.addWidget(characterization_group)
+        layout.addWidget(settings_group)
+        layout.addWidget(advanced_group)
         self.setLayout(layout)
 
         if not self.stretch:
@@ -3445,12 +3458,10 @@ class LaserAutofocusSettingWidget(QWidget):
         self.exposure_spinbox.valueChanged.connect(self.update_exposure_time)
         self.analog_gain_spinbox.valueChanged.connect(self.update_analog_gain)
         self.update_threshold_button.clicked.connect(self.update_threshold_settings)
-        self.run_spot_detection_button.clicked.connect(self.run_spot_detection)
         self.apply_crop_button.clicked.connect(self.apply_crop)
         self.center_crop_button.clicked.connect(self.center_crop_on_last_detection)
         self.reset_crop_button.clicked.connect(self.reset_crop_to_full_sensor)
         self.select_crop_button.toggled.connect(self.toggle_crop_selection)
-        self.run_sweep_button.clicked.connect(self.signal_run_af_sweep.emit)
         self.display_lut_combo.currentIndexChanged.connect(
             lambda: self.signal_display_lut_changed.emit(self.display_lut_combo.currentData())
         )
@@ -3458,6 +3469,9 @@ class LaserAutofocusSettingWidget(QWidget):
         self.live_detection_checkbox.toggled.connect(self.signal_live_detection_enabled.emit)
         self.detection_rate_spinbox.valueChanged.connect(self.signal_live_detection_rate.emit)
         self.spinboxes["confirm_step_um"].valueChanged.connect(self._update_confirm_prediction_label)
+        self.spinboxes["displacement_success_window_pixels"].valueChanged.connect(
+            self._update_success_window_label
+        )
         self._update_confirm_prediction_label()
         self.spinboxes["pixel_to_um_calibration_distance"].valueChanged.connect(self._update_calibration_distance_label)
         self._update_calibration_distance_label()
@@ -3501,6 +3515,21 @@ class LaserAutofocusSettingWidget(QWidget):
         # Store spinbox reference
         self.spinboxes[property_name] = spinbox
 
+    def on_live_spot_detected(self, x: float, y: float, source_roi: tuple):
+        """Record the live overlay's latest spot so the crop tools can act on it.
+
+        The overlay runs at up to 20 Hz and _update_crop_status rebuilds a multi-line label, so
+        the label is refreshed on a slower clock than the detection itself. The stored detection
+        is always current -- only the redraw is paced.
+        """
+        self._last_spot_detection = (x, y, source_roi)
+        self.center_crop_button.setEnabled(True)
+
+        now = time.perf_counter()
+        if now >= self._next_crop_status_refresh_s:
+            self._next_crop_status_refresh_s = now + self._CROP_STATUS_REFRESH_INTERVAL_S
+            self._update_crop_status()
+
     def show_live_detection_status(self, status: str):
         """Display why the current frame would fail laser AF, or nothing when it would not."""
         self.live_detection_status_label.setText(status)
@@ -3510,11 +3539,9 @@ class LaserAutofocusSettingWidget(QWidget):
         if pressed:
             self.liveController.start_live()
             self.btn_live.setText("Stop Live")
-            self.run_spot_detection_button.setEnabled(False)
         else:
             self.liveController.stop_live()
             self.btn_live.setText("Start Live")
-            self.run_spot_detection_button.setEnabled(True)
 
     def stop_live(self):
         """Used for stopping live when switching to other tabs"""
@@ -3590,8 +3617,6 @@ class LaserAutofocusSettingWidget(QWidget):
             "has_reference": False,
             "width": int(self.spinboxes["width"].value()),
             "height": int(self.spinboxes["height"].value()),
-            "initialize_crop_width": int(self.spinboxes["initialize_crop_width"].value()),
-            "initialize_crop_height": int(self.spinboxes["initialize_crop_height"].value()),
             "laser_af_search_range_um": self.spinboxes["laser_af_search_range_um"].value(),
             "laser_af_search_step_um": self.spinboxes["laser_af_search_step_um"].value(),
             "confirm_motion_mode": self.confirm_mode_combo.currentData(),
@@ -3684,8 +3709,8 @@ class LaserAutofocusSettingWidget(QWidget):
 
         The displayed frame is itself a camera crop, so box coordinates are relative to it and the
         current camera ROI supplies the offset. Read from the camera rather than the config: it is
-        the region these pixels were actually delivered in, the same discipline run_spot_detection
-        uses.
+        the region these pixels were actually delivered in, the same discipline the live spot
+        overlay uses when it reports a detection.
         """
         if not self.select_crop_button.isChecked():
             return
@@ -3926,87 +3951,40 @@ class LaserAutofocusSettingWidget(QWidget):
         self.crop_status_label.setStyleSheet("color: red;" if warn else "")
 
     def update_calibration_label(self):
-        # Show calibration result
-        # Clear previous calibration label if it exists
-        if hasattr(self, "calibration_label"):
-            self.calibration_label.deleteLater()
-
-        # Create and add new calibration label
-        self.calibration_label = QLabel()
         pixel_to_um = self.laserAutofocusController.laser_af_properties.pixel_to_um
         text = (
             f"Calibration Result: {pixel_to_um:.3f} um/pixel\n"
             f"Performed at {self.laserAutofocusController.laser_af_properties.calibration_timestamp}"
         )
-        if abs(pixel_to_um) > control._def.LASER_AF_MAX_PLAUSIBLE_PIXEL_TO_UM:
+        implausible = abs(pixel_to_um) > control._def.LASER_AF_MAX_PLAUSIBLE_PIXEL_TO_UM
+        if implausible:
             text += "\nImplausible - the detected spot barely moved and may be a static reflection."
-            self.calibration_label.setStyleSheet("color: red;")
+        self.calibration_label.setStyleSheet("color: red;" if implausible else "")
         self.calibration_label.setText(text)
-        self.layout().addWidget(self.calibration_label)
+        self._update_success_window_label()
 
-    def illuminate_and_get_frame(self):
-        # Get a frame from the live controller.  We need to reach deep into the liveController here which
-        # is not ideal.
-        self.liveController.microscope.low_level_drivers.microcontroller.turn_on_AF_laser()
-        self.liveController.microscope.low_level_drivers.microcontroller.wait_till_operation_is_completed()
-        self.liveController.trigger_acquisition()
+    def _update_success_window_label(self):
+        """State the accept window in microns as well as pixels.
 
-        try:
-            frame = self.liveController.camera.read_frame()
-        finally:
-            self.liveController.microscope.low_level_drivers.microcontroller.turn_off_AF_laser()
-            self.liveController.microscope.low_level_drivers.microcontroller.wait_till_operation_is_completed()
-
-        return frame
+        The window is configured in pixels because that is what the detector measures, but how
+        much defocus it tolerates depends entirely on the objective -- 300 px is +/-262 um at 20x
+        and a different number everywhere else.
+        """
+        window_px = self.spinboxes["displacement_success_window_pixels"].value()
+        pixel_to_um = self.laserAutofocusController.laser_af_properties.pixel_to_um
+        if not pixel_to_um or not math.isfinite(pixel_to_um):
+            self.success_window_label.setText("Accepts any displacement until pixel_to_um is calibrated.")
+            return
+        self.success_window_label.setText(
+            f"Accepts a spot up to +/-{window_px * abs(pixel_to_um):.0f} um from the reference "
+            f"at {abs(pixel_to_um):.4f} um/px. Beyond that the frame is discarded."
+        )
 
     def clear_labels(self):
         # Remove any existing error or correlation labels
-        if hasattr(self, "spot_detection_error_label"):
-            self.spot_detection_error_label.deleteLater()
-            delattr(self, "spot_detection_error_label")
-
         if hasattr(self, "correlation_label"):
             self.correlation_label.deleteLater()
             delattr(self, "correlation_label")
-
-    def run_spot_detection(self):
-        """Run spot detection with current settings and emit results"""
-        params = {
-            "threshold": self.spinboxes["cc_threshold"].value(),
-            "min_area": int(self.spinboxes["cc_min_area"].value()),
-            "max_area": int(self.spinboxes["cc_max_area"].value()),
-            "row_tolerance": self.spinboxes["cc_row_tolerance"].value(),
-            "max_aspect_ratio": self.spinboxes["cc_max_aspect_ratio"].value(),
-        }
-        mode = self.spot_mode_combo.currentData()
-        sigma = self.spinboxes["filter_sigma"].value()
-
-        # Read the ROI from the camera rather than from the config: it is the frame these
-        # pixels are actually measured in, and stays right even if a failed crop left the
-        # camera and the config disagreeing.
-        source_roi = self.laserAutofocusController.camera.get_region_of_interest()
-
-        frame = self.illuminate_and_get_frame()
-        if frame is not None:
-            try:
-                result = utils.find_spot_location(frame, mode=mode, params=params, filter_sigma=sigma, debug_plot=True)
-                if result is not None:
-                    x, y = result  # Unpack centroid (x, y)
-                    self._last_spot_detection = (x, y, source_roi)
-                    self.center_crop_button.setEnabled(True)
-                    self._update_crop_status()
-                    self.signal_laser_spot_location.emit(frame, x, y)
-                else:
-                    raise Exception("No spot detection result returned")
-            except Exception:
-                # Show error message
-                # Clear previous error label if it exists
-                if hasattr(self, "spot_detection_error_label"):
-                    self.spot_detection_error_label.deleteLater()
-
-                # Create and add new error label
-                self.spot_detection_error_label = QLabel("Spot detection failed!")
-                self.layout().addWidget(self.spot_detection_error_label)
 
     def show_cross_correlation_result(self, value):
         """Show cross-correlation value from validating laser af images"""
@@ -14224,6 +14202,12 @@ class LaserAFSpotOverlay(QObject):
     """
 
     signal_status = Signal(str)  # failure reason for the current frame, or "" when it would pass
+    # (x, y, source_roi) of the spot the configured mode selected on this frame. source_roi is
+    # the camera ROI those coordinates were measured in, so a later crop change cannot cause them
+    # to be reinterpreted against the wrong frame. This is what keeps Center on Last Detection
+    # supplied now that the one-shot Run Spot Detection button is gone -- and unlike that button
+    # it works while live, which is when the operator is actually framing the crop.
+    signal_spot_detected = Signal(float, float, tuple)
 
     # Ceiling on the share of the thread detection may use. The crop is normally 1536x256 and
     # detection costs a few ms, but Reset to Full Sensor makes the same call an order of
@@ -14298,6 +14282,18 @@ class LaserAFSpotOverlay(QObject):
             failed=result.failure_reason is not None,
         )
         self._emit_status(result.failure_reason or "")
+
+        if result.selected_x is not None and result.selected_y is not None:
+            # Read the ROI from the camera rather than from the config: it is the frame these
+            # pixels are actually measured in, and stays right even if a failed crop left the
+            # camera and the config disagreeing. Only fetched when there is a spot to report,
+            # so a frame with nothing in it costs no camera round-trip.
+            try:
+                source_roi = self.laserAutofocusController.camera.get_region_of_interest()
+            except Exception:
+                self._log.exception("Could not read the focus camera ROI; skipping this detection.")
+                return
+            self.signal_spot_detected.emit(float(result.selected_x), float(result.selected_y), tuple(source_roi))
 
     def _emit_status(self, status: str):
         # Only on change: at several hertz an unchanged string would repaint the label for nothing.

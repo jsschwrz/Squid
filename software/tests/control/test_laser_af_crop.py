@@ -302,11 +302,62 @@ class _WidgetStub:
         self.signal_apply_settings = MagicMock()
 
     apply_crop = LaserAutofocusSettingWidget.apply_crop
+    on_live_spot_detected = LaserAutofocusSettingWidget.on_live_spot_detected
+    _CROP_STATUS_REFRESH_INTERVAL_S = LaserAutofocusSettingWidget._CROP_STATUS_REFRESH_INTERVAL_S
     center_crop_on_last_detection = LaserAutofocusSettingWidget.center_crop_on_last_detection
     reset_crop_to_full_sensor = LaserAutofocusSettingWidget.reset_crop_to_full_sensor
     _apply_crop_and_refresh = LaserAutofocusSettingWidget._apply_crop_and_refresh
     _update_crop_status = LaserAutofocusSettingWidget._update_crop_status
     on_crop_selection_changed = LaserAutofocusSettingWidget.on_crop_selection_changed
+
+
+class TestLiveDetectionFeedsTheCropTools:
+    """The live overlay is the only source of _last_spot_detection now.
+
+    Run Spot Detection used to be, and Center on Last Detection reads it -- so if the overlay
+    stopped supplying it, that button would simply never enable again.
+    """
+
+    def _widget(self):
+        widget = _WidgetStub(LaserAFConfig(x_offset=1016, y_offset=826, width=1536, height=256))
+        widget._next_crop_status_refresh_s = 0.0
+        return widget
+
+    def test_a_live_detection_arms_center_on_last_detection(self):
+        widget = self._widget()
+
+        widget.on_live_spot_detected(1750.0, 128.0, (1016, 826, 1536, 256))
+
+        assert widget._last_spot_detection == (1750.0, 128.0, (1016, 826, 1536, 256))
+        widget.center_crop_button.setEnabled.assert_called_with(True)
+
+    def test_the_recorded_roi_is_the_one_the_spot_was_measured_in(self):
+        """A crop applied after the detection must not reinterpret those pixels."""
+        widget = self._widget()
+        measured_in = (500, 300, 800, 200)
+
+        widget.on_live_spot_detected(120.0, 90.0, measured_in)
+        widget.laserAutofocusController.camera.get_region_of_interest.return_value = (0, 0, 3088, 2064)
+
+        assert widget._last_spot_detection[2] == measured_in
+
+    def test_the_latest_detection_always_wins(self):
+        widget = self._widget()
+
+        widget.on_live_spot_detected(1000.0, 100.0, (0, 0, 3088, 2064))
+        widget.on_live_spot_detected(1200.0, 110.0, (0, 0, 3088, 2064))
+
+        assert widget._last_spot_detection[0] == 1200.0
+
+    def test_the_status_label_is_paced_but_the_detection_is_not(self):
+        """The overlay runs far faster than a multi-line label is worth rebuilding."""
+        widget = self._widget()
+
+        for i in range(20):
+            widget.on_live_spot_detected(1000.0 + i, 100.0, (0, 0, 3088, 2064))
+
+        assert widget._last_spot_detection[0] == 1019.0
+        assert widget.crop_status_label.setText.call_count == 1
 
 
 class TestWidgetCropSlots:

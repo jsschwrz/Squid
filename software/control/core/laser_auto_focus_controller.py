@@ -1574,14 +1574,8 @@ class LaserAutofocusController(QObject):
 
                 # calculate centroid using connected components parameters
                 # Use large row_tolerance during initialization when spot location is unknown
-                row_tolerance = image.shape[0] if ignore_row_tolerance else self.laser_af_properties.cc_row_tolerance
-                spot_detection_params = {
-                    "threshold": self.laser_af_properties.cc_threshold,
-                    "min_area": self.laser_af_properties.cc_min_area,
-                    "max_area": self.laser_af_properties.cc_max_area,
-                    "row_tolerance": row_tolerance,
-                    "max_aspect_ratio": self.laser_af_properties.cc_max_aspect_ratio,
-                }
+                row_tolerance = image.shape[0] if ignore_row_tolerance else None
+                spot_detection_params = self._spot_detection_params(row_tolerance=row_tolerance)
 
                 result = utils.find_spot_location(
                     image,
