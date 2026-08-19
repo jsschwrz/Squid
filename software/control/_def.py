@@ -948,6 +948,11 @@ CORRELATION_THRESHOLD = 0.75
 # including perfect ones. Cap it below 1.0 so that setting is unreachable.
 MAX_CORRELATION_THRESHOLD = 0.99
 PIXEL_TO_UM_CALIBRATION_DISTANCE = 6.0
+# Ceiling offered for that distance. A low-magnification objective is far less sensitive to
+# defocus -- a 4x/0.13 lands near 30 um/px -- so the few-micron move that suits a 20x shifts the
+# spot by less than one pixel there and cannot be resolved at all. The ceiling has to leave room
+# for the least sensitive objective to move the spot by tens of pixels.
+PIXEL_TO_UM_CALIBRATION_DISTANCE_MAX = 1000.0
 # Connected component spot detection parameters
 LASER_AF_CC_THRESHOLD = 8  # Intensity threshold for binarization
 LASER_AF_CC_MIN_AREA = 5  # Minimum component area in pixels
@@ -962,7 +967,10 @@ LASER_AF_INITIALIZE_CROP_HEIGHT = 800
 # displacement, so a spot that barely moves yields a huge factor: locking onto a static
 # back-reflection once produced -98.6 um/pixel from 0.06 px of travel.
 LASER_AF_MIN_CALIBRATION_DISPLACEMENT_PX = 1.0  # below this, calibration fails rather than dividing
-LASER_AF_MAX_PLAUSIBLE_PIXEL_TO_UM = 10.0  # above this, calibration warns (real values here are 0.4 - 2.0)
+# Above this, calibration warns that the spot may not be the sample reflection. Real values span
+# the objective range, from ~0.09 um/px at 100x to ~30 um/px at 4x, so this sits well above the
+# least sensitive objective rather than above the common ones.
+LASER_AF_MAX_PLAUSIBLE_PIXEL_TO_UM = 50.0
 
 LASER_AF_SEARCH_DOWN_FIRST = (
     True  # If True, search downward (smaller z values) first then upward; if False, search upward first

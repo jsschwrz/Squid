@@ -1,4 +1,5 @@
-"""Unit tests for the laser AF z-search, the diagnostic sweep, and the motion confirm guard.
+"""Unit tests for the laser AF z-search, the diagnostic sweep and the calibration read back from
+it, and the motion confirm guard.
 
 The simulated focus camera renders uniform noise rather than a spot, so detection against it
 always fails. Every test here that cares about detection behaviour stubs the frame source or
@@ -9,7 +10,7 @@ flow, not spot finding.
 import glob
 import math
 import os
-from unittest.mock import MagicMock, call
+from unittest.mock import MagicMock, call, patch
 
 import numpy as np
 import pytest
@@ -982,3 +983,307 @@ class TestRunAfSweep:
 
         assert len(samples) == 5
         assert all(s.candidates == [] for s in samples)
+
+
+class TestSweepFit:
+    """The line fitted through a sweep, which is both the summary text and a calibration."""
+
+    def _samples(self, slope_px_per_um=2.0, noise=None, dzs=(-20.0, -10.0, 0.0, 10.0, 20.0)):
+        noise = noise or [0.0] * len(dzs)
+        return [
+            SweepSample(
+                z_um=1000.0 + dz,
+                dz_um=dz,
+                candidates=[{"x": 100.0 + slope_px_per_um * dz + n}],
+                selected_x=100.0 + slope_px_per_um * dz + n,
+            )
+            for dz, n in zip(dzs, noise)
+        ]
+
+    def test_fit_measures_the_slope_span_and_residual(self):
+        from control.widgets import _fit_sweep_slope
+
+        fit = _fit_sweep_slope(self._samples(slope_px_per_um=2.0))
+
+        assert fit.slope_px_per_um == pytest.approx(2.0)
+        assert fit.um_per_px == pytest.approx(0.5)
+        assert fit.n_points == 5
+        assert fit.dz_span_um == pytest.approx(40.0)
+        assert fit.residual_rms_px == pytest.approx(0.0, abs=1e-9)
+        assert fit.is_usable_calibration
+        assert not fit.residual_is_high
+
+    def test_fit_is_none_when_there_is_no_line_to_fit(self):
+        from control.widgets import _fit_sweep_slope
+
+        assert _fit_sweep_slope([]) is None
+        # Every detection at one z: a vertical scatter has no slope, however many points it holds.
+        assert _fit_sweep_slope(self._samples(dzs=(0.0, 0.0, 0.0))) is None
+
+    def test_a_bent_branch_is_flagged_rather_than_averaged_into_one_slope(self):
+        """A sweep across the whole search range leaves the linear region; one slope then fits
+        neither end, and adopting it as a calibration would be wrong everywhere."""
+        from control.widgets import _fit_sweep_slope
+
+        # A parabola, which no straight line describes.
+        samples = [
+            SweepSample(z_um=1000.0 + dz, dz_um=dz, candidates=[{"x": 100.0 + 0.02 * dz * dz}],
+                        selected_x=100.0 + 0.02 * dz * dz)
+            for dz in range(-100, 101, 10)
+        ]
+
+        fit = _fit_sweep_slope(samples)
+
+        assert fit.residual_is_high
+
+    def test_summarize_reports_how_the_fit_was_obtained(self):
+        """Whether the slope is worth adopting is a question about the fit, not the slope."""
+        from control.widgets import LaserAFSweepWidget
+
+        widget = MagicMock()
+        widget.laserAutofocusController.laser_af_properties = LaserAFConfig(pixel_to_um=0.5)
+
+        text = LaserAFSweepWidget._summarize(widget, self._samples(slope_px_per_um=2.0))
+
+        assert "5 points over 40 um" in text
+        assert "residual 0.00 px RMS" in text
+
+
+class TestApplySweepFitAsCalibration:
+    """Reading the swept slope back into pixel_to_um -- the only path in that window that writes."""
+
+    def _widget(self, fit, stored=1.0, acquisition_running=False):
+        from control.widgets import LaserAFSweepWidget
+
+        widget = MagicMock()
+        widget._fit = fit
+        widget._log = MagicMock()
+        widget.laserAutofocusController = MagicMock()
+        widget.laserAutofocusController.laser_af_properties = LaserAFConfig(pixel_to_um=stored)
+        widget.multipointController = MagicMock()
+        widget.multipointController.acquisition_in_progress.return_value = acquisition_running
+        widget.laserAutofocusSettingWidget = MagicMock()
+        return widget
+
+    def _fit(self, slope_px_per_um=2.0, residual_rms_px=0.0):
+        from control.widgets import _SweepFit
+
+        return _SweepFit(slope_px_per_um, residual_rms_px, 41, 400.0)
+
+    def _answer(self, message_box, answer):
+        """Make the confirmation dialog return a given standard button."""
+        message_box.return_value.exec_.return_value = answer
+
+    def test_adopting_writes_the_measured_factor_and_refreshes_the_panel(self):
+        from control.widgets import LaserAFSweepWidget
+
+        widget = self._widget(self._fit(slope_px_per_um=1.0 / 29.7), stored=1.0)
+
+        with patch("control.widgets.QMessageBox") as message_box:
+            self._answer(message_box, message_box.Yes)
+            LaserAFSweepWidget.apply_fit_as_calibration(widget)
+
+        (measured,), kwargs = widget.laserAutofocusController.set_pixel_to_um_calibration.call_args
+        assert measured == pytest.approx(29.7)
+        assert "sweep" in kwargs["source"]
+        widget.laserAutofocusSettingWidget.refresh_calibration_display.assert_called_once()
+        # Nothing here re-initializes: the reference is a pixel position and rescaling um does not
+        # move it, so throwing it away would be pure loss.
+        widget.laserAutofocusController.initialize_auto.assert_not_called()
+
+    def test_declining_the_confirmation_writes_nothing(self):
+        from control.widgets import LaserAFSweepWidget
+
+        widget = self._widget(self._fit())
+
+        with patch("control.widgets.QMessageBox") as message_box:
+            self._answer(message_box, message_box.No)
+            LaserAFSweepWidget.apply_fit_as_calibration(widget)
+
+        widget.laserAutofocusController.set_pixel_to_um_calibration.assert_not_called()
+
+    def test_a_flat_branch_is_never_adopted(self):
+        """1/slope on a static back-reflection is an enormous number, not a calibration."""
+        from control.widgets import LaserAFSweepWidget
+
+        widget = self._widget(self._fit(slope_px_per_um=0.0))
+
+        with patch("control.widgets.QMessageBox") as message_box:
+            self._answer(message_box, message_box.Yes)
+            LaserAFSweepWidget.apply_fit_as_calibration(widget)
+
+        widget.laserAutofocusController.set_pixel_to_um_calibration.assert_not_called()
+
+    def test_refuses_to_change_the_calibration_under_a_running_acquisition(self):
+        from control.widgets import LaserAFSweepWidget
+
+        widget = self._widget(self._fit(), acquisition_running=True)
+
+        with patch("control.widgets.QMessageBox") as message_box:
+            self._answer(message_box, message_box.Yes)
+            LaserAFSweepWidget.apply_fit_as_calibration(widget)
+
+        widget.laserAutofocusController.set_pixel_to_um_calibration.assert_not_called()
+        message_box.warning.assert_called_once()
+
+    def test_a_curved_branch_is_adopted_only_with_the_curvature_spelled_out(self):
+        from control.widgets import LaserAFSweepWidget
+
+        widget = self._widget(self._fit(slope_px_per_um=0.1, residual_rms_px=20.0))
+
+        with patch("control.widgets.QMessageBox") as message_box:
+            self._answer(message_box, message_box.Yes)
+            LaserAFSweepWidget.apply_fit_as_calibration(widget)
+
+        shown = message_box.return_value.setText.call_args[0][0]
+        assert "not straight" in shown
+        widget.laserAutofocusController.set_pixel_to_um_calibration.assert_called_once()
+
+    def test_the_button_is_enabled_only_by_a_sweep_that_yields_a_usable_slope(self):
+        from control.widgets import LaserAFSweepWidget
+
+        widget = MagicMock()
+        widget.laserAutofocusController.laser_af_properties = LaserAFConfig(pixel_to_um=0.5)
+        widget._was_main_live = False
+
+        moving = [SweepSample(z_um=1000.0 + dz, dz_um=dz, candidates=[{"x": 100.0 + 2 * dz}],
+                              selected_x=100.0 + 2 * dz) for dz in (-10.0, 0.0, 10.0)]
+        LaserAFSweepWidget.on_sweep_finished(widget, moving)
+        assert widget.btn_apply_calibration.setEnabled.call_args[0][0] is True
+
+        static = [SweepSample(z_um=1000.0 + dz, dz_um=dz, candidates=[{"x": 100.0}], selected_x=100.0)
+                  for dz in (-10.0, 0.0, 10.0)]
+        LaserAFSweepWidget.on_sweep_finished(widget, static)
+        assert widget.btn_apply_calibration.setEnabled.call_args[0][0] is False
+
+
+class TestSetPixelToUmCalibration:
+    """The controller side of adopting an externally measured factor."""
+
+    def _controller(self, **config_kwargs):
+        controller = _controller_for_search(LaserAFConfig(**config_kwargs))
+        controller._save_current_config = MagicMock()
+        return controller
+
+    def test_writes_the_factor_stamps_it_and_saves(self):
+        controller = self._controller(pixel_to_um=1.0, calibration_timestamp="")
+
+        controller.set_pixel_to_um_calibration(29.7, source="AF sweep fit")
+
+        assert controller.laser_af_properties.pixel_to_um == pytest.approx(29.7)
+        assert controller.laser_af_properties.calibration_timestamp != ""
+        controller._save_current_config.assert_called_once()
+
+    def test_leaves_the_reference_and_the_initialized_state_alone(self):
+        controller = self._controller(pixel_to_um=1.0, x_reference=768.0, has_reference=True)
+        controller.is_initialized = True
+
+        controller.set_pixel_to_um_calibration(0.4, source="AF sweep fit")
+
+        assert controller.laser_af_properties.x_reference == pytest.approx(768.0)
+        assert controller.laser_af_properties.has_reference
+        assert controller.is_initialized
+
+    @pytest.mark.parametrize("bad", [0.0, float("inf"), float("nan")])
+    def test_refuses_a_factor_that_is_not_a_number_of_microns(self, bad):
+        controller = self._controller(pixel_to_um=1.0)
+
+        with pytest.raises(ValueError):
+            controller.set_pixel_to_um_calibration(bad, source="test")
+
+        assert controller.laser_af_properties.pixel_to_um == pytest.approx(1.0)
+        controller._save_current_config.assert_not_called()
+
+
+class TestCalibrationDistanceGuidance:
+    """The calibration move has to shift the spot far enough to be read, and how far that is
+    depends entirely on the objective."""
+
+    def _widget(self, pixel_to_um, distance_um, piezo_range_um=None):
+        from control.widgets import LaserAutofocusSettingWidget
+
+        widget = MagicMock()
+        widget.laserAutofocusController.laser_af_properties = LaserAFConfig(pixel_to_um=pixel_to_um)
+        widget.laserAutofocusController.piezo = None
+        if piezo_range_um is not None:
+            widget.laserAutofocusController.piezo = MagicMock(range_um=piezo_range_um)
+        widget.spinboxes = {"pixel_to_um_calibration_distance": MagicMock(value=lambda: distance_um)}
+        LaserAutofocusSettingWidget._update_calibration_distance_label(widget)
+        return widget.calibration_distance_label
+
+    def test_a_low_magnification_objective_is_told_the_move_is_too_small(self):
+        """The 4x/0.13 case: 20 um of defocus moves the spot two thirds of a pixel, and the
+        calibration fails a minimum-displacement check that says nothing from the GUI."""
+        label = self._widget(pixel_to_um=29.73, distance_um=20.0)
+
+        text = label.setText.call_args[0][0]
+        assert "0.7 px" in text
+        assert "calibration will fail" in text
+        assert "at least 30 um" in text
+        assert label.setStyleSheet.call_args[0][0] == "color: red;"
+
+    def test_a_workable_but_marginal_move_is_advised_upward_without_alarm(self):
+        label = self._widget(pixel_to_um=2.0, distance_um=6.0)
+
+        text = label.setText.call_args[0][0]
+        assert "3.0 px" in text
+        assert "centroid noise" in text
+        assert label.setStyleSheet.call_args[0][0] != "color: red;"
+
+    def test_a_move_longer_than_the_piezo_travel_is_called_out(self):
+        """The two constraints meet on a piezo machine: the distance a 4x needs is the same order
+        as the piezo's whole range."""
+        label = self._widget(pixel_to_um=29.73, distance_um=600.0, piezo_range_um=300.0)
+
+        text = label.setText.call_args[0][0]
+        assert "300 um travel" in text
+        assert "Test AF Sweep" in text
+        assert label.setStyleSheet.call_args[0][0] == "color: red;"
+
+    def test_a_move_within_the_piezo_travel_is_not_called_out(self):
+        label = self._widget(pixel_to_um=29.73, distance_um=250.0, piezo_range_um=300.0)
+
+        assert "travel" not in label.setText.call_args[0][0]
+
+    def test_a_comfortable_move_is_reported_without_advice(self):
+        label = self._widget(pixel_to_um=0.4, distance_um=6.0)
+
+        text = label.setText.call_args[0][0]
+        assert "15.0 px" in text
+        assert "fail" not in text
+        assert "noise" not in text
+        assert label.setStyleSheet.call_args[0][0] == ""
+
+
+class TestCalibrationDistanceFitsThePiezo:
+    """PiezoStage.move_to raises rather than clipping, so an over-range calibration distance would
+    otherwise fail halfway through the sequence with the AF laser still on."""
+
+    def _controller(self, distance_um, piezo=None):
+        controller = _controller_for_search(LaserAFConfig(pixel_to_um_calibration_distance=distance_um))
+        controller.piezo = piezo
+        return controller
+
+    def test_a_stage_machine_is_never_blocked(self):
+        controller = self._controller(600.0, piezo=None)
+
+        assert controller._calibration_distance_fits()
+
+    def test_a_move_that_fits_the_piezo_travel_is_allowed(self):
+        controller = self._controller(200.0, piezo=MagicMock(position=150.0, range_um=300.0))
+
+        assert controller._calibration_distance_fits()
+
+    def test_a_move_off_the_end_of_the_piezo_is_refused_before_the_laser_is_lit(self):
+        controller = self._controller(600.0, piezo=MagicMock(position=150.0, range_um=300.0))
+        controller._move_z = MagicMock()
+        controller._turn_on_laser = MagicMock()
+
+        assert controller._calibrate_pixel_to_um() is False
+        controller._move_z.assert_not_called()
+
+    def test_an_off_center_piezo_is_refused_even_for_a_short_move(self):
+        """Half the move goes down: the travel that matters is the travel on both sides."""
+        controller = self._controller(100.0, piezo=MagicMock(position=10.0, range_um=300.0))
+
+        assert not controller._calibration_distance_fits()

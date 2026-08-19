@@ -454,6 +454,9 @@ class LaserAutofocusController(QObject):
         Returns:
             bool: True if calibration successful, False otherwise
         """
+        if not self._calibration_distance_fits():
+            return False
+
         # Calibrate pixel-to-um conversion
         try:
             self.microcontroller.turn_on_AF_laser()
@@ -548,6 +551,67 @@ class LaserAutofocusController(QObject):
         self._save_current_config()
 
         return True
+
+    def _calibration_distance_fits(self) -> bool:
+        """Whether the calibration move stays inside the travel of whatever drives z.
+
+        Only the piezo has a hard limit that can be hit by a legitimate setting: it moves a few
+        hundred microns in total, while a low-magnification objective needs a calibration move of
+        that order to shift the spot far enough to measure. PiezoStage.move_to raises rather than
+        clipping, so without this the failure lands halfway through the sequence with the AF laser
+        still on and z off its starting point. Checked up front instead, where the only cost is a
+        log line.
+        """
+        if self.piezo is None:
+            return True  # the stage's own software limits are enforced elsewhere
+
+        half_span_um = self.laser_af_properties.pixel_to_um_calibration_distance / 2
+        position_um = self.piezo.position
+        if position_um - half_span_um < 0 or position_um + half_span_um > self.piezo.range_um:
+            self._log.error(
+                f"Calibration distance of {self.laser_af_properties.pixel_to_um_calibration_distance} um needs "
+                f"+/-{half_span_um} um around the piezo's current {position_um} um, which does not fit in its "
+                f"0-{self.piezo.range_um} um travel. Center the piezo, shorten the calibration distance, or "
+                f"take the factor from a Test AF Sweep instead."
+            )
+            return False
+        return True
+
+    def set_pixel_to_um_calibration(self, pixel_to_um: float, source: str) -> None:
+        """Adopt a pixel_to_um measured somewhere other than the two-point calibration.
+
+        The two-point calibration in _calibrate_pixel_to_um divides one z move by one spot
+        displacement, which is only as good as that single pair of centroids and needs the move to
+        be large enough to resolve at all. A fitted sweep measures the same slope over tens of z
+        positions and is the better number whenever one is available -- particularly on a low
+        magnification objective, where the calibration move needed to shift the spot even a few
+        pixels is hundreds of microns.
+
+        Deliberately does not touch has_reference, x_reference or is_initialized: the reference is
+        a spot position in pixels, and rescaling pixels to microns leaves where the spot sits
+        untouched. Re-initializing here would throw away the reference this is meant to improve.
+
+        Raises:
+            ValueError: if pixel_to_um is not a finite non-zero number. Zero would make every
+                displacement read as zero microns, and the caller has a measurement bug rather
+                than a legitimately flat calibration.
+        """
+        if not math.isfinite(pixel_to_um) or pixel_to_um == 0:
+            raise ValueError(f"Refusing to set a pixel_to_um of {pixel_to_um}; it must be finite and non-zero.")
+
+        previous = self.laser_af_properties.pixel_to_um
+        calibration_timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        self.laser_af_properties = self.laser_af_properties.model_copy(
+            update={"pixel_to_um": pixel_to_um, "calibration_timestamp": calibration_timestamp}
+        )
+        self._save_current_config()
+        self._log.info(f"pixel_to_um set to {pixel_to_um:.4f} um/pixel from {source} (was {previous:.4f}).")
+        if abs(pixel_to_um) > control._def.LASER_AF_MAX_PLAUSIBLE_PIXEL_TO_UM:
+            self._log.warning(
+                f"Adopted pixel_to_um of {pixel_to_um:.3f} um/pixel is implausibly large "
+                f"(> {control._def.LASER_AF_MAX_PLAUSIBLE_PIXEL_TO_UM}); the measured spot barely moved and "
+                f"may not be the sample reflection."
+            )
 
     def set_laser_af_properties(self, updates: dict) -> None:
         """Update laser autofocus properties. Used for updating settings from GUI."""

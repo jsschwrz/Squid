@@ -8,7 +8,7 @@ import yaml
 import logging
 import sys
 from pathlib import Path
-from typing import Dict, List, Optional, TYPE_CHECKING
+from typing import Dict, List, NamedTuple, Optional, TYPE_CHECKING
 
 import psutil
 
@@ -3015,6 +3015,11 @@ class StageUtils(QDialog):
 # it. Every stock 1536 px crop is several times wider than needed, so a lower factor would flag
 # every objective on the machine and the advice would stop meaning anything.
 _CROP_WIDTH_ADVISORY_FACTOR = 4.0
+# Spot motion below which a two-point calibration is dominated by centroid noise. One pixel is
+# the hard floor the controller enforces; this is the point at which the answer is worth
+# trusting, and it is advice rather than a rule because a short move is sometimes all the
+# clearance under an objective allows.
+_CALIBRATION_DISPLACEMENT_ADVISORY_PX = 10.0
 
 
 class LaserAutofocusSettingWidget(QWidget):
@@ -3215,8 +3220,24 @@ class LaserAutofocusSettingWidget(QWidget):
         # Add non-threshold property spinboxes
         self._add_spinbox(non_threshold_layout, "Spot Crop Size (pixels):", "spot_crop_size", 1, 500, 0)
         self._add_spinbox(
-            non_threshold_layout, "Calibration Distance (μm):", "pixel_to_um_calibration_distance", 0.1, 20.0, 2
+            non_threshold_layout,
+            "Calibration Distance (μm):",
+            "pixel_to_um_calibration_distance",
+            0.1,
+            control._def.PIXEL_TO_UM_CALIBRATION_DISTANCE_MAX,
+            2,
         )
+        self.spinboxes["pixel_to_um_calibration_distance"].setToolTip(
+            "The z move Initialize makes to calibrate um-per-pixel. It must be large enough to shift "
+            "the spot by a readable number of pixels, which depends entirely on the objective: a few "
+            "microns suffice at 20x, while a 4x needs hundreds. The line below says what the current "
+            "value predicts."
+        )
+        # The number that decides whether calibration can work at all, and it is not derivable by
+        # eye: the same distance moves the spot 250 px on one objective and half a pixel on another.
+        self.calibration_distance_label = QLabel()
+        self.calibration_distance_label.setWordWrap(True)
+        non_threshold_layout.addWidget(self.calibration_distance_label)
         non_threshold_group.setLayout(non_threshold_layout)
 
         # Settings group
@@ -3438,6 +3459,8 @@ class LaserAutofocusSettingWidget(QWidget):
         self.detection_rate_spinbox.valueChanged.connect(self.signal_live_detection_rate.emit)
         self.spinboxes["confirm_step_um"].valueChanged.connect(self._update_confirm_prediction_label)
         self._update_confirm_prediction_label()
+        self.spinboxes["pixel_to_um_calibration_distance"].valueChanged.connect(self._update_calibration_distance_label)
+        self._update_calibration_distance_label()
         self.initialize_button.clicked.connect(self.apply_and_initialize)
         self.characterization_checkbox.toggled.connect(self.toggle_characterization_mode)
 
@@ -3543,6 +3566,7 @@ class LaserAutofocusSettingWidget(QWidget):
         self.center_crop_button.setEnabled(self._last_spot_detection is not None)
         self._update_crop_status()
         self._update_confirm_prediction_label()
+        self._update_calibration_distance_label()
 
     def apply_and_initialize(self):
         self.clear_labels()
@@ -3602,8 +3626,10 @@ class LaserAutofocusSettingWidget(QWidget):
                 "Laser Autofocus",
                 "Initialization failed - see the log for details.\n\n"
                 "If the spot could not be found, check the focus camera exposure and the spot "
-                "detection settings. If calibration failed, the detected reflection may not be "
-                "the one that moves with focus; use Reset to Full Sensor to see all of them.",
+                "detection settings. If calibration failed, either the calibration distance is too "
+                "short to move the spot a measurable amount on this objective -- the line under "
+                "Calibration Distance says which -- or the detected reflection is not the one that "
+                "moves with focus; use Reset to Full Sensor to see all of them.",
             )
 
     def update_threshold_settings(self):
@@ -3766,6 +3792,71 @@ class LaserAutofocusSettingWidget(QWidget):
             + ("" if predicted_px >= floor_px else f" Below the {floor_px:.0f} px floor: the check will be skipped.")
         )
         self.confirm_prediction_label.setStyleSheet("" if predicted_px >= floor_px else "color: red;")
+
+    def _update_calibration_distance_label(self):
+        """Show how far the calibration move is predicted to shift the spot, in pixels.
+
+        Whether the two-point calibration can resolve anything at all is decided by this number,
+        and nothing on screen used to say so: a 4x/0.13 sits near 30 um/px, where a 20 um move
+        shifts the spot by two thirds of a pixel and the calibration fails on a minimum-displacement
+        check whose cause is invisible from the GUI. The prediction is only as good as the stored
+        pixel_to_um, which is exactly what is being calibrated -- hence "stored" in the wording. A
+        fitted AF sweep is the way out of that circle.
+        """
+        config = self.laserAutofocusController.laser_af_properties
+        um_per_px = abs(config.pixel_to_um)
+        distance_um = self.spinboxes["pixel_to_um_calibration_distance"].value()
+
+        if not (um_per_px > 0 and math.isfinite(um_per_px)):
+            self.calibration_distance_label.setText("Predicted spot motion unknown until pixel_to_um is calibrated.")
+            self.calibration_distance_label.setStyleSheet("")
+            return
+
+        predicted_px = distance_um / um_per_px
+        floor_px = control._def.LASER_AF_MIN_CALIBRATION_DISPLACEMENT_PX
+        lines = [
+            f"At the stored {um_per_px:.4f} um/px, a {distance_um:.2f} um calibration move shifts the "
+            f"spot {predicted_px:.1f} px."
+        ]
+        style = ""
+        if predicted_px < floor_px:
+            lines.append(
+                f"Below the {floor_px:.0f} px minimum, so calibration will fail. Use at least "
+                f"{floor_px * um_per_px:.0f} um, or run Test AF Sweep and read the slope back."
+            )
+            style = "color: red;"
+        elif predicted_px < _CALIBRATION_DISPLACEMENT_ADVISORY_PX:
+            lines.append(
+                f"Under {_CALIBRATION_DISPLACEMENT_ADVISORY_PX:.0f} px the factor is only as good as the "
+                f"centroid noise; ~{_CALIBRATION_DISPLACEMENT_ADVISORY_PX * um_per_px:.0f} um would be steadier."
+            )
+            style = "color: #C87000;"
+
+        # The distance a low-magnification objective needs is the same order as a piezo's entire
+        # travel, so on a piezo machine the two constraints meet. Said here as well as in the
+        # controller because the operator sets the number here.
+        piezo = self.laserAutofocusController.piezo
+        if piezo is not None and distance_um > piezo.range_um:
+            lines.append(
+                f"Longer than the piezo's {piezo.range_um:.0f} um travel, so Initialize will refuse it. "
+                f"Take the factor from a Test AF Sweep instead."
+            )
+            style = "color: red;"
+
+        self.calibration_distance_label.setText(" ".join(lines))
+        self.calibration_distance_label.setStyleSheet(style)
+
+    def refresh_calibration_display(self):
+        """Re-read the parts of this panel that depend on pixel_to_um.
+
+        For callers that change the calibration without going through Initialize -- reading a slope
+        back off an AF sweep, for one. update_values() would do this too, but it also reloads every
+        spinbox from the config and would discard settings the operator has typed but not applied.
+        """
+        self.update_calibration_label()
+        self._update_crop_status()
+        self._update_calibration_distance_label()
+        self._update_confirm_prediction_label()
 
     def _update_crop_status(self):
         """Show where the crop sits, and how much focus travel it leaves before the spot
@@ -14215,6 +14306,65 @@ class LaserAFSpotOverlay(QObject):
             self.signal_status.emit(status)
 
 
+# Below this the branch is flat to within the plot's own noise, and 1/slope would turn a static
+# back-reflection into an enormous um/px. Not a tolerance to tune -- it separates "moves" from
+# "does not move", and everything real is orders of magnitude above it.
+_MIN_SWEEP_SLOPE_PX_PER_UM = 1e-6
+# How far the branch may wander from the fitted line, as a fraction of the pixel range it covers,
+# before one slope stops describing it. A sweep run over the full search range routinely leaves the
+# region where defocus and spot position are linear, and a fit across the bend is a number that
+# matches neither end.
+_SWEEP_FIT_RESIDUAL_WARNING_FRACTION = 0.05
+
+
+class _SweepFit(NamedTuple):
+    """A straight line fitted through the selected branch of an AF sweep."""
+
+    slope_px_per_um: float
+    residual_rms_px: float
+    n_points: int
+    dz_span_um: float
+
+    @property
+    def um_per_px(self) -> float:
+        return 1.0 / self.slope_px_per_um
+
+    @property
+    def is_usable_calibration(self) -> bool:
+        return abs(self.slope_px_per_um) >= _MIN_SWEEP_SLOPE_PX_PER_UM
+
+    @property
+    def residual_is_high(self) -> bool:
+        """Whether the branch strays from the line by enough that one slope misdescribes it."""
+        covered_px = abs(self.slope_px_per_um) * self.dz_span_um
+        return covered_px > 0 and self.residual_rms_px > _SWEEP_FIT_RESIDUAL_WARNING_FRACTION * covered_px
+
+
+def _fit_sweep_slope(samples) -> Optional[_SweepFit]:
+    """Fit spot x against z over the selected branch of a sweep.
+
+    Module level rather than a method so the summary text and the calibration it can be read back
+    into are computed from one place, and so neither has to be reached through a widget to be
+    tested.
+
+    Returns None when the samples cannot define a line at all -- fewer than two detections, or all
+    of them at one z.
+    """
+    points = [(s.dz_um, s.selected_x) for s in samples if s.selected_x is not None]
+    if len(points) < 2:
+        return None
+
+    dz = np.array([p[0] for p in points], dtype=float)
+    x = np.array([p[1] for p in points], dtype=float)
+    dz_span_um = float(np.ptp(dz))
+    if dz_span_um == 0:
+        return None
+
+    slope, intercept = np.polyfit(dz, x, 1)
+    residual_rms_px = float(np.sqrt(np.mean((x - (slope * dz + intercept)) ** 2)))
+    return _SweepFit(float(slope), residual_rms_px, len(points), dz_span_um)
+
+
 class LaserAFSweepWidget(QWidget):
     """Plots every reflection in the focus camera's crop against z.
 
@@ -14254,6 +14404,9 @@ class LaserAFSweepWidget(QWidget):
         # origin and the current-z marker would be meaningless.
         self._sweep_start_z_um = None
         self._last_marked_z_um = None
+        # The line fitted through the last completed sweep, kept so the summary the operator read
+        # and the calibration they can adopt from it are the same number.
+        self._fit = None
 
         self.init_ui()
 
@@ -14264,8 +14417,22 @@ class LaserAFSweepWidget(QWidget):
         self.btn_run = QPushButton("Test AF Sweep")
         self.btn_run.setStyleSheet("background-color: #C2C2FF")
         self.btn_clear = QPushButton("Clear")
+        # Disabled until a sweep produces a slope worth adopting. Writing a calibration is the one
+        # thing in this window that is not a diagnostic, so it stays unavailable until there is
+        # something real behind it.
+        self.btn_apply_calibration = QPushButton("Use Slope as Calibration")
+        self.btn_apply_calibration.setEnabled(False)
+        self.btn_apply_calibration.setToolTip(
+            "Write the fitted slope into pixel_to_um for the current objective.\n"
+            "Measured over every z position of the sweep rather than the two positions the\n"
+            "Initialize calibration uses -- and on a low magnification objective, where a few\n"
+            "microns of defocus move the spot less than a pixel, it is often the only way to get\n"
+            "the number at all.\n"
+            "Leaves the crop and the reference position untouched."
+        )
         button_layout.addWidget(self.btn_run)
         button_layout.addWidget(self.btn_clear)
+        button_layout.addWidget(self.btn_apply_calibration)
         layout.addLayout(button_layout)
 
         self.status_label = QLabel("Sweep z across the search range to see which reflections track focus.")
@@ -14313,9 +14480,12 @@ class LaserAFSweepWidget(QWidget):
 
         self.btn_run.clicked.connect(self.start_sweep)
         self.btn_clear.clicked.connect(self.clear)
+        self.btn_apply_calibration.clicked.connect(self.apply_fit_as_calibration)
 
     def clear(self):
         self._samples = []
+        self._fit = None
+        self.btn_apply_calibration.setEnabled(False)
         self.all_candidates_item.setData([], [])
         self.selected_item.setData([], [])
         # Drop the origin with the data. A marker left over from a previous sweep would be placed
@@ -14482,36 +14652,35 @@ class LaserAFSweepWidget(QWidget):
                 self._log.exception("Failed to restore live after AF sweep")
             self._was_main_live = False
 
+        self._fit = _fit_sweep_slope(samples)
         self.status_label.setText(self._summarize(samples))
+        self.btn_apply_calibration.setEnabled(self._fit is not None and self._fit.is_usable_calibration)
 
     def _summarize(self, samples) -> str:
         """Fit the selected branch against z and compare the slope to the stored calibration."""
-        points = [(s.dz_um, s.selected_x) for s in samples if s.selected_x is not None]
+        n_selected = sum(1 for s in samples if s.selected_x is not None)
         positions_with_any = sum(1 for s in samples if s.candidates)
         header = f"{len(samples)} z positions, {positions_with_any} with a detected spot."
 
-        if len(points) < 2:
+        fit = _fit_sweep_slope(samples)
+        if fit is None:
+            if n_selected >= 2:
+                return f"{header} All detections at one z; cannot fit a slope."
             return (
                 f"{header} Not enough detections to fit a slope. If the plot is empty, the spot is "
                 f"outside the crop across this whole range -- check the crop status in the settings panel."
             )
 
-        dz = np.array([p[0] for p in points], dtype=float)
-        x = np.array([p[1] for p in points], dtype=float)
-        if float(np.ptp(dz)) == 0:
-            return f"{header} All detections at one z; cannot fit a slope."
-
-        slope_px_per_um = float(np.polyfit(dz, x, 1)[0])
         stored = self.laserAutofocusController.laser_af_properties.pixel_to_um
 
-        if abs(slope_px_per_um) < 1e-6:
+        if not fit.is_usable_calibration:
             return (
-                f"{header} Slope {slope_px_per_um:.3f} px/um - this branch does NOT move with z, so it "
+                f"{header} Slope {fit.slope_px_per_um:.3f} px/um - this branch does NOT move with z, so it "
                 f"is a static reflection, not the sample reflection. Reposition the crop onto a "
                 f"reflection that tracks focus."
             )
 
-        measured_um_per_px = 1.0 / slope_px_per_um
+        measured_um_per_px = fit.um_per_px
         agreement = ""
         if stored not in (0, None) and math.isfinite(stored):
             rel = abs(measured_um_per_px - stored) / abs(stored)
@@ -14519,9 +14688,89 @@ class LaserAFSweepWidget(QWidget):
                 f" Stored pixel_to_um = {stored:.4f} ({'agrees within' if rel < 0.1 else 'DISAGREES by'} "
                 f"{rel * 100:.0f}%)."
             )
-        return (
-            f"{header} Slope {slope_px_per_um:.2f} px/um -> {measured_um_per_px:.4f} um/px.{agreement}"
+        # Whether the slope is worth reading back into the configuration is a question about the fit,
+        # so the fit quality belongs next to the slope rather than in the log.
+        quality = (
+            f" Fit: {fit.n_points} points over {fit.dz_span_um:.0f} um, residual "
+            f"{fit.residual_rms_px:.2f} px RMS."
         )
+        if fit.residual_is_high:
+            quality += " That is a lot of curvature for one straight line; narrow the sweep around focus."
+        return f"{header} Slope {fit.slope_px_per_um:.2f} px/um -> {measured_um_per_px:.4f} um/px.{agreement}{quality}"
+
+    def apply_fit_as_calibration(self):
+        """Read the fitted slope back into pixel_to_um for the current objective.
+
+        The Initialize calibration measures the same quantity from two z positions a few microns
+        apart. That is enough on a sensitive objective and impossible on an insensitive one: a
+        4x/0.13 near 30 um/px needs a move of hundreds of microns to shift the spot even ten
+        pixels, and the two-point measurement carries the full centroid noise of exactly two
+        frames. The sweep already visits tens of positions across a range the operator chose, so
+        the slope it fits is both obtainable and better conditioned. This is what turns the sweep
+        from a diagnostic into a calibration.
+        """
+        fit = self._fit
+        if fit is None or not fit.is_usable_calibration:
+            return
+
+        # Same guard as the sweep itself: an acquisition in flight is measuring against the
+        # calibration this would replace underneath it.
+        if self.multipointController is not None and self.multipointController.acquisition_in_progress():
+            QMessageBox.warning(
+                self, "Laser Autofocus", "Cannot change the calibration while an acquisition is running."
+            )
+            return
+
+        measured_um_per_px = fit.um_per_px
+        stored = self.laserAutofocusController.laser_af_properties.pixel_to_um
+        message = (
+            f"Set pixel_to_um for the current objective to {measured_um_per_px:.4f} um/px?\n\n"
+            f"It is {stored:.4f} um/px now.\n"
+            f"Fitted over {fit.n_points} detections spanning {fit.dz_span_um:.0f} um, "
+            f"residual {fit.residual_rms_px:.2f} px RMS.\n\n"
+            f"The crop and the reference position are left as they are."
+        )
+        if fit.residual_is_high:
+            message += (
+                "\n\nThe residual is large for this slope: the branch is not straight across the swept "
+                "range, so no single factor describes all of it. Consider narrowing Z Search Range to "
+                "the region around focus and sweeping again before adopting this."
+            )
+
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Question)
+        box.setWindowTitle("Laser Autofocus")
+        box.setText(message)
+        box.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
+        box.setDefaultButton(QMessageBox.No)
+        if box.exec_() != QMessageBox.Yes:
+            return
+
+        source = f"AF sweep fit over {fit.n_points} points spanning {fit.dz_span_um:.0f} um"
+        try:
+            self.laserAutofocusController.set_pixel_to_um_calibration(measured_um_per_px, source=source)
+        except ValueError:
+            self._log.exception("Refused to adopt the swept slope as a calibration")
+            QMessageBox.warning(
+                self, "Laser Autofocus", "The fitted slope does not give a usable calibration - see the log."
+            )
+            return
+
+        if self.laserAutofocusSettingWidget is not None:
+            try:
+                self.laserAutofocusSettingWidget.refresh_calibration_display()
+            except Exception:
+                # The calibration is written and saved by this point; a stale panel is not worth
+                # losing it over.
+                self._log.exception("Failed to refresh the laser AF settings panel after adopting a calibration")
+
+        self.btn_apply_calibration.setEnabled(False)
+        self.status_label.setText(
+            f"pixel_to_um set to {measured_um_per_px:.4f} um/px from this sweep "
+            f"({fit.n_points} points over {fit.dz_span_um:.0f} um, residual {fit.residual_rms_px:.2f} px RMS). "
+            f"Was {stored:.4f} um/px."
+        )
+        self.status_label.setStyleSheet("")
 
     def closeEvent(self, event):
         # Emitting a signal into a destroyed widget is a hard crash, not an exception.

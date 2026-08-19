@@ -198,9 +198,9 @@ class TestCalibrationGuard:
         assert controller.laser_af_properties.pixel_to_um == pytest.approx(-6.0 / 10.64)
 
     def test_implausible_factor_warns_but_still_calibrates(self):
-        # Above the 1 px minimum, so it calibrates -- but 20 / 1.5 is far outside the
-        # 0.4 - 2.0 um/pixel range these objectives actually produce.
-        controller = self._controller_measuring(700.0, 701.5, calibration_distance=20.0)
+        # Above the 1 px minimum, so it calibrates -- but 100 / 1.5 is far beyond even the 4x, the
+        # least sensitive objective on the machine, which lands near 30 um/pixel.
+        controller = self._controller_measuring(700.0, 701.5, calibration_distance=100.0)
 
         assert controller._calibrate_pixel_to_um() is True
         assert abs(controller.laser_af_properties.pixel_to_um) > control._def.LASER_AF_MAX_PLAUSIBLE_PIXEL_TO_UM
