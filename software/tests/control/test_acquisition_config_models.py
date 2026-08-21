@@ -713,7 +713,6 @@ class TestLaserAFConfig:
         assert config.correlation_threshold == _def.CORRELATION_THRESHOLD
         assert config.focus_camera_exposure_time_ms == float(_def.FOCUS_CAMERA_EXPOSURE_TIME_MS)
         assert config.focus_camera_analog_gain == float(_def.FOCUS_CAMERA_ANALOG_GAIN)
-        assert config.displacement_success_window_pixels == float(_def.DISPLACEMENT_SUCCESS_WINDOW_PIXELS)
         assert config.spot_crop_size == _def.SPOT_CROP_SIZE
         assert config.pixel_to_um_calibration_distance == _def.PIXEL_TO_UM_CALIBRATION_DISTANCE
         assert config.cc_threshold == float(_def.LASER_AF_CC_THRESHOLD)
@@ -786,7 +785,6 @@ class TestLaserAFConfig:
         # detection parameters fall back to the new defaults, not translated
         assert config.cc_threshold == float(_def.LASER_AF_CC_THRESHOLD)
         assert config.cc_min_area == _def.LASER_AF_CC_MIN_AREA
-        assert config.displacement_success_window_pixels == float(_def.DISPLACEMENT_SUCCESS_WINDOW_PIXELS)
 
         # the legacy "filtering off" sentinel is replaced by the connected-components
         # default, which is the regime the new detector was tuned in
@@ -818,6 +816,27 @@ class TestLaserAFConfig:
         """The legacy shim must not become a blanket extra="allow"."""
         with pytest.raises(ValidationError):
             LaserAFConfig(pixel_to_um=1.0, not_a_real_field=123)
+
+    def test_retired_displacement_window_is_dropped_not_rejected(self):
+        """A config saved before the field was retired must still load, calibration intact.
+
+        extra="forbid" is what catches typos, and it would otherwise turn every existing
+        laser_af_configs/*.yaml into a validation error -- taking pixel_to_um, x_reference and
+        the reference image with it.
+        """
+        config = LaserAFConfig(
+            pixel_to_um=1.9707661823541205,
+            x_reference=1606.9260959823705,
+            has_reference=True,
+            displacement_success_window_pixels=300.0,
+        )
+        assert config.pixel_to_um == 1.9707661823541205
+        assert config.x_reference == 1606.9260959823705
+        assert not hasattr(config, "displacement_success_window_pixels")
+
+        # and it leaves on the next save rather than lingering in the file
+        dumped = config.model_dump(exclude_none=True, mode="json", warnings=False)
+        assert "displacement_success_window_pixels" not in dumped
 
     def test_laser_af_config_with_reference_image(self):
         """Test LaserAFConfig with reference image data."""

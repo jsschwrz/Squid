@@ -56,14 +56,13 @@ class SpotOverlayResult:
     A read-only verdict for display: computing it moves nothing, writes no configuration and
     changes no state. What makes it worth having separately from the numbers measure_displacement
     returns is failure_reason -- a measurement that fails reports only that it failed, while this
-    says which of the three ways it failed, which is the part that tells you what to change.
+    says which of the ways it failed, which is the part that tells you what to change.
     """
 
     candidates: List[Dict[str, Any]] = field(default_factory=list)  # left to right, as detected
     selected_x: Optional[float] = None  # what the configured mode picks, if it can pick
     selected_y: Optional[float] = None
     reference_x: Optional[float] = None  # the reference plane's spot x, when one has been set
-    window_px: Optional[float] = None  # half-width of the accept window around reference_x
     displacement_um: Optional[float] = None  # signed, relative to the reference; None without one
     failure_reason: Optional[str] = None  # None when this frame would have produced a measurement
 
@@ -887,14 +886,13 @@ class LaserAutofocusController(QObject):
                 continue
 
             # The first genuine detection wins. There is deliberately no displacement window here:
-            # _get_laser_spot_centroid already discards anything further than
-            # displacement_success_window_pixels from the reference, move_to_target refuses a
+            # the crop bounds where a spot can be found at all, move_to_target refuses a
             # displacement beyond laser_af_range, and the cross-correlation check after the move
-            # restores z if the spot turns out to be the wrong one. A fourth window at this layer
-            # added nothing those three do not cover, and because it was derived from the search
-            # step it silently tightened to 2.8 um when the step was set to 2 um -- discarding real
-            # detections at 3-25 um and making the search succeed only if it happened to land
-            # within one step of focus.
+            # restores z if the spot turns out to be the wrong one. A window at this layer added
+            # nothing those cover, and because it was derived from the search step it silently
+            # tightened to 2.8 um when the step was set to 2 um -- discarding real detections at
+            # 3-25 um and making the search succeed only if it happened to land within one step
+            # of focus.
             displacement_um = self._get_displacement_from_centroid(result)
 
             if confirm_mode in (
@@ -976,15 +974,16 @@ class LaserAutofocusController(QObject):
         array it is displaying -- a camera crop and a center-crop are different coordinate frames
         and nothing in the result says which one it is.
 
-        The three failure modes are the three ways measure_displacement can come back empty, and
-        they call for different fixes: no candidates means the cc_* thresholds or the crop are
-        wrong, an unchoosable set means the spot detection mode does not match what is in frame,
-        and a selection outside the window means AF is looking at the right spot but too far from
-        the reference to accept it.
+        The two failure modes are the two ways measure_displacement can come back empty, and they
+        call for different fixes: no candidates means the cc_* thresholds or the crop are wrong,
+        and an unchoosable set means the spot detection mode does not match what is in frame.
+
+        A spot far from the reference is deliberately not a failure here. The crop is what bounds
+        where a spot may be, and a detection inside it is one this frame legitimately offers; how
+        large a displacement is worth acting on is move_to_target's call, against laser_af_range.
         """
         config = self.laser_af_properties
         reference_x = config.x_reference if config.has_reference else None
-        window_px = float(config.displacement_success_window_pixels) if reference_x is not None else None
 
         try:
             candidates = utils.find_all_spot_locations(
@@ -995,9 +994,9 @@ class LaserAutofocusController(QObject):
         except ValueError:
             # An unusable frame -- empty, or not an array. Ordinary here: the stream can hand us
             # one between a crop change and the first frame in the new geometry.
-            return SpotOverlayResult(reference_x=reference_x, window_px=window_px, failure_reason="no frame")
+            return SpotOverlayResult(reference_x=reference_x, failure_reason="no frame")
 
-        result = SpotOverlayResult(candidates=candidates, reference_x=reference_x, window_px=window_px)
+        result = SpotOverlayResult(candidates=candidates, reference_x=reference_x)
 
         if not candidates:
             result.failure_reason = "no spot detected"
@@ -1014,15 +1013,8 @@ class LaserAutofocusController(QObject):
         result.selected_x = float(selected["x"])
         result.selected_y = float(selected["y"])
 
-        if reference_x is not None:
-            offset_px = result.selected_x - reference_x
-            if config.pixel_to_um:
-                result.displacement_um = offset_px * config.pixel_to_um
-            if abs(offset_px) > window_px:
-                result.failure_reason = (
-                    f"spot {abs(offset_px):.0f} px from reference, outside the "
-                    f"{window_px:.0f} px window -- AF would reject this frame"
-                )
+        if reference_x is not None and config.pixel_to_um:
+            result.displacement_um = (result.selected_x - reference_x) * config.pixel_to_um
 
         return result
 
@@ -1600,20 +1592,12 @@ class LaserAutofocusController(QObject):
                 else:
                     x, y = spot_x, spot_y
 
-                # Check if displacement from reference exceeds the success window (in pixels)
-                if (
-                    self.laser_af_properties.has_reference
-                    and self.laser_af_properties.x_reference is not None
-                    and abs(x - self.laser_af_properties.x_reference)
-                    > self.laser_af_properties.displacement_success_window_pixels
-                ):
-                    self._log.warning(
-                        f"Spot detected at ({x:.1f}, {y:.1f}) is outside displacement window "
-                        f"({abs(x - self.laser_af_properties.x_reference):.1f} > "
-                        f"{self.laser_af_properties.displacement_success_window_pixels:.0f} pixels), skipping it."
-                    )
-                    continue
-
+                # Every detection the mode returns is averaged in. There is deliberately no
+                # distance-from-reference filter here: the crop already bounds where a spot may
+                # be found, and it is set against live spot detection and the AF sweep -- i.e.
+                # sized to contain the spot and exclude the reflections around it. A second bound
+                # in the same axis, in pixels rather than the crop's own coordinates, only
+                # restated the crop, and restated it wrongly whenever the two were set apart.
                 tmp_x += x
                 tmp_y += y
                 successful_detections += 1

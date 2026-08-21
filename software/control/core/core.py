@@ -898,7 +898,6 @@ class ImageDisplayWindow(QMainWindow):
         self.spot_candidates_item = None  # every spot the detector found in frame
         self.spot_selected_item = None  # the one the configured spot detection mode picked
         self.spot_reference_line = None  # x_reference, i.e. the focus plane
-        self.spot_window_region = None  # the displacement window AF will accept a spot within
 
         # Create main layout
         layout = QVBoxLayout()
@@ -1546,6 +1545,10 @@ class ImageDisplayWindow(QMainWindow):
     # the same color on the image as it does on the sweep plot.
     _SPOT_CANDIDATE_BRUSH = (150, 150, 150, 180)
     _SPOT_SELECTED_BRUSH = (0, 140, 255, 220)
+    # Latent since the displacement window was retired: every failure classify_frame_spots can
+    # report now leaves `selected` None, so there is nothing to recolor. Kept because `failed` is
+    # derived from failure_reason at the call site and stays correct on its own -- a failure mode
+    # that does pick a spot would light this up without needing the path rebuilt.
     _SPOT_FAILED_BRUSH = (255, 60, 60, 230)
 
     def _ensure_spot_overlay_items(self):
@@ -1564,13 +1567,9 @@ class ImageDisplayWindow(QMainWindow):
             size=18, pen=pg.mkPen(self._SPOT_SELECTED_BRUSH, width=2), brush=None, symbol="+"
         )
         self.spot_reference_line = pg.InfiniteLine(angle=90, movable=False, pen=pg.mkPen("g", style=Qt.DashLine))
-        self.spot_window_region = pg.LinearRegionItem(orientation="vertical", movable=False)
-        self.spot_window_region.setBrush(pg.mkBrush(0, 200, 0, 30))
-        self.spot_window_region.setZValue(15)  # under the markers, over the image
 
         view = self._active_view()
         for item in (
-            self.spot_window_region,
             self.spot_reference_line,
             self.spot_candidates_item,
             self.spot_selected_item,
@@ -1587,7 +1586,7 @@ class ImageDisplayWindow(QMainWindow):
             # ignoreBounds so turning the overlay on never changes the current zoom.
             view.addItem(item, ignoreBounds=True)
 
-    def set_spot_overlay(self, candidates=None, selected=None, reference_x=None, window_px=None, failed=False):
+    def set_spot_overlay(self, candidates=None, selected=None, reference_x=None, failed=False):
         """Draw what the laser AF detector made of the frame currently on display.
 
         Coordinates are pixels of the displayed frame. The ImageItem sits at the origin with no
@@ -1596,8 +1595,8 @@ class ImageDisplayWindow(QMainWindow):
         frame it displayed, not on some other crop of the sensor.
 
         candidates: sequence of (x, y) for every spot in frame; selected: the (x, y) the
-        configured mode picked, or None; reference_x / window_px: the accept window, omitted when
-        no reference has been set; failed: draw the selection in the failure color.
+        configured mode picked, or None; reference_x: the focus plane, omitted when no reference
+        has been set; failed: draw the selection in the failure color.
         """
         self._ensure_spot_overlay_items()
 
@@ -1621,16 +1620,8 @@ class ImageDisplayWindow(QMainWindow):
         if reference_x is not None:
             self.spot_reference_line.setPos(float(reference_x))
             self.spot_reference_line.show()
-            if window_px is not None:
-                self.spot_window_region.setRegion(
-                    (float(reference_x) - float(window_px), float(reference_x) + float(window_px))
-                )
-                self.spot_window_region.show()
-            else:
-                self.spot_window_region.hide()
         else:
             self.spot_reference_line.hide()
-            self.spot_window_region.hide()
 
     def clear_spot_overlay(self):
         """Hide every overlay item. Safe before any overlay has been drawn."""
@@ -1642,7 +1633,6 @@ class ImageDisplayWindow(QMainWindow):
             self.spot_candidates_item,
             self.spot_selected_item,
             self.spot_reference_line,
-            self.spot_window_region,
         ):
             item.hide()
 

@@ -66,36 +66,40 @@ class TestClassifyFrameSpots:
         assert result.selected_x == pytest.approx(expected_x, abs=2)
         assert result.failure_reason is None
 
-    def test_no_reference_means_no_window_and_no_displacement(self):
+    def test_no_reference_means_no_displacement(self):
         controller = _make_controller(spot_detection_mode=SpotDetectionMode.SINGLE, has_reference=False)
         result = controller.classify_frame_spots(create_test_image([(320, 240)]))
-        assert (result.reference_x, result.window_px, result.displacement_um) == (None, None, None)
+        assert (result.reference_x, result.displacement_um) == (None, None)
 
-    def test_spot_inside_the_window_reports_displacement_and_passes(self):
+    def test_a_reference_turns_the_selection_into_a_signed_displacement(self):
         controller = _make_controller(
             spot_detection_mode=SpotDetectionMode.SINGLE,
             has_reference=True,
             x_reference=300.0,
-            displacement_success_window_pixels=300,
             pixel_to_um=0.5,
         )
         result = controller.classify_frame_spots(create_test_image([(320, 240)]))
         assert result.reference_x == 300.0
-        assert result.window_px == 300
         assert result.displacement_um == pytest.approx((result.selected_x - 300.0) * 0.5)
         assert result.failure_reason is None
 
-    def test_spot_outside_the_window_is_the_rejection_af_would_make(self):
+    def test_a_spot_far_from_the_reference_is_reported_not_rejected(self):
+        """Distance from the reference is no longer a verdict this layer makes.
+
+        The crop bounds where a spot may be found, and how large a displacement is worth acting
+        on is move_to_target's call against laser_af_range. A frame the operator can see is a
+        frame worth reporting honestly.
+        """
         controller = _make_controller(
             spot_detection_mode=SpotDetectionMode.SINGLE,
             has_reference=True,
             x_reference=100.0,
-            displacement_success_window_pixels=100,
+            pixel_to_um=0.5,
         )
         result = controller.classify_frame_spots(create_test_image([(600, 240)]))
-        # Still selected and still drawn -- seeing where the rejected spot sits is the point.
         assert result.selected_x == pytest.approx(600, abs=2)
-        assert "outside" in result.failure_reason
+        assert result.displacement_um == pytest.approx((result.selected_x - 100.0) * 0.5)
+        assert result.failure_reason is None
 
 
 class _FakeClock:
@@ -120,7 +124,6 @@ def overlay_parts(qtbot):
         selected_x=10.0,
         selected_y=20.0,
         reference_x=None,
-        window_px=None,
         failure_reason=None,
     )
     display = MagicMock()
@@ -169,7 +172,6 @@ class TestSpotOverlayThrottle:
             selected_x=None,
             selected_y=None,
             reference_x=None,
-            window_px=None,
             failure_reason=None,
         )
         overlay.on_frame(np.zeros((16, 16), dtype=np.uint8))
@@ -209,7 +211,6 @@ class TestSpotOverlayThrottle:
             selected_x=30.0,
             selected_y=21.0,
             reference_x=25.0,
-            window_px=100.0,
             failure_reason=None,
         )
         overlay.set_enabled(True)
@@ -218,7 +219,7 @@ class TestSpotOverlayThrottle:
         kwargs = display.set_spot_overlay.call_args.kwargs
         assert kwargs["candidates"] == [(10.0, 20.0), (30.0, 21.0)]
         assert kwargs["selected"] == (30.0, 21.0)
-        assert (kwargs["reference_x"], kwargs["window_px"], kwargs["failed"]) == (25.0, 100.0, False)
+        assert (kwargs["reference_x"], kwargs["failed"]) == (25.0, False)
 
     def test_a_failing_frame_is_flagged_and_explained_once(self, overlay_parts):
         overlay, controller, display, clock = overlay_parts
@@ -227,7 +228,6 @@ class TestSpotOverlayThrottle:
             selected_x=None,
             selected_y=None,
             reference_x=None,
-            window_px=None,
             failure_reason="no spot detected",
         )
         statuses = []
@@ -264,16 +264,14 @@ class TestImageDisplayWindowOverlay:
         assert focus_display.spot_candidates_item.isVisible()
         assert focus_display.spot_selected_item.isVisible()
 
-    def test_window_band_is_centered_on_the_reference(self, focus_display):
-        focus_display.set_spot_overlay(selected=(300, 20), reference_x=250.0, window_px=100.0)
+    def test_the_reference_line_marks_the_focus_plane(self, focus_display):
+        focus_display.set_spot_overlay(selected=(300, 20), reference_x=250.0)
         assert focus_display.spot_reference_line.value() == pytest.approx(250.0)
-        assert focus_display.spot_window_region.getRegion() == pytest.approx((150.0, 350.0))
-        assert focus_display.spot_window_region.isVisible()
+        assert focus_display.spot_reference_line.isVisible()
 
-    def test_no_reference_hides_the_line_and_the_band(self, focus_display):
+    def test_no_reference_hides_the_line(self, focus_display):
         focus_display.set_spot_overlay(candidates=[(10, 20)], selected=(10, 20))
         assert not focus_display.spot_reference_line.isVisible()
-        assert not focus_display.spot_window_region.isVisible()
 
     def test_failure_recolors_the_selection(self, focus_display):
         focus_display.set_spot_overlay(selected=(10, 20), failed=False)
@@ -290,13 +288,12 @@ class TestImageDisplayWindowOverlay:
         assert not focus_display.spot_selected_item.isVisible()
 
     def test_clear_hides_everything(self, focus_display):
-        focus_display.set_spot_overlay(candidates=[(10, 20)], selected=(10, 20), reference_x=250.0, window_px=100.0)
+        focus_display.set_spot_overlay(candidates=[(10, 20)], selected=(10, 20), reference_x=250.0)
         focus_display.clear_spot_overlay()
         for item in (
             focus_display.spot_candidates_item,
             focus_display.spot_selected_item,
             focus_display.spot_reference_line,
-            focus_display.spot_window_region,
         ):
             assert not item.isVisible()
 
@@ -307,14 +304,11 @@ class TestImageDisplayWindowOverlay:
         would swallow the click before the view saw it -- and a marker sits exactly where the
         interesting part of the image is.
         """
-        focus_display.set_spot_overlay(
-            candidates=[(10, 20)], selected=(10, 20), reference_x=250.0, window_px=100.0
-        )
+        focus_display.set_spot_overlay(candidates=[(10, 20)], selected=(10, 20), reference_x=250.0)
         for item in (
             focus_display.spot_candidates_item,
             focus_display.spot_selected_item,
             focus_display.spot_reference_line,
-            focus_display.spot_window_region,
         ):
             assert item.acceptedMouseButtons() == Qt.NoButton
             assert not item.acceptHoverEvents()
@@ -339,7 +333,6 @@ class TestEndToEnd:
             spot_detection_mode=SpotDetectionMode.DUAL_LEFT,
             has_reference=True,
             x_reference=210.0,
-            displacement_success_window_pixels=100,
         )
         display = ImageDisplayWindow()
         qtbot.addWidget(display)
@@ -356,22 +349,32 @@ class TestEndToEnd:
         xs, ys = display.spot_candidates_item.getData()
         assert sorted(round(x) for x in xs) == [200, 440]
         assert all(y == pytest.approx(240, abs=2) for y in ys)
-        # DUAL_LEFT selects the leftmost, which is inside the window around x_reference=210.
+        # DUAL_LEFT selects the leftmost, 10 px from x_reference=210.
         assert display.spot_selected_item.getData()[0][0] == pytest.approx(200, abs=2)
-        assert display.spot_window_region.getRegion() == pytest.approx((110.0, 310.0))
+        assert display.spot_reference_line.value() == pytest.approx(210.0)
 
-    def test_a_frame_af_would_reject_shows_up_as_a_failure(self, chain):
+    def test_a_frame_with_nothing_in_it_shows_up_as_a_failure(self, chain):
         overlay, display, _ = chain
         statuses = []
         overlay.signal_status.connect(statuses.append)
         overlay.set_enabled(True)
-        # Only a spot far to the right of the reference: selected, but outside the window.
+        overlay.on_frame(np.zeros((480, 640), dtype=np.uint8))
+
+        assert "no spot detected" in statuses[-1]
+        assert not display.spot_candidates_item.isVisible()
+        assert not display.spot_selected_item.isVisible()
+
+    def test_a_spot_far_from_the_reference_is_still_a_good_frame(self, chain):
+        """What used to be the window rejection. The crop is what decides this now."""
+        overlay, display, _ = chain
+        statuses = []
+        overlay.signal_status.connect(statuses.append)
+        overlay.set_enabled(True)
+        # 390 px right of x_reference=210 -- outside the window that used to be enforced here.
         overlay.on_frame(create_test_image([(600, 240)]))
 
         assert display.spot_selected_item.getData()[0][0] == pytest.approx(600, abs=2)
-        assert "outside" in statuses[-1]
-        failing = display.spot_selected_item.opts["pen"].color().getRgb()
-        assert failing[:3] == ImageDisplayWindow._SPOT_FAILED_BRUSH[:3]
+        assert statuses[-1] == ""
 
     def test_turning_it_off_removes_the_markers(self, chain):
         overlay, display, _ = chain

@@ -941,7 +941,6 @@ LASER_AF_ITERATIVE_CORRECTION_MIN_DISPLACEMENT_UM = 10.0
 # moving spot from a static one, so the check is skipped rather than guessed at.
 LASER_AF_CONFIRM_MIN_PREDICTED_PX = 4.0
 LASER_AF_CONFIRM_TOLERANCE_FRACTION = 0.35  # slack as a fraction of the predicted motion
-DISPLACEMENT_SUCCESS_WINDOW_PIXELS = 300  # Max displacement from reference x to accept detection (pixels)
 SPOT_CROP_SIZE = 100
 CORRELATION_THRESHOLD = 0.75
 # A live frame correlated against a stored template never reaches exactly 1.0 -- camera noise alone

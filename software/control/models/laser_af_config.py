@@ -20,10 +20,9 @@ _log = squid.logging.get_logger(__name__)
 # Fields written by the line-profile spot detector, which connected-components detection
 # replaced. They have no equivalent in the new schema and are dropped on load.
 #
-# displacement_success_window_um is NOT convertible to displacement_success_window_pixels:
-# the old field was a convergence tolerance for averaged measurements, the new one is a
-# maximum accepted distance from the reference x. Different quantities, so the new default
-# from _def is used rather than a fabricated conversion.
+# displacement_success_window_um was a convergence tolerance for averaged measurements. Its
+# successor displacement_success_window_pixels has since been retired too -- see
+# _RETIRED_FIELDS -- so there is nothing left for it to convert into.
 _LEGACY_LINE_PROFILE_FIELDS = frozenset(
     {
         "displacement_success_window_um",
@@ -35,6 +34,18 @@ _LEGACY_LINE_PROFILE_FIELDS = frozenset(
         "spot_spacing",
     }
 )
+
+# Fields that were real settings in an earlier build of this schema and are now gone. Unlike the
+# line-profile fields above these are not tied to a detector change, so they are dropped on their
+# own path: folding them into that set would make a config carrying only one of them take the
+# line-profile migration, including its filter_sigma rewrite and its "re-tune this objective"
+# warning, neither of which applies.
+#
+# displacement_success_window_pixels bounded how far from x_reference a per-frame detection could
+# land before it was discarded. The camera crop now serves that purpose -- it is set against live
+# spot detection and the AF sweep, so it is chosen to contain the spot and exclude everything else
+# -- and a second bound in the same axis only duplicated it, in a unit the crop is not expressed in.
+_RETIRED_FIELDS = frozenset({"displacement_success_window_pixels"})
 
 _migration_warned: set = set()
 
@@ -125,10 +136,6 @@ class LaserAFConfig(BaseModel):
     spot_detection_mode: SpotDetectionMode = Field(
         default_factory=lambda: SpotDetectionMode(_def.LASER_AF_SPOT_DETECTION_MODE),
         description="Spot detection mode",
-    )
-    displacement_success_window_pixels: float = Field(
-        default_factory=lambda: float(_def.DISPLACEMENT_SUCCESS_WINDOW_PIXELS),
-        description="Max displacement from reference x to accept detection (pixels)",
     )
 
     # Spot detection
@@ -345,6 +352,26 @@ class LaserAFConfig(BaseModel):
                 ", ".join(sorted(present)),
             )
         return data
+
+    @model_validator(mode="before")
+    @classmethod
+    def _drop_retired_fields(cls, data: Any) -> Any:
+        """Drop settings this schema used to have, so an existing config still loads.
+
+        model_config forbids extras, which is what catches typos -- but it would also make every
+        config saved before the field was retired fail to load, taking its calibration and
+        reference image with it. Dropped silently at debug level: nothing about the config is
+        wrong and nothing needs re-tuning, and the key disappears from disk on the next save.
+        """
+        if not isinstance(data, dict):
+            return data
+
+        present = _RETIRED_FIELDS.intersection(data)
+        if not present:
+            return data
+
+        _log.debug("Dropping retired laser AF config fields: %s", ", ".join(sorted(present)))
+        return {k: v for k, v in data.items() if k not in _RETIRED_FIELDS}
 
     @model_validator(mode="before")
     @classmethod

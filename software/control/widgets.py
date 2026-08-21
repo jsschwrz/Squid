@@ -3296,14 +3296,6 @@ class LaserAutofocusSettingWidget(QWidget):
             "implausible and the move is refused. It bounds no search and moves nothing -- how far "
             "z is searched for a lost spot is Z Search Range, below."
         )
-        self._add_spinbox(
-            settings_layout, "Displacement Success Window (pixels):", "displacement_success_window_pixels", 1, 1000, 0
-        )
-        # In pixels because that is what the detector measures, but nobody reasons about focus in
-        # pixels -- so say what it is worth in microns at the current calibration.
-        self.success_window_label = QLabel()
-        self.success_window_label.setWordWrap(True)
-        settings_layout.addWidget(self.success_window_label)
         self._add_spinbox(settings_layout, "Laser AF Averaging N:", "laser_af_averaging_n", 1, 100, 0)
         self.spinboxes["laser_af_averaging_n"].setToolTip(
             "Frames averaged per measurement. They are taken at one z, so this averages sensor "
@@ -3469,9 +3461,6 @@ class LaserAutofocusSettingWidget(QWidget):
         self.live_detection_checkbox.toggled.connect(self.signal_live_detection_enabled.emit)
         self.detection_rate_spinbox.valueChanged.connect(self.signal_live_detection_rate.emit)
         self.spinboxes["confirm_step_um"].valueChanged.connect(self._update_confirm_prediction_label)
-        self.spinboxes["displacement_success_window_pixels"].valueChanged.connect(
-            self._update_success_window_label
-        )
         self._update_confirm_prediction_label()
         self.spinboxes["pixel_to_um_calibration_distance"].valueChanged.connect(self._update_calibration_distance_label)
         self._update_calibration_distance_label()
@@ -3600,7 +3589,6 @@ class LaserAutofocusSettingWidget(QWidget):
 
         updates = {
             "laser_af_averaging_n": int(self.spinboxes["laser_af_averaging_n"].value()),
-            "displacement_success_window_pixels": int(self.spinboxes["displacement_success_window_pixels"].value()),
             "spot_crop_size": int(self.spinboxes["spot_crop_size"].value()),
             "correlation_threshold": self.spinboxes["correlation_threshold"].value(),
             "pixel_to_um_calibration_distance": self.spinboxes["pixel_to_um_calibration_distance"].value(),
@@ -3660,7 +3648,6 @@ class LaserAutofocusSettingWidget(QWidget):
     def update_threshold_settings(self):
         updates = {
             "laser_af_averaging_n": int(self.spinboxes["laser_af_averaging_n"].value()),
-            "displacement_success_window_pixels": int(self.spinboxes["displacement_success_window_pixels"].value()),
             "correlation_threshold": self.spinboxes["correlation_threshold"].value(),
             "laser_af_range": self.spinboxes["laser_af_range"].value(),
             # The search and confirm settings belong here rather than only on the Initialize path:
@@ -3961,24 +3948,6 @@ class LaserAutofocusSettingWidget(QWidget):
             text += "\nImplausible - the detected spot barely moved and may be a static reflection."
         self.calibration_label.setStyleSheet("color: red;" if implausible else "")
         self.calibration_label.setText(text)
-        self._update_success_window_label()
-
-    def _update_success_window_label(self):
-        """State the accept window in microns as well as pixels.
-
-        The window is configured in pixels because that is what the detector measures, but how
-        much defocus it tolerates depends entirely on the objective -- 300 px is +/-262 um at 20x
-        and a different number everywhere else.
-        """
-        window_px = self.spinboxes["displacement_success_window_pixels"].value()
-        pixel_to_um = self.laserAutofocusController.laser_af_properties.pixel_to_um
-        if not pixel_to_um or not math.isfinite(pixel_to_um):
-            self.success_window_label.setText("Accepts any displacement until pixel_to_um is calibrated.")
-            return
-        self.success_window_label.setText(
-            f"Accepts a spot up to +/-{window_px * abs(pixel_to_um):.0f} um from the reference "
-            f"at {abs(pixel_to_um):.4f} um/px. Beyond that the frame is discarded."
-        )
 
     def clear_labels(self):
         # Remove any existing error or correlation labels
@@ -14320,7 +14289,6 @@ class LaserAFSpotOverlay(QObject):
             candidates=[(c["x"], c["y"]) for c in result.candidates],
             selected=(result.selected_x, result.selected_y) if result.selected_x is not None else None,
             reference_x=result.reference_x,
-            window_px=result.window_px,
             failed=result.failure_reason is not None,
         )
         self._emit_status(result.failure_reason or "")

@@ -416,7 +416,7 @@ def convert_laser_af_json_to_yaml(json_path: Path) -> Optional[LaserAFConfig]:
         "correlation_threshold": data.get("correlation_threshold", 0.9),
         # Legacy line-profile detection fields (y_window, x_window, min_peak_*, spot_spacing,
         # displacement_success_window_um) are dropped: connected-components detection replaced
-        # them and its parameters (cc_*, displacement_success_window_pixels) use _def defaults.
+        # them and its parameters (cc_*) use _def defaults.
         "filter_sigma": data.get("filter_sigma"),
         "focus_camera_exposure_time_ms": data.get("focus_camera_exposure_time_ms", 0.2),
         "focus_camera_analog_gain": data.get("focus_camera_analog_gain", 0.0),
