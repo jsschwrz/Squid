@@ -821,114 +821,107 @@ class LaserAutofocusController(QObject):
             self._log.exception("Turning on AF laser timed out, failed to measure displacement.")
             return finish_with(float("nan"))
 
-        # get laser spot location
-        result = self._get_laser_spot_centroid()
-
-        if result is not None and self.laser_af_properties.confirm_motion_mode == (
-            control._def.LaserAFConfirmMotionMode.ALWAYS
-        ):
-            # This path runs at every FOV of an acquisition, so the extra z step is only taken
-            # when explicitly asked for. A rejection here is not a failure -- it means whatever is
-            # at this z is not the sample reflection, which is a reason to go looking for it.
-            confirmed, reason = self._confirm_spot_moves_with_z(result[0])
-            if not confirmed:
-                self._log.warning(f"First-try candidate {reason}; falling through to the z search.")
-                result = None
-
-        if result is not None:
-            # Spot found on first try
-            try:
-                self._turn_off_laser()
-            except TimeoutError:
-                self._log.exception("Turning off AF laser timed out! Laser may still be on.")
-            return finish_with(self._get_displacement_from_centroid(result))
-
-        self._log.error("Failed to detect laser spot during displacement measurement")
-
-        if not search_for_spot:
-            try:
-                self._turn_off_laser()
-            except TimeoutError:
-                self._log.exception("Turning off AF laser timed out! Laser may still be on.")
-            return finish_with(float("nan"))
-
-        # Search for spot by scanning through z range (laser stays on during search)
-        current_z_um, search_step_um, search_positions_um = self._build_search_positions()
-
-        self._log.info(
-            f"Starting spot search ({'downward' if control._def.LASER_AF_SEARCH_DOWN_FIRST else 'upward'} first): "
-            f"positions {search_positions_um} um"
-        )
-
-        confirm_mode = self.laser_af_properties.confirm_motion_mode
-        confirm_failures = 0
-
-        current_pos_um = current_z_um  # Track where we are
-
-        for target_pos_um in search_positions_um:
-            # Move to target position
-            move_um = target_pos_um - current_pos_um
-            if move_um != 0:
-                self._log.info(f"Z search: moving to {target_pos_um:.1f} um (delta: {move_um:+.1f} um)")
-                self._move_z(move_um)
-                current_pos_um = target_pos_um
-                # Wait for piezo to settle
-                if self.piezo is not None:
-                    time.sleep(control._def.MULTIPOINT_PIEZO_DELAY_MS / 1000)
-            else:
-                self._log.info(f"Z search: checking current position {target_pos_um:.1f} um")
-
-            # Attempt spot detection
+        # Every way out of the measurement -- including one that raises -- has to put the laser
+        # back, so the turn-off lives here rather than being repeated on each return path. It
+        # used to be, and an unexpected exception (a dropped frame reaching image_to_display)
+        # skipped every copy of it and left the laser lit through the FOV's own exposure.
+        try:
+            # get laser spot location
             result = self._get_laser_spot_centroid()
 
-            if result is None:
-                self._log.info(f"Z search: no valid spot at {target_pos_um:.1f} um")
-                continue
-
-            # The first genuine detection wins. There is deliberately no displacement window here:
-            # the crop bounds where a spot can be found at all, move_to_target refuses a
-            # displacement beyond laser_af_range, and the cross-correlation check after the move
-            # restores z if the spot turns out to be the wrong one. A window at this layer added
-            # nothing those cover, and because it was derived from the search step it silently
-            # tightened to 2.8 um when the step was set to 2 um -- discarding real detections at
-            # 3-25 um and making the search succeed only if it happened to land within one step
-            # of focus.
-            displacement_um = self._get_displacement_from_centroid(result)
-
-            if confirm_mode in (
-                control._def.LaserAFConfirmMotionMode.SEARCH_ONLY,
-                control._def.LaserAFConfirmMotionMode.ALWAYS,
+            if result is not None and self.laser_af_properties.confirm_motion_mode == (
+                control._def.LaserAFConfirmMotionMode.ALWAYS
             ):
+                # This path runs at every FOV of an acquisition, so the extra z step is only taken
+                # when explicitly asked for. A rejection here is not a failure -- it means whatever is
+                # at this z is not the sample reflection, which is a reason to go looking for it.
                 confirmed, reason = self._confirm_spot_moves_with_z(result[0])
                 if not confirmed:
-                    confirm_failures += 1
-                    self._log.warning(f"Z search: candidate at {target_pos_um:.1f} um {reason}")
-                    if confirm_failures >= _CONFIRM_MAX_FAILURES:
-                        self._log.error(
-                            f"Candidates were found at {confirm_failures} z positions but none translated "
-                            f"with z. That is the signature of a static back-reflection rather than the "
-                            f"sample reflection. Run Test AF Sweep to see which reflections are in frame."
-                        )
-                        # Fall through to the shared restore-and-NaN tail below.
-                        break
+                    self._log.warning(f"First-try candidate {reason}; falling through to the z search.")
+                    result = None
+
+            if result is not None:
+                # Spot found on first try
+                return finish_with(self._get_displacement_from_centroid(result))
+
+            self._log.error("Failed to detect laser spot during displacement measurement")
+
+            if not search_for_spot:
+                return finish_with(float("nan"))
+
+            # Search for spot by scanning through z range (laser stays on until the finally below)
+            current_z_um, search_step_um, search_positions_um = self._build_search_positions()
+
+            self._log.info(
+                f"Starting spot search ({'downward' if control._def.LASER_AF_SEARCH_DOWN_FIRST else 'upward'} first): "
+                f"positions {search_positions_um} um"
+            )
+
+            confirm_mode = self.laser_af_properties.confirm_motion_mode
+            confirm_failures = 0
+
+            current_pos_um = current_z_um  # Track where we are
+
+            for target_pos_um in search_positions_um:
+                # Move to target position
+                move_um = target_pos_um - current_pos_um
+                if move_um != 0:
+                    self._log.info(f"Z search: moving to {target_pos_um:.1f} um (delta: {move_um:+.1f} um)")
+                    self._move_z(move_um)
+                    current_pos_um = target_pos_um
+                    # Wait for piezo to settle
+                    if self.piezo is not None:
+                        time.sleep(control._def.MULTIPOINT_PIEZO_DELAY_MS / 1000)
+                else:
+                    self._log.info(f"Z search: checking current position {target_pos_um:.1f} um")
+
+                # Attempt spot detection
+                result = self._get_laser_spot_centroid()
+
+                if result is None:
+                    self._log.info(f"Z search: no valid spot at {target_pos_um:.1f} um")
                     continue
 
-            self._log.info(f"Z search: spot found at {target_pos_um:.1f} um, displacement {displacement_um:.1f} um")
+                # The first genuine detection wins. There is deliberately no displacement window here:
+                # the crop bounds where a spot can be found at all, move_to_target refuses a
+                # displacement beyond laser_af_range, and the cross-correlation check after the move
+                # restores z if the spot turns out to be the wrong one. A window at this layer added
+                # nothing those cover, and because it was derived from the search step it silently
+                # tightened to 2.8 um when the step was set to 2 um -- discarding real detections at
+                # 3-25 um and making the search succeed only if it happened to land within one step
+                # of focus.
+                displacement_um = self._get_displacement_from_centroid(result)
+
+                if confirm_mode in (
+                    control._def.LaserAFConfirmMotionMode.SEARCH_ONLY,
+                    control._def.LaserAFConfirmMotionMode.ALWAYS,
+                ):
+                    confirmed, reason = self._confirm_spot_moves_with_z(result[0])
+                    if not confirmed:
+                        confirm_failures += 1
+                        self._log.warning(f"Z search: candidate at {target_pos_um:.1f} um {reason}")
+                        if confirm_failures >= _CONFIRM_MAX_FAILURES:
+                            self._log.error(
+                                f"Candidates were found at {confirm_failures} z positions but none translated "
+                                f"with z. That is the signature of a static back-reflection rather than the "
+                                f"sample reflection. Run Test AF Sweep to see which reflections are in frame."
+                            )
+                            # Fall through to the shared restore-and-NaN tail below.
+                            break
+                        continue
+
+                self._log.info(f"Z search: spot found at {target_pos_um:.1f} um, displacement {displacement_um:.1f} um")
+                return finish_with(displacement_um)
+
+            # Spot not found - move back to original position
+            self._restore_to_position(current_z_um)
+            self._log.warning("Spot not found during z search")
+            return finish_with(float("nan"))
+        finally:
             try:
                 self._turn_off_laser()
             except TimeoutError:
                 self._log.exception("Turning off AF laser timed out! Laser may still be on.")
-            return finish_with(displacement_um)
-
-        # Spot not found - move back to original position
-        self._restore_to_position(current_z_um)
-        self._log.warning("Spot not found during z search")
-
-        try:
-            self._turn_off_laser()
-        except TimeoutError:
-            self._log.exception("Turning off AF laser timed out! Laser may still be on.")
-        return finish_with(float("nan"))
 
     def _save_current_config(self) -> None:
         """Persist laser_af_properties, converting x_reference back to the on-disk frame.
@@ -1608,8 +1601,15 @@ class LaserAutofocusController(QObject):
                 )
                 continue
 
-        # optionally display the image
-        if control._def.LASER_AF_DISPLAY_SPOT_IMAGE:
+        # Optionally display the image. Deliberately still ahead of the detection check below --
+        # a frame that produced no detection is exactly the frame worth looking at.
+        #
+        # `image` is None when the read on the final pass timed out, and emitting None on a
+        # numpy.ndarray signal raises. That raise used to escape the whole measurement: two good
+        # detections were already averaged and waiting three lines below, and a display-only line
+        # threw them away, failed AF for the FOV and left the laser on. A dropped frame must cost
+        # one pass of averaging, nothing more.
+        if control._def.LASER_AF_DISPLAY_SPOT_IMAGE and image is not None:
             self.image_to_display.emit(image)
 
         # Check if we got enough successful detections

@@ -1293,3 +1293,117 @@ class TestCalibrationDistanceFitsThePiezo:
         controller = self._controller(100.0, piezo=MagicMock(position=10.0, range_um=300.0))
 
         assert not controller._calibration_distance_fits()
+class _StrictImageSignal:
+    """Stands in for image_to_display, which is typed numpy.ndarray and rejects None.
+
+    A MagicMock would swallow the exact call that took down a whole acquisition FOV, so this
+    reproduces PyQt's own type check instead.
+    """
+
+    def __init__(self):
+        self.emitted = []
+
+    def emit(self, image):
+        if not isinstance(image, np.ndarray):
+            raise TypeError(
+                "LaserAutofocusController.image_to_display[numpy.ndarray].emit(): "
+                f"argument 1 has unexpected type '{type(image).__name__}'"
+            )
+        self.emitted.append(image)
+
+
+def _controller_for_frames(frames, **config_overrides):
+    """A controller whose focus camera hands back exactly `frames`, one per read."""
+    config = LaserAFConfig(
+        spot_detection_mode=SpotDetectionMode.SINGLE,
+        laser_af_averaging_n=len(frames),
+        **config_overrides,
+    )
+    controller = _make_controller(config)
+    controller.microcontroller = MagicMock()
+    controller.camera.read_frame.side_effect = list(frames)
+    controller.image_to_display = _StrictImageSignal()
+    controller.signal_displacement_um = MagicMock()
+    return controller
+
+
+class TestDroppedFrameDuringAveraging:
+    """A frame the camera fails to deliver must cost one pass of averaging, nothing more.
+
+    From the 2026-08-21 acquisition: the focus camera missed frame 3 of 3, `image` was left None,
+    and the display emit below the loop raised TypeError -- discarding two good detections that
+    were already averaged, failing AF for that FOV, and leaving the laser on because the raise
+    skipped the turn-off.
+    """
+
+    def test_a_missed_last_frame_still_returns_the_good_detections(self):
+        spot = create_test_image([(320, 240)])
+        controller = _controller_for_frames([spot, spot, None])
+
+        result = controller._get_laser_spot_centroid()
+
+        assert result is not None, "two good frames must still produce a centroid"
+        assert result[0] == pytest.approx(320, abs=2)
+        assert result[1] == pytest.approx(240, abs=2)
+
+    def test_a_missed_last_frame_displays_nothing_rather_than_raising(self):
+        spot = create_test_image([(320, 240)])
+        controller = _controller_for_frames([spot, spot, None])
+
+        controller._get_laser_spot_centroid()
+
+        assert controller.image_to_display.emitted == []
+
+    def test_a_frame_that_arrives_is_still_displayed(self):
+        """The guard must not cost the normal case its preview."""
+        spot = create_test_image([(320, 240)])
+        controller = _controller_for_frames([spot, spot, spot])
+
+        controller._get_laser_spot_centroid()
+
+        assert len(controller.image_to_display.emitted) == 1
+
+    def test_every_frame_missed_reports_failure_without_raising(self):
+        controller = _controller_for_frames([None, None, None])
+
+        assert controller._get_laser_spot_centroid() is None
+        assert controller.image_to_display.emitted == []
+
+
+class TestLaserIsAlwaysTurnedOff:
+    """The laser must not outlive the measurement, on any path.
+
+    It used to be turned off once per return path and not at all on a raise, so an unexpected
+    exception left it lit through the FOV's own exposure.
+    """
+
+    def _controller(self):
+        controller = _make_controller(LaserAFConfig(x_reference=100.0, has_reference=True))
+        controller.microcontroller = MagicMock()
+        controller.signal_displacement_um = MagicMock()
+        return controller
+
+    def test_turned_off_when_the_measurement_raises(self):
+        controller = self._controller()
+        controller._get_laser_spot_centroid = MagicMock(side_effect=RuntimeError("dropped frame"))
+
+        with pytest.raises(RuntimeError):
+            controller.measure_displacement()
+
+        controller.microcontroller.turn_on_AF_laser.assert_called_once()
+        controller.microcontroller.turn_off_AF_laser.assert_called_once()
+
+    def test_turned_off_on_a_normal_measurement(self):
+        controller = self._controller()
+        controller._get_laser_spot_centroid = MagicMock(return_value=(120.0, 50.0))
+
+        controller.measure_displacement()
+
+        controller.microcontroller.turn_off_AF_laser.assert_called_once()
+
+    def test_turned_off_when_no_spot_is_found_and_no_search_is_allowed(self):
+        controller = self._controller()
+        controller._get_laser_spot_centroid = MagicMock(return_value=None)
+
+        assert math.isnan(controller.measure_displacement(search_for_spot=False))
+        controller.microcontroller.turn_off_AF_laser.assert_called_once()
