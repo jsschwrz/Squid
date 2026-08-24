@@ -959,6 +959,27 @@ LASER_AF_CC_MIN_AREA = 5  # Minimum component area in pixels
 LASER_AF_CC_MAX_AREA = 5000  # Maximum component area in pixels
 LASER_AF_CC_ROW_TOLERANCE = 50  # Allowed deviation from expected row (pixels)
 LASER_AF_CC_MAX_ASPECT_RATIO = 2.5  # Maximum aspect ratio (width/height or height/width)
+
+# Live spot-detection diagnostics. These tune how the detector explains a failure to the operator;
+# none of them change what it accepts.
+# How many rejected components a diagnosis may describe. Capped because an over-exposed full-sensor
+# frame yields tens of thousands, and only the few closest to passing are worth reading.
+LASER_AF_DIAG_MAX_REJECTS = 5
+# Above this many components the frame is noise rather than a scene with spots in it, and the useful
+# answer is "raise the threshold", not a list of blobs.
+LASER_AF_DIAG_MAX_COMPONENTS = 5000
+# Gray levels of peak-above-median below which a frame carries no signal at all. Binarizing one of
+# these labels the whole sensor, so diagnosis stops here and reports the frame as uniform.
+LASER_AF_DIAG_MIN_CONTRAST = 3
+# Noise multiple (of the median absolute deviation) used to pick a threshold below the configured
+# one, for the single case where nothing at all cleared cc_threshold and the blob must still be
+# located to be described.
+LASER_AF_DIAG_NOISE_K = 3.0
+# How many times the area ceiling a blob may be before the "what threshold would separate this
+# merged spot" search is skipped. A spot fused with its halo runs a few times the ceiling; a blob
+# tens of times over it is the background, not a merge, and searching a frame-sized blob costs a
+# quarter of a second for an answer that was never going to be "raise the threshold a little".
+LASER_AF_DIAG_SEPARATION_MAX_AREA_FACTOR = 20
 SHOW_LEGACY_DISPLACEMENT_MEASUREMENT_WINDOWS = False
 LASER_AF_FILTER_SIGMA = 1  # Sigma for Gaussian filter before spot detection
 LASER_AF_INITIALIZE_CROP_WIDTH = 1200

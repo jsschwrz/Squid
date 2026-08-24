@@ -898,6 +898,8 @@ class ImageDisplayWindow(QMainWindow):
         self.spot_candidates_item = None  # every spot the detector found in frame
         self.spot_selected_item = None  # the one the configured spot detection mode picked
         self.spot_reference_line = None  # x_reference, i.e. the focus plane
+        self.spot_rejected_item = None  # blobs the cc_* filters turned away
+        self.spot_reject_label_item = None  # what turned the closest of them away
 
         # Create main layout
         layout = QVBoxLayout()
@@ -1545,10 +1547,10 @@ class ImageDisplayWindow(QMainWindow):
     # the same color on the image as it does on the sweep plot.
     _SPOT_CANDIDATE_BRUSH = (150, 150, 150, 180)
     _SPOT_SELECTED_BRUSH = (0, 140, 255, 220)
-    # Latent since the displacement window was retired: every failure classify_frame_spots can
-    # report now leaves `selected` None, so there is nothing to recolor. Kept because `failed` is
-    # derived from failure_reason at the call site and stays correct on its own -- a failure mode
-    # that does pick a spot would light this up without needing the path rebuilt.
+    # The failure color. It recolors `selected` on a failure that still picked a spot -- latent
+    # since the displacement window was retired, but kept because `failed` is derived from
+    # failure_reason at the call site and stays correct on its own. It is also what the rejected
+    # blobs are drawn in, which is the same statement: this is what the detector would not use.
     _SPOT_FAILED_BRUSH = (255, 60, 60, 230)
 
     def _ensure_spot_overlay_items(self):
@@ -1567,12 +1569,21 @@ class ImageDisplayWindow(QMainWindow):
             size=18, pen=pg.mkPen(self._SPOT_SELECTED_BRUSH, width=2), brush=None, symbol="+"
         )
         self.spot_reference_line = pg.InfiniteLine(angle=90, movable=False, pen=pg.mkPen("g", style=Qt.DashLine))
+        self.spot_rejected_item = pg.ScatterPlotItem(
+            size=14, pen=pg.mkPen(self._SPOT_FAILED_BRUSH, width=1), brush=None, symbol="x"
+        )
+        # One label, for the reject closest to passing -- not one per blob. Every other item here
+        # is created once and driven by setData; a pool of text items rebuilt per frame would be
+        # churn at the overlay's rate for something only the nearest miss needs said about it.
+        self.spot_reject_label_item = pg.TextItem(color=self._SPOT_FAILED_BRUSH, anchor=(0, 1))
 
         view = self._active_view()
         for item in (
             self.spot_reference_line,
             self.spot_candidates_item,
             self.spot_selected_item,
+            self.spot_rejected_item,
+            self.spot_reject_label_item,
         ):
             if item.zValue() == 0:
                 item.setZValue(21)  # above the crosshair (20) and the ROI (10)
@@ -1586,7 +1597,9 @@ class ImageDisplayWindow(QMainWindow):
             # ignoreBounds so turning the overlay on never changes the current zoom.
             view.addItem(item, ignoreBounds=True)
 
-    def set_spot_overlay(self, candidates=None, selected=None, reference_x=None, failed=False):
+    def set_spot_overlay(
+        self, candidates=None, selected=None, reference_x=None, failed=False, rejects=None, reject_label=None
+    ):
         """Draw what the laser AF detector made of the frame currently on display.
 
         Coordinates are pixels of the displayed frame. The ImageItem sits at the origin with no
@@ -1597,6 +1610,11 @@ class ImageDisplayWindow(QMainWindow):
         candidates: sequence of (x, y) for every spot in frame; selected: the (x, y) the
         configured mode picked, or None; reference_x: the focus plane, omitted when no reference
         has been set; failed: draw the selection in the failure color.
+
+        rejects: sequence of (x, y) for blobs the cc_* filters turned away, and reject_label an
+        (x, y, text) naming what turned the nearest one away. Drawing the rejects is the point:
+        knowing a setting is too tight is far easier to act on when you can see the thing it
+        excluded sitting where the spot ought to be.
         """
         self._ensure_spot_overlay_items()
 
@@ -1623,16 +1641,40 @@ class ImageDisplayWindow(QMainWindow):
         else:
             self.spot_reference_line.hide()
 
+        rejects = list(rejects or [])
+        if rejects:
+            self.spot_rejected_item.setData([float(r[0]) for r in rejects], [float(r[1]) for r in rejects])
+            self.spot_rejected_item.show()
+        else:
+            self.spot_rejected_item.setData([], [])
+            self.spot_rejected_item.hide()
+
+        if reject_label is not None:
+            x, y, text = float(reject_label[0]), float(reject_label[1]), str(reject_label[2])
+            # Anchor away from the nearer edge. A label anchored left on a blob at the right edge
+            # renders outside the view and is simply invisible -- and the spot leaving frame to one
+            # side is precisely when a reject appears there.
+            width = self.graphics_widget.img.image.shape[1] if self.graphics_widget.img.image is not None else 0
+            self.spot_reject_label_item.setAnchor((1, 1) if width and x > width / 2 else (0, 1))
+            self.spot_reject_label_item.setText(text)
+            self.spot_reject_label_item.setPos(x, y)
+            self.spot_reject_label_item.show()
+        else:
+            self.spot_reject_label_item.hide()
+
     def clear_spot_overlay(self):
         """Hide every overlay item. Safe before any overlay has been drawn."""
         if self.spot_candidates_item is None:
             return
         self.spot_candidates_item.setData([], [])
         self.spot_selected_item.setData([], [])
+        self.spot_rejected_item.setData([], [])
         for item in (
             self.spot_candidates_item,
             self.spot_selected_item,
             self.spot_reference_line,
+            self.spot_rejected_item,
+            self.spot_reject_label_item,
         ):
             item.hide()
 

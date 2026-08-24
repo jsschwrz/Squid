@@ -637,7 +637,16 @@ class TestFindAllSpotLocations:
         # Retained across a long sweep, one boolean frame per candidate is a real memory cost.
         candidate = utils.find_all_spot_locations(create_test_image([(200, 240)]))[0]
         assert "mask" not in candidate
-        assert set(candidate) == {"x", "y", "col", "row", "area", "intensity", "aspect_ratio"}
+        assert set(candidate) == {
+            "x",
+            "y",
+            "col",
+            "row",
+            "area",
+            "intensity",
+            "peak_intensity",
+            "aspect_ratio",
+        }
 
     def test_blank_frame_returns_empty_rather_than_raising(self):
         # A z position where nothing is visible is ordinary sweep data, not an error.

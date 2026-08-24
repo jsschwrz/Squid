@@ -1774,6 +1774,9 @@ class HighContentScreeningGui(QMainWindow):
             self.laserAutofocusSettingWidget.signal_live_detection_rate.connect(self.laserAFSpotOverlay.set_rate_hz)
             self.laserAFSpotOverlay.signal_status.connect(self.laserAutofocusSettingWidget.show_live_detection_status)
             self.laserAFSpotOverlay.signal_spot_detected.connect(self.laserAutofocusSettingWidget.on_live_spot_detected)
+            self.laserAFSpotOverlay.signal_detection_result.connect(
+                self.laserAutofocusSettingWidget.on_live_detection_result
+            )
             # The checkbox defaults to on, and the overlay defaults to off, so seed it the way
             # the autolevel checkbox above is seeded.
             self.laserAFSpotOverlay.set_enabled(self.laserAutofocusSettingWidget.live_detection_checkbox.isChecked())

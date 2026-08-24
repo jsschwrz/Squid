@@ -1,5 +1,6 @@
 import collections
 import enum
+import math
 import inspect
 import pathlib
 import sys
@@ -7,7 +8,7 @@ import shutil
 import statistics
 import time
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import cv2
 import git
@@ -16,7 +17,7 @@ import numpy as np
 from scipy.ndimage import label, gaussian_filter
 from scipy import signal
 import os
-from typing import Optional, Tuple, List, Callable
+from typing import Any, Dict, Optional, Tuple, List, Callable
 
 from control._def import (
     LASER_AF_CC_THRESHOLD,
@@ -24,6 +25,11 @@ from control._def import (
     LASER_AF_CC_MAX_AREA,
     LASER_AF_CC_ROW_TOLERANCE,
     LASER_AF_CC_MAX_ASPECT_RATIO,
+    LASER_AF_DIAG_MAX_REJECTS,
+    LASER_AF_DIAG_MAX_COMPONENTS,
+    LASER_AF_DIAG_MIN_CONTRAST,
+    LASER_AF_DIAG_NOISE_K,
+    LASER_AF_DIAG_SEPARATION_MAX_AREA_FACTOR,
     SpotDetectionMode,
     FocusMeasureOperator,
 )
@@ -247,16 +253,28 @@ def _resolve_spot_detection_params(params: Optional[dict]) -> dict:
     return resolved
 
 
+def _build_working_image(image: np.ndarray, filter_sigma: Optional[int]) -> np.ndarray:
+    """The frame every measurement is actually taken on: optionally Gaussian-filtered, uint8.
+
+    Split out from _prepare_working_image so a diagnosis can look at a frame the detector would
+    have refused. It is also the expensive step -- a float64 copy plus a Gaussian, tens of
+    milliseconds on a full-sensor crop -- so a caller that needs both a detection and a diagnosis
+    of the same frame must build this once and pass it to both.
+    """
+    working_image = image.copy()
+    if filter_sigma is not None and filter_sigma > 0:
+        filtered = gaussian_filter(working_image.astype(float), sigma=filter_sigma)
+        working_image = np.clip(filtered, 0, 255).astype(np.uint8)
+    return working_image
+
+
 def _prepare_working_image(image: np.ndarray, filter_sigma: Optional[int], threshold: float) -> np.ndarray:
     """Optionally Gaussian-filter the frame, then reject it if nothing is above threshold.
 
     Raises:
         ValueError: if the brightest pixel is at or below the threshold.
     """
-    working_image = image.copy()
-    if filter_sigma is not None and filter_sigma > 0:
-        filtered = gaussian_filter(working_image.astype(float), sigma=filter_sigma)
-        working_image = np.clip(filtered, 0, 255).astype(np.uint8)
+    working_image = _build_working_image(image, filter_sigma)
 
     # Quick check - if max intensity below threshold, no spot visible
     if working_image.max() <= threshold:
@@ -265,12 +283,46 @@ def _prepare_working_image(image: np.ndarray, filter_sigma: Optional[int], thres
     return working_image
 
 
-def _collect_valid_spots(working_image: np.ndarray, p: dict) -> Tuple[List[dict], np.ndarray, np.ndarray, int, float]:
+@dataclass
+class _FrameComponents:
+    """Per-component measurements for every connected component in one frame, in label order.
+
+    Index j here is label j+1; label 0 is the background. Held as parallel numpy arrays rather
+    than a list of dicts because the whole point is to test the filters without a Python loop --
+    an over-exposed full-sensor frame yields tens of thousands of components, and the per-
+    component `labels == i` comparison is a full-frame operation. Only the handful actually
+    reported are ever materialized.
+    """
+
+    areas: np.ndarray  # int64, pixels
+    row_deviations: np.ndarray  # float, |centroid row - expected row|
+    aspect_ratios: np.ndarray  # float, always >= 1
+    cols: np.ndarray  # float, centroid column
+    rows: np.ndarray  # float, centroid row
+    bboxes: np.ndarray  # int, (N, 4) of left, top, width, height -- lets a reject be inspected
+    failure_counts: np.ndarray  # int64, how many cc_* filters each component fails
+    reject_indices: np.ndarray  # int, the few worth describing, closest-to-passing first
+
+
+def _collect_valid_spots(
+    working_image: np.ndarray, p: dict, collect_rejects: bool = False
+) -> Tuple[List[dict], np.ndarray, np.ndarray, int, float, Optional[_FrameComponents]]:
     """Binarize, label, and filter connected components down to plausible spot candidates.
 
-    Returns (valid_spots sorted left-to-right by column, binary, labels, num_labels, expected_row).
-    Each candidate carries its boolean `mask`, which callers that retain candidates should drop --
-    it is a full-frame array per candidate.
+    Returns (valid_spots sorted left-to-right by column, binary, labels, num_labels, expected_row,
+    components). Each candidate carries its boolean `mask`, which callers that retain candidates
+    should drop -- it is a full-frame array per candidate.
+
+    `components` is None unless collect_rejects is set. It carries what every component measured
+    and how many filters turned it away, which is what lets a failed frame name the setting to
+    change rather than only reporting that it failed. Recording rejections here rather than in a
+    separate pass is deliberate: one function then decides what a rejection is, so the live
+    diagnosis cannot drift out of agreement with the detector it is explaining.
+
+    The filters are evaluated as whole-array numpy predicates, and `labels == i` is run only for
+    survivors. That is load-bearing, not style: it is a full-frame boolean comparison, and running
+    it across the tens of thousands of components a noisy full-sensor frame produces would take
+    minutes on the GUI thread.
     """
     # Binarize the image
     binary = (working_image > p["threshold"]).astype(np.uint8)
@@ -281,27 +333,33 @@ def _collect_valid_spots(working_image: np.ndarray, p: dict) -> Tuple[List[dict]
     # Expected row position (center of image)
     expected_row = working_image.shape[0] / 2.0
 
-    # Filter valid components and collect spot candidates
+    areas = stats[1:, cv2.CC_STAT_AREA].astype(np.int64)  # skip background (label 0)
+    widths = stats[1:, cv2.CC_STAT_WIDTH].astype(np.float64)
+    heights = stats[1:, cv2.CC_STAT_HEIGHT].astype(np.float64)
+    cols = centroids[1:, 0].astype(np.float64)
+    rows = centroids[1:, 1].astype(np.float64)
+
+    # Aspect ratio (max of w/h or h/w, so always >= 1). A zero extent cannot occur for a real
+    # label; treating it as infinite keeps a degenerate one out instead of raising.
+    with np.errstate(divide="ignore", invalid="ignore"):
+        aspect_ratios = np.maximum(widths / heights, heights / widths)
+    aspect_ratios[~np.isfinite(aspect_ratios)] = np.inf
+
+    row_deviations = np.abs(rows - expected_row)
+
+    # Size, row position and aspect ratio filters, counted rather than short-circuited. The count
+    # is what tells "one setting away" from "nothing like a spot", and a caller that relaxes a
+    # setting needs every failure, not just the first one.
+    failure_counts = (
+        (areas < p["min_area"]).astype(np.int64)
+        + (areas > p["max_area"])
+        + (row_deviations > p["row_tolerance"])
+        + (aspect_ratios > p["max_aspect_ratio"])
+    )
+
     valid_spots = []
-    for i in range(1, num_labels):  # Skip background (label 0)
-        area = stats[i, cv2.CC_STAT_AREA]
-        cx, cy = centroids[i]
-        width = stats[i, cv2.CC_STAT_WIDTH]
-        height = stats[i, cv2.CC_STAT_HEIGHT]
-
-        # Size filter
-        if area < p["min_area"] or area > p["max_area"]:
-            continue
-
-        # Row position filter
-        if abs(cy - expected_row) > p["row_tolerance"]:
-            continue
-
-        # Aspect ratio filter (max of w/h or h/w, so always >= 1)
-        aspect_ratio = max(width / height, height / width) if height > 0 and width > 0 else float("inf")
-        if aspect_ratio > p["max_aspect_ratio"]:
-            continue
-
+    for j in np.flatnonzero(failure_counts == 0):
+        i = int(j) + 1
         # Calculate mean intensity of this component for sorting
         component_mask = labels == i
         intensity = working_image[component_mask].mean()
@@ -309,11 +367,11 @@ def _collect_valid_spots(working_image: np.ndarray, p: dict) -> Tuple[List[dict]
         valid_spots.append(
             {
                 "label": i,
-                "col": cx,
-                "row": cy,
-                "area": area,
+                "col": float(cols[j]),
+                "row": float(rows[j]),
+                "area": int(areas[j]),
                 "intensity": intensity,
-                "aspect_ratio": aspect_ratio,
+                "aspect_ratio": float(aspect_ratios[j]),
                 "mask": component_mask,
             }
         )
@@ -321,7 +379,24 @@ def _collect_valid_spots(working_image: np.ndarray, p: dict) -> Tuple[List[dict]
     # Sort spots by x-coordinate (column) for mode-based selection
     valid_spots.sort(key=lambda s: s["col"])
 
-    return valid_spots, binary, labels, num_labels, expected_row
+    components = None
+    if collect_rejects:
+        rejected = np.flatnonzero(failure_counts > 0)
+        # Fewest failures first, then largest: closest to passing is the one whose settings are
+        # worth naming, and among equals the biggest blob is the one the operator can see.
+        order = np.lexsort((-areas[rejected], failure_counts[rejected]))
+        components = _FrameComponents(
+            areas=areas,
+            row_deviations=row_deviations,
+            aspect_ratios=aspect_ratios,
+            cols=cols,
+            rows=rows,
+            bboxes=stats[1:, [cv2.CC_STAT_LEFT, cv2.CC_STAT_TOP, cv2.CC_STAT_WIDTH, cv2.CC_STAT_HEIGHT]],
+            failure_counts=failure_counts,
+            reject_indices=rejected[order][:LASER_AF_DIAG_MAX_REJECTS],
+        )
+
+    return valid_spots, binary, labels, num_labels, expected_row, components
 
 
 def select_spot_by_mode(sorted_spots: List[dict], mode: SpotDetectionMode) -> dict:
@@ -377,9 +452,9 @@ def find_all_spot_locations(
 
     Unlike find_spot_location this never raises for an empty or spotless frame -- a z position
     where nothing is visible is ordinary data for a sweep, not an error. Returned dicts carry
-    x, y (sub-pixel weighted centroid, in the frame's own coordinates), col, row, area, intensity
-    and aspect_ratio; the internal boolean mask is dropped, since retaining one full-frame array
-    per candidate across a long sweep would be a real memory cost.
+    x, y (sub-pixel weighted centroid, in the frame's own coordinates), col, row, area, intensity,
+    peak_intensity and aspect_ratio; the internal boolean mask is dropped, since retaining one
+    full-frame array per candidate across a long sweep would be a real memory cost.
 
     Over-exposed frames can yield very many components, so the list is capped at max_candidates,
     keeping the brightest.
@@ -388,14 +463,25 @@ def find_all_spot_locations(
         raise ValueError("Invalid input image")
 
     p = _resolve_spot_detection_params(params)
+    return _candidates_from_working(_build_working_image(image, filter_sigma), p, max_candidates)
 
-    try:
-        working_image = _prepare_working_image(image, filter_sigma, p["threshold"])
-    except ValueError:
+
+def _candidates_from_working(working_image: np.ndarray, p: dict, max_candidates: int = 32) -> List[dict]:
+    """find_all_spot_locations once the working image already exists."""
+    if working_image.max() <= p["threshold"]:
         return []
+    valid_spots, _, _, _, _, _ = _collect_valid_spots(working_image, p)
+    return _candidates_from_valid_spots(working_image, valid_spots, max_candidates)
 
-    valid_spots, _, _, _, _ = _collect_valid_spots(working_image, p)
 
+def _candidates_from_valid_spots(working_image: np.ndarray, valid_spots: List[dict], max_candidates: int) -> List[dict]:
+    """Turn surviving components into candidate dicts, dropping their full-frame masks.
+
+    Split out so a caller that already ran _collect_valid_spots -- to get rejects out of the same
+    pass -- does not run it a second time. Binarizing and labelling a full sensor is a couple of
+    hundred milliseconds, and doing it twice per frame on the GUI thread is what makes Reset to
+    Full Sensor feel broken.
+    """
     if len(valid_spots) > max_candidates:
         valid_spots = sorted(valid_spots, key=lambda s: s["intensity"], reverse=True)[:max_candidates]
         valid_spots.sort(key=lambda s: s["col"])
@@ -411,10 +497,650 @@ def find_all_spot_locations(
                 "row": float(spot["row"]),
                 "area": int(spot["area"]),
                 "intensity": float(spot["intensity"]),
+                # Peak as well as mean, because the threshold filter is a test on the peak: a
+                # large dim blob and a small bright one have the same mean and behave completely
+                # differently when cc_threshold moves.
+                "peak_intensity": float(working_image[spot["mask"]].max()),
                 "aspect_ratio": float(spot["aspect_ratio"]),
             }
         )
     return candidates
+
+
+# The cc_* field a criterion names, and the parameter key the detector reads it under.
+_CC_FIELD_TO_PARAM = {
+    "cc_threshold": "threshold",
+    "cc_min_area": "min_area",
+    "cc_max_area": "max_area",
+    "cc_row_tolerance": "row_tolerance",
+    "cc_max_aspect_ratio": "max_aspect_ratio",
+}
+
+# Mirror of the spinbox ranges in LaserAutofocusSettingWidget.init_ui (the cc_* block in
+# widgets.py). (minimum, maximum, decimals). A suggestion outside these cannot be typed in, so a
+# suggestion that ignores them is worse than no suggestion at all: the operator clicks Relax,
+# presses Apply, and nothing changes. Kept here rather than imported because utils must not depend
+# on the GUI; if the spinbox ranges ever move, these move with them.
+#
+# cc_row_tolerance is the exception: its useful range depends on the crop, so the value here is
+# only the floor. See _row_tolerance_ceiling.
+_CC_SPINBOX_LIMITS = {
+    "cc_threshold": (0.0, 255.0, 0),
+    "cc_min_area": (1.0, 1000.0, 0),
+    "cc_max_area": (100.0, 50000.0, 0),
+    "cc_row_tolerance": (1.0, 200.0, 0),
+    "cc_max_aspect_ratio": (1.0, 10.0, 1),
+}
+
+
+@dataclass
+class SpotCriterion:
+    """One filter verdict on one blob, with the value that would change the verdict.
+
+    `suggested` is None when no value the spinbox can hold would admit the blob. That is not the
+    same as "no advice": it means the answer is somewhere else entirely -- usually the crop -- and
+    `alternative` says where. Offering a clamped value instead would be the worst outcome, since it
+    looks like a fix and changes nothing.
+    """
+
+    name: str  # the config field, e.g. "cc_min_area", so advice can name the spinbox
+    label: str  # what to call it in a table, e.g. "area"
+    measured: float
+    limit: float
+    passed: bool
+    suggested: Optional[float] = None
+    alternative: Optional[str] = None
+
+
+@dataclass
+class SpotReject:
+    """A blob the detector threw away, and every reason it did.
+
+    All five criteria are always present, never short-circuited at the first failure. A record
+    built by short-circuiting would break the one thing this exists for: relaxing a single setting
+    and finding the blob still rejected by the next one.
+    """
+
+    x: float
+    y: float
+    area: int
+    peak_intensity: float
+    aspect_ratio: float
+    row_deviation: float
+    criteria: List[SpotCriterion] = field(default_factory=list)
+    # Set when the blob had to be found below cc_threshold to be described at all, in which case
+    # area and shape are measured at that lower threshold and overstate what the detector sees.
+    measured_at_relaxed_threshold: Optional[float] = None
+
+    @property
+    def failures(self) -> List[SpotCriterion]:
+        return [c for c in self.criteria if not c.passed]
+
+
+@dataclass
+class SpotDiagnosis:
+    """Why a frame produced no usable spot, in terms of the settings that decide it."""
+
+    frame_peak_intensity: float  # of the working image, i.e. AFTER the Gaussian filter
+    frame_median: float
+    rejects: List[SpotReject] = field(default_factory=list)  # closest to passing first
+    also_admits: int = 0  # other blobs the best reject suggestion would also let in
+    note: Optional[str] = None  # set when no per-blob answer applies; see diagnose_frame
+
+    @property
+    def best(self) -> Optional[SpotReject]:
+        return self.rejects[0] if self.rejects else None
+
+    def suggested_params(self) -> Dict[str, float]:
+        """Every cc_* value that would admit the best reject, ready for the spinboxes.
+
+        Empty when there is nothing to suggest, which is what disables the Relax button. All
+        failing criteria at once, because fixing them one at a time does not work.
+        """
+        best = self.best
+        if best is None:
+            return {}
+        return {c.name: c.suggested for c in best.failures if c.suggested is not None}
+
+
+def _row_tolerance_ceiling(frame_height: Optional[float] = None) -> float:
+    """The largest row tolerance worth offering for a frame this tall.
+
+    Row deviation is measured from the middle of the crop, so it cannot exceed half the crop
+    height: a tolerance set there accepts any blob the frame can contain. A fixed ceiling therefore
+    means something different on every crop -- on the stock 256-tall crop it is already unreachable,
+    while on a full sensor it cuts off at a fifth of what a blob can actually measure, so a spot
+    plainly visible near the top of the frame could not be admitted at all.
+
+    Never returns less than the static floor, so widening the crop can raise this but narrowing it
+    can never silently clamp a value an objective already has saved.
+    """
+    static_max = _CC_SPINBOX_LIMITS["cc_row_tolerance"][1]
+    if frame_height is None or not math.isfinite(frame_height) or frame_height <= 0:
+        return static_max
+    return max(static_max, float(math.ceil(frame_height / 2.0)))
+
+
+def _round_to_admit(name: str, value: float, direction: int, high_override: Optional[float] = None) -> Optional[float]:
+    """Round `value` onto the spinbox grid in the direction that admits the blob.
+
+    direction +1 rounds up (for limits that must reach at least `value`), -1 rounds down. Returns
+    None if the result falls outside the spinbox range, because a clamped value that still rejects
+    the blob is worse than admitting there is no answer here.
+
+    Rounding to nearest is the trap this exists to avoid: aspect ratio has one decimal, so a blob
+    at 2.63 "suggested" as 2.6 is still rejected, and the operator clicks Relax, presses Apply, and
+    sees no change at all.
+
+    A value already on the grid is kept exactly, not pushed a further step. That matters at the
+    ends of the ranges: a 1-pixel blob wants cc_min_area = 1, and a step past it lands outside the
+    spinbox and turns a perfectly good suggestion into "no answer". The epsilon absorbs binary
+    representation error only -- 2.5 held as 2.4999999996 must still round to 2.5, not to 2.6.
+
+    Falling off one end of the range is fine and falling off the other is fatal, and which is which
+    depends on the direction. A ceiling that must reach at least `value` is only ever helped by
+    being larger, so a result under the spinbox minimum is raised to it -- cc_max_area cannot be
+    set below 100, and 100 admits a 45-pixel blob perfectly well. A result past the maximum is the
+    fatal one: no reachable value admits the blob, and saying so is the whole point of returning
+    None rather than a number that will not work.
+    """
+    low, high, decimals = _CC_SPINBOX_LIMITS[name]
+    if high_override is not None:
+        high = high_override
+    scale = 10.0**decimals
+    scaled = value * scale
+    stepped = math.ceil(scaled - 1e-9) if direction > 0 else math.floor(scaled + 1e-9)
+    result = stepped / scale
+
+    if direction > 0:
+        if result > high:
+            return None
+        return max(result, low)
+    if result < low:
+        return None
+    return min(result, high)
+
+
+def evaluate_spot_criteria(
+    *,
+    peak_intensity: float,
+    area: int,
+    row_deviation: float,
+    aspect_ratio: float,
+    params: Optional[dict] = None,
+    frame_median: float = 0.0,
+    frame_height: Optional[float] = None,
+    max_area_alternative: Optional[str] = None,
+) -> List[SpotCriterion]:
+    """The five filters applied to one blob measurements, each with its margin and its fix.
+
+    Used for both halves of the live feedback: on a blob that passed it reports headroom, so a
+    dropout is visible coming; on one that was rejected it reports which setting to change. One
+    function, so the two readings cannot disagree.
+    """
+    p = _resolve_spot_detection_params(params)
+    criteria: List[SpotCriterion] = []
+
+    # -- cc_threshold. The test is strict (working > threshold), so a suggestion equal to the peak
+    #    still rejects. Aim between the blob and the frame background rather than just under the
+    #    peak, so ordinary frame-to-frame flicker does not immediately undo the fix.
+    threshold_passed = peak_intensity > p["threshold"]
+    suggested = alternative = None
+    if not threshold_passed:
+        ceiling = math.floor(peak_intensity) - 1.0
+        if ceiling < _CC_SPINBOX_LIMITS["cc_threshold"][0]:
+            alternative = (
+                "This blob is barely above the noise floor. Raise the focus camera exposure or "
+                "analog gain rather than lowering the threshold onto the noise."
+            )
+        else:
+            target = min((peak_intensity + frame_median) / 2.0, ceiling)
+            suggested = _round_to_admit("cc_threshold", target, -1)
+            if suggested is None or suggested > ceiling:
+                suggested = _round_to_admit("cc_threshold", ceiling, -1)
+    criteria.append(
+        SpotCriterion(
+            name="cc_threshold",
+            label="peak intensity",
+            measured=float(peak_intensity),
+            limit=float(p["threshold"]),
+            passed=threshold_passed,
+            suggested=suggested,
+            alternative=alternative,
+        )
+    )
+
+    # -- cc_min_area
+    min_passed = area >= p["min_area"]
+    suggested = alternative = None
+    if not min_passed:
+        suggested = _round_to_admit("cc_min_area", float(area), -1)
+        if suggested is None:
+            alternative = "This blob is smaller than the smallest area the detector can be set to accept."
+    criteria.append(
+        SpotCriterion(
+            name="cc_min_area",
+            label="area",
+            measured=float(area),
+            limit=float(p["min_area"]),
+            passed=min_passed,
+            suggested=suggested,
+            alternative=alternative,
+        )
+    )
+
+    # -- cc_max_area. Raising the ceiling is usually the wrong fix: a blob this large is normally
+    #    the spot merged with a halo, and the right move is to raise the threshold until it
+    #    separates. max_area_alternative carries that finding when the caller computed it.
+    max_passed = area <= p["max_area"]
+    suggested = alternative = None
+    if not max_passed:
+        suggested = _round_to_admit("cc_max_area", float(area), 1)
+        alternative = max_area_alternative
+        if suggested is None and alternative is None:
+            alternative = (
+                "This blob is larger than the largest area the detector can be set to accept -- it "
+                "is a bright field, not a spot. Raise CC Threshold or cut exposure and gain."
+            )
+    criteria.append(
+        SpotCriterion(
+            name="cc_max_area",
+            label="area",
+            measured=float(area),
+            limit=float(p["max_area"]),
+            passed=max_passed,
+            suggested=suggested,
+            alternative=alternative,
+        )
+    )
+
+    # -- cc_row_tolerance. Measured from the crop own centre row, so a large deviation is a
+    #    statement about where the crop sits, not about the tolerance.
+    row_passed = row_deviation <= p["row_tolerance"]
+    suggested = alternative = None
+    if not row_passed:
+        suggested = _round_to_admit(
+            "cc_row_tolerance", float(row_deviation), 1, high_override=_row_tolerance_ceiling(frame_height)
+        )
+        if suggested is None:
+            alternative = (
+                "This blob sits further from the centre row of the crop than the tolerance can "
+                "reach. Move the crop instead: shift Crop Y Offset so the spot is centred, or use "
+                "Center on Last Detection."
+            )
+    criteria.append(
+        SpotCriterion(
+            name="cc_row_tolerance",
+            label="row offset",
+            measured=float(row_deviation),
+            limit=float(p["row_tolerance"]),
+            passed=row_passed,
+            suggested=suggested,
+            alternative=alternative,
+        )
+    )
+
+    # -- cc_max_aspect_ratio
+    ar_passed = aspect_ratio <= p["max_aspect_ratio"]
+    suggested = alternative = None
+    if not ar_passed:
+        suggested = _round_to_admit("cc_max_aspect_ratio", float(aspect_ratio), 1)
+        if suggested is None:
+            alternative = (
+                "This is a streak, not a spot -- it is longer than the detector can be set to "
+                "accept. Check for a specular reflection off the coverslip edge."
+            )
+    criteria.append(
+        SpotCriterion(
+            name="cc_max_aspect_ratio",
+            label="aspect ratio",
+            measured=float(aspect_ratio),
+            limit=float(p["max_aspect_ratio"]),
+            passed=ar_passed,
+            suggested=suggested,
+            alternative=alternative,
+        )
+    )
+
+    return criteria
+
+
+# Stride used when estimating the frame background. A median over a full sensor sorts 6.4 million
+# values -- a couple of hundred milliseconds, on the GUI thread, for a number that is only ever a
+# background level. Every 4th pixel in each axis is 16x cheaper and agrees to well inside one gray
+# level on any frame that is mostly background, which is every frame this is asked about.
+_BACKGROUND_SUBSAMPLE_STRIDE = 4
+
+
+def _frame_background(working_image: np.ndarray) -> Tuple[float, float]:
+    """(median, median absolute deviation) of the frame, from a strided subsample."""
+    stride = _BACKGROUND_SUBSAMPLE_STRIDE
+    sample = working_image[::stride, ::stride].astype(np.float32)
+    median = float(np.median(sample))
+    return median, float(np.median(np.abs(sample - median)))
+
+
+# A frame with no contrast cannot be binarized into anything meaningful, and "there is no
+# signal" is the true answer anyway. Shared so analyze_frame and diagnose_frame say it the same.
+_UNIFORM_FRAME_NOTE = (
+    "Frame is uniform (peak {:.0f}, median {:.0f}) -- there is no signal in the crop at all. "
+    "Check that the AF laser is on, then exposure and analog gain."
+)
+
+
+def _threshold_that_separates(sub: np.ndarray, mask: np.ndarray, p: dict) -> Optional[str]:
+    """For an over-large blob, find a threshold at which it breaks into something spot-sized.
+
+    A blob failing cc_max_area is normally the spot merged with a halo or a bright background, and
+    raising the ceiling to admit it is the wrong fix -- it admits the halo. Raising cc_threshold
+    until the merge separates is the right one, and this is the one place a measurement at a
+    different threshold is well defined, because it is confined to a single blob and asks what that
+    blob becomes rather than what the frame contains.
+
+    Bounded work: the slices are the blob bounding box, not the frame, and at most six candidate
+    thresholds are tried.
+    """
+    values = sub[mask]
+    if values.size == 0:
+        return None
+
+    for percentile in (50, 60, 70, 80, 90, 95):
+        candidate = float(np.percentile(values, percentile))
+        if candidate <= p["threshold"]:
+            continue
+        sub_binary = ((sub > candidate) & mask).astype(np.uint8)
+        count, _, sub_stats, _ = cv2.connectedComponentsWithStats(sub_binary, connectivity=8)
+        if count <= 1:
+            continue
+        largest = int(sub_stats[1:, cv2.CC_STAT_AREA].max())
+        if p["min_area"] <= largest <= p["max_area"]:
+            return (
+                f"This blob is the spot merged with its surroundings. At CC Threshold "
+                f"{math.ceil(candidate):.0f} it separates into {largest} px and passes -- raise the "
+                f"threshold rather than the area ceiling, which would only admit the merge."
+            )
+    return None
+
+
+def _diagnose_above_threshold(
+    working_image: np.ndarray,
+    p: dict,
+    peak: float,
+    median: float,
+    x_reference: Optional[float],
+    labels: np.ndarray,
+    num_labels: int,
+    components: _FrameComponents,
+) -> "SpotDiagnosis":
+    """The common case: components exist, so every measurement the table wants is already exact.
+
+    No second threshold and no re-measurement are involved. Because a component exists only by
+    having pixels above cc_threshold, every blob here passes the threshold criterion by
+    construction, and the failures are all about size, position and shape.
+
+    Takes the labelling rather than producing it, so the caller that just detected on this frame
+    does not pay for a second binarize-and-label of the same pixels.
+    """
+    if num_labels - 1 > LASER_AF_DIAG_MAX_COMPONENTS:
+        return SpotDiagnosis(
+            frame_peak_intensity=peak,
+            frame_median=median,
+            note=(
+                f"{num_labels - 1} components above CC Threshold {p['threshold']:.0f} -- this frame "
+                f"is noise, not spots. Raise CC Threshold, or cut the focus camera exposure and "
+                f"analog gain."
+            ),
+        )
+
+    rejects: List[SpotReject] = []
+    for index in components.reject_indices:
+        j = int(index)
+        label_id = j + 1
+        left, top, width, height = (int(v) for v in components.bboxes[j])
+        sub = working_image[top : top + height, left : left + width]
+        mask = labels[top : top + height, left : left + width] == label_id
+        blob_peak = float(sub[mask].max()) if mask.any() else float(p["threshold"])
+
+        area = int(components.areas[j])
+        # Only worth asking of a blob that plausibly IS the spot fused with something. Past that
+        # the blob is the background, and walking it is a quarter-second of GUI thread for advice
+        # that would be wrong anyway.
+        separable = p["max_area"] < area <= LASER_AF_DIAG_SEPARATION_MAX_AREA_FACTOR * p["max_area"]
+        alternative = _threshold_that_separates(sub, mask, p) if separable else None
+
+        rejects.append(
+            SpotReject(
+                x=float(components.cols[j]),
+                y=float(components.rows[j]),
+                area=area,
+                peak_intensity=blob_peak,
+                aspect_ratio=float(components.aspect_ratios[j]),
+                row_deviation=float(components.row_deviations[j]),
+                criteria=evaluate_spot_criteria(
+                    peak_intensity=blob_peak,
+                    area=area,
+                    row_deviation=float(components.row_deviations[j]),
+                    aspect_ratio=float(components.aspect_ratios[j]),
+                    params=p,
+                    frame_median=median,
+                    frame_height=working_image.shape[0],
+                    max_area_alternative=alternative,
+                ),
+            )
+        )
+
+    # With a reference to hand, nearness to it is the strongest available prior on which of several
+    # blobs is the sample reflection. Applied after the cap rather than before it, so the shortlist
+    # is still the one closest to passing -- a blob near the reference that fails four filters is
+    # not the one whose settings are worth naming.
+    if x_reference is not None:
+        rejects.sort(key=lambda r: (len(r.failures), abs(r.x - x_reference)))
+
+    diagnosis = SpotDiagnosis(frame_peak_intensity=peak, frame_median=median, rejects=rejects)
+    diagnosis.also_admits = _count_also_admitted(components, p, diagnosis.suggested_params())
+    return diagnosis
+
+
+def _count_also_admitted(components: _FrameComponents, p: dict, suggested: Dict[str, float]) -> int:
+    """How many other blobs in this frame the suggested settings would also let through.
+
+    Relaxing a filter until the blob you want appears is how a back-reflection gets locked onto,
+    and the number that makes that visible is free: the same vectorized predicates, re-evaluated.
+    A count of zero means the suggestion is surgical; a count in the dozens means the spot
+    detection mode will simply fail differently.
+    """
+    if not suggested:
+        return 0
+
+    relaxed = dict(p)
+    for field_name, value in suggested.items():
+        relaxed[_CC_FIELD_TO_PARAM[field_name]] = value
+
+    would_pass = (
+        (components.areas >= relaxed["min_area"])
+        & (components.areas <= relaxed["max_area"])
+        & (components.row_deviations <= relaxed["row_tolerance"])
+        & (components.aspect_ratios <= relaxed["max_aspect_ratio"])
+    )
+    already_valid = int((components.failure_counts == 0).sum())
+    # Minus those already accepted, minus the blob the suggestion was built for.
+    return max(int(would_pass.sum()) - already_valid - 1, 0)
+
+
+def _diagnose_below_threshold(working_image: np.ndarray, p: dict, peak: float, median: float) -> "SpotDiagnosis":
+    """Nothing cleared cc_threshold, so the threshold is the cause -- but where is the spot?
+
+    This is the only case that needs to look below the configured threshold, and it needs one
+    number rather than a second detector. The floor is taken from the frame noise statistics, never
+    from the peak: a single saturated hot pixel would put a peak-derived floor above the real spot
+    and hide exactly what we came to find.
+    """
+    ceiling = float(p["threshold"]) - 1.0
+    if ceiling < 1.0:
+        return SpotDiagnosis(
+            frame_peak_intensity=peak,
+            frame_median=median,
+            note="CC Threshold is already at the floor and nothing cleared it. Raise exposure or analog gain.",
+        )
+
+    _, mad = _frame_background(working_image)
+    relaxed_threshold = min(max(median + LASER_AF_DIAG_NOISE_K * mad, 1.0), ceiling)
+
+    binary = (working_image > relaxed_threshold).astype(np.uint8)
+    num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(binary, connectivity=8)
+
+    if num_labels <= 1:
+        return SpotDiagnosis(
+            frame_peak_intensity=peak,
+            frame_median=median,
+            note=(
+                "Nothing spot-like in the crop, even below CC Threshold. The spot is not in this "
+                "crop at all -- no detection setting will bring it back. Use Reset to Full Sensor "
+                "to find where it went, or check z."
+            ),
+        )
+    if num_labels - 1 > LASER_AF_DIAG_MAX_COMPONENTS:
+        return SpotDiagnosis(
+            frame_peak_intensity=peak,
+            frame_median=median,
+            note=(
+                f"Nothing cleared CC Threshold {p['threshold']:.0f}, and below it the frame breaks "
+                f"into {num_labels - 1} components of noise. The spot is not distinguishable here: "
+                f"raise exposure or analog gain rather than lowering the threshold."
+            ),
+        )
+
+    areas = stats[1:, cv2.CC_STAT_AREA]
+    j = int(np.argmax(areas))
+    label_id = j + 1
+    left, top, width, height = (
+        int(stats[label_id, cv2.CC_STAT_LEFT]),
+        int(stats[label_id, cv2.CC_STAT_TOP]),
+        int(stats[label_id, cv2.CC_STAT_WIDTH]),
+        int(stats[label_id, cv2.CC_STAT_HEIGHT]),
+    )
+    sub = working_image[top : top + height, left : left + width]
+    mask = labels[top : top + height, left : left + width] == label_id
+    blob_peak = float(sub[mask].max())
+
+    aspect_ratio = max(width / height, height / width) if width > 0 and height > 0 else float("inf")
+    row_deviation = abs(float(centroids[label_id, 1]) - working_image.shape[0] / 2.0)
+    area = int(areas[j])
+
+    reject = SpotReject(
+        x=float(centroids[label_id, 0]),
+        y=float(centroids[label_id, 1]),
+        area=area,
+        peak_intensity=blob_peak,
+        aspect_ratio=float(aspect_ratio),
+        row_deviation=row_deviation,
+        criteria=evaluate_spot_criteria(
+            peak_intensity=blob_peak,
+            area=area,
+            row_deviation=row_deviation,
+            aspect_ratio=float(aspect_ratio),
+            params=p,
+            frame_median=median,
+            frame_height=working_image.shape[0],
+        ),
+        measured_at_relaxed_threshold=relaxed_threshold,
+    )
+    return SpotDiagnosis(frame_peak_intensity=peak, frame_median=median, rejects=[reject])
+
+
+def diagnose_frame(
+    working_image: np.ndarray, params: Optional[dict] = None, x_reference: Optional[float] = None
+) -> SpotDiagnosis:
+    """Explain, in terms of the settings that decide it, why a frame yields no usable spot.
+
+    Takes the working image rather than the raw frame, so a caller that has already built one for
+    detection does not pay for a second Gaussian filter -- which is the dominant cost of the whole
+    path on a full-sensor crop.
+
+    Reads nothing back, moves nothing, and changes no configuration. It splits into two cases, and
+    only the second needs to look below the configured threshold at all:
+
+    - The frame peak clears cc_threshold, so components exist and every number is already exact.
+    - It does not, so the threshold is the sole cause and the blob must be located below it.
+
+    A frame with no contrast at all short-circuits both: binarizing one labels the whole sensor,
+    and "there is no signal" is the true answer anyway.
+    """
+    p = _resolve_spot_detection_params(params)
+    peak = float(working_image.max())
+    median, _ = _frame_background(working_image)
+
+    if peak - median < LASER_AF_DIAG_MIN_CONTRAST:
+        return SpotDiagnosis(
+            frame_peak_intensity=peak, frame_median=median, note=_UNIFORM_FRAME_NOTE.format(peak, median)
+        )
+
+    if peak > p["threshold"]:
+        _, _, labels, num_labels, _, components = _collect_valid_spots(working_image, p, collect_rejects=True)
+        return _diagnose_above_threshold(
+            working_image, p, peak, median, x_reference, labels, num_labels, components
+        )
+    return _diagnose_below_threshold(working_image, p, peak, median)
+
+
+def diagnose_spot_detection(
+    image: np.ndarray,
+    params: Optional[dict] = None,
+    filter_sigma: Optional[int] = None,
+    x_reference: Optional[float] = None,
+) -> SpotDiagnosis:
+    """diagnose_frame for a caller holding a raw frame rather than a working image."""
+    if image is None or not isinstance(image, np.ndarray) or image.size == 0:
+        raise ValueError("Invalid input image")
+    return diagnose_frame(_build_working_image(image, filter_sigma), params=params, x_reference=x_reference)
+
+
+def analyze_frame(
+    image: np.ndarray,
+    params: Optional[dict] = None,
+    filter_sigma: Optional[int] = None,
+    max_candidates: int = 32,
+    diagnose: bool = False,
+    x_reference: Optional[float] = None,
+) -> Tuple[List[dict], Optional[SpotDiagnosis]]:
+    """Every candidate in frame and, on request, why there were none -- from one working image.
+
+    The one entry point a live overlay should use. Detection and diagnosis both need the
+    Gaussian-filtered frame, and building it twice doubles the cost of the most expensive case
+    (a full sensor, which is exactly when someone is diagnosing).
+
+    `diagnose` is the cost control and belongs to the caller: the diagnosis walks the frame a
+    second time, so it is worth running when detection just failed and wasteful otherwise.
+    """
+    if image is None or not isinstance(image, np.ndarray) or image.size == 0:
+        raise ValueError("Invalid input image")
+
+    p = _resolve_spot_detection_params(params)
+    working_image = _build_working_image(image, filter_sigma)
+    peak = float(working_image.max())
+
+    # Nothing cleared the threshold: there are no candidates by definition, and the diagnosis has
+    # its own way of finding the blob below it.
+    if peak <= p["threshold"]:
+        return [], (diagnose_frame(working_image, params=p, x_reference=x_reference) if diagnose else None)
+
+    valid_spots, _, labels, num_labels, _, components = _collect_valid_spots(
+        working_image, p, collect_rejects=diagnose
+    )
+    candidates = _candidates_from_valid_spots(working_image, valid_spots, max_candidates)
+
+    diagnosis = None
+    if diagnose:
+        median, _ = _frame_background(working_image)
+        if peak - median < LASER_AF_DIAG_MIN_CONTRAST:
+            diagnosis = SpotDiagnosis(
+                frame_peak_intensity=peak, frame_median=median, note=_UNIFORM_FRAME_NOTE.format(peak, median)
+            )
+        else:
+            diagnosis = _diagnose_above_threshold(
+                working_image, p, peak, median, x_reference, labels, num_labels, components
+            )
+    return candidates, diagnosis
 
 
 def find_spot_location(
@@ -458,7 +1184,7 @@ def find_spot_location(
     try:
         working_image = _prepare_working_image(image, filter_sigma, p["threshold"])
 
-        valid_spots, binary, labels, num_labels, expected_row = _collect_valid_spots(working_image, p)
+        valid_spots, binary, labels, num_labels, expected_row, _ = _collect_valid_spots(working_image, p)
 
         if len(valid_spots) == 0:
             raise ValueError("No valid spots detected after filtering")

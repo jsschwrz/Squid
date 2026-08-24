@@ -12,7 +12,7 @@ import pytest
 from qtpy.QtCore import Qt
 
 from control.core.core import ImageDisplayWindow
-from control.core.laser_auto_focus_controller import LaserAutofocusController
+from control.core.laser_auto_focus_controller import LaserAutofocusController, SpotOverlayResult
 from control.models import LaserAFConfig
 from control.utils import SpotDetectionMode
 from control.widgets import LaserAFSpotOverlay
@@ -119,12 +119,13 @@ class _FakeClock:
 def overlay_parts(qtbot):
     """An overlay wired to a mock controller and a mock display, on a hand-cranked clock."""
     controller = MagicMock()
-    controller.classify_frame_spots.return_value = MagicMock(
+    # A real SpotOverlayResult, not a MagicMock: a mock auto-creates whatever the overlay reads,
+    # so a field added to the result later would be silently satisfied here and the test would go
+    # on passing while the overlay mishandled it.
+    controller.classify_frame_spots.return_value = SpotOverlayResult(
         candidates=[{"x": 10.0, "y": 20.0}],
         selected_x=10.0,
         selected_y=20.0,
-        reference_x=None,
-        failure_reason=None,
     )
     display = MagicMock()
     overlay = LaserAFSpotOverlay(controller, display, rate_hz=5.0)
@@ -167,13 +168,9 @@ class TestSpotOverlayThrottle:
         overlay.set_enabled(True)
         # A full-sensor crop: detection itself burns 1 s, so the 5 Hz rate is not the binding
         # constraint -- the duty cycle is, and it must hold the next run off for 1/0.25 = 4 s.
-        controller.classify_frame_spots.side_effect = lambda image: clock.advance(1.0) or MagicMock(
-            candidates=[],
-            selected_x=None,
-            selected_y=None,
-            reference_x=None,
-            failure_reason=None,
-        )
+        controller.classify_frame_spots.side_effect = lambda image, diagnose=False: clock.advance(
+            1.0
+        ) or SpotOverlayResult()
         overlay.on_frame(np.zeros((16, 16), dtype=np.uint8))
 
         clock.advance(3.0)
@@ -206,12 +203,11 @@ class TestSpotOverlayThrottle:
 
     def test_result_is_forwarded_to_the_display(self, overlay_parts):
         overlay, controller, display, _ = overlay_parts
-        controller.classify_frame_spots.return_value = MagicMock(
+        controller.classify_frame_spots.return_value = SpotOverlayResult(
             candidates=[{"x": 10.0, "y": 20.0}, {"x": 30.0, "y": 21.0}],
             selected_x=30.0,
             selected_y=21.0,
             reference_x=25.0,
-            failure_reason=None,
         )
         overlay.set_enabled(True)
         overlay.on_frame(np.zeros((16, 16), dtype=np.uint8))
@@ -223,13 +219,7 @@ class TestSpotOverlayThrottle:
 
     def test_a_failing_frame_is_flagged_and_explained_once(self, overlay_parts):
         overlay, controller, display, clock = overlay_parts
-        controller.classify_frame_spots.return_value = MagicMock(
-            candidates=[],
-            selected_x=None,
-            selected_y=None,
-            reference_x=None,
-            failure_reason="no spot detected",
-        )
+        controller.classify_frame_spots.return_value = SpotOverlayResult(failure_reason="no spot detected")
         statuses = []
         overlay.signal_status.connect(statuses.append)
         overlay.set_enabled(True)

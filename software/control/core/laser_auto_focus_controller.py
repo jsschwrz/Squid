@@ -65,6 +65,13 @@ class SpotOverlayResult:
     reference_x: Optional[float] = None  # the reference plane's spot x, when one has been set
     displacement_um: Optional[float] = None  # signed, relative to the reference; None without one
     failure_reason: Optional[str] = None  # None when this frame would have produced a measurement
+    # Every filter's margin for the spot that was selected: how much room each cc_* setting has
+    # left before it starts rejecting. This is the half that is useful while detection still
+    # works -- it makes a dropout visible coming rather than only after it happens.
+    criteria: List[utils.SpotCriterion] = field(default_factory=list)
+    # Why this frame yielded nothing, in terms of the settings that decide it. Only populated when
+    # the caller asked for a diagnosis and the frame did not produce a selection.
+    diagnosis: Optional[utils.SpotDiagnosis] = None
 
 
 class LaserAutofocusController(QObject):
@@ -960,7 +967,7 @@ class LaserAutofocusController(QObject):
             "max_aspect_ratio": self.laser_af_properties.cc_max_aspect_ratio,
         }
 
-    def classify_frame_spots(self, image: np.ndarray) -> SpotOverlayResult:
+    def classify_frame_spots(self, image: np.ndarray, diagnose: bool = False) -> SpotOverlayResult:
         """Run the detector over one frame and report what it found, without touching anything.
 
         Coordinates come back in the frame's own pixel space, so the caller must pass the same
@@ -971,18 +978,29 @@ class LaserAutofocusController(QObject):
         call for different fixes: no candidates means the cc_* thresholds or the crop are wrong,
         and an unchoosable set means the spot detection mode does not match what is in frame.
 
+        `diagnose` asks the harder question: not only that the frame failed, but which cc_* setting
+        turned the spot away and what value would let it back. It walks the frame a second time, so
+        the caller owns when it runs -- worth it on a frame that just failed, wasteful otherwise.
+        The verdict is still read-only: nothing moves and no configuration is written either way.
+
         A spot far from the reference is deliberately not a failure here. The crop is what bounds
         where a spot may be, and a detection inside it is one this frame legitimately offers; how
         large a displacement is worth acting on is move_to_target's call, against laser_af_range.
         """
         config = self.laser_af_properties
         reference_x = config.x_reference if config.has_reference else None
+        params = self._spot_detection_params()
 
         try:
-            candidates = utils.find_all_spot_locations(
+            # One entry point, so detection and diagnosis share a single Gaussian-filtered frame.
+            # Building it twice is the dominant cost of this path on a full-sensor crop, which is
+            # exactly the crop someone is using when they need the diagnosis.
+            candidates, diagnosis = utils.analyze_frame(
                 image,
-                params=self._spot_detection_params(),
+                params=params,
                 filter_sigma=config.filter_sigma,
+                diagnose=diagnose,
+                x_reference=reference_x,
             )
         except ValueError:
             # An unusable frame -- empty, or not an array. Ordinary here: the stream can hand us
@@ -993,6 +1011,7 @@ class LaserAutofocusController(QObject):
 
         if not candidates:
             result.failure_reason = "no spot detected"
+            result.diagnosis = diagnosis
             return result
 
         try:
@@ -1001,10 +1020,20 @@ class LaserAutofocusController(QObject):
             # e.g. SINGLE mode with several candidates. The candidates are still worth drawing --
             # that the mode cannot choose between them is exactly what the operator needs to see.
             result.failure_reason = f"{len(candidates)} candidates, mode cannot choose: {e}"
+            # Not a cc_* problem, so no blob-level advice: every candidate passed every filter.
+            # The mode is what cannot choose, and the mode is not something a margin explains.
             return result
 
         result.selected_x = float(selected["x"])
         result.selected_y = float(selected["y"])
+        result.criteria = utils.evaluate_spot_criteria(
+            peak_intensity=selected["peak_intensity"],
+            area=int(selected["area"]),
+            row_deviation=abs(selected["row"] - image.shape[0] / 2.0),
+            aspect_ratio=selected["aspect_ratio"],
+            params=params,
+            frame_height=image.shape[0],
+        )
 
         if reference_x is not None and config.pixel_to_um:
             result.displacement_um = (result.selected_x - reference_x) * config.pixel_to_um

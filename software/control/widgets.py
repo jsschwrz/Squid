@@ -3029,7 +3029,39 @@ _CALIBRATION_DISPLACEMENT_ADVISORY_PX = 10.0
 _SPOT_MODE_LABELS = {
     SpotDetectionMode.DUAL_LEFT: "Leftmost spot",
     SpotDetectionMode.DUAL_RIGHT: "Rightmost spot",
-    SpotDetectionMode.SINGLE: "Exactly one spot (fail if more)",
+    SpotDetectionMode.SINGLE: "Exactly one spot",
+}
+
+
+# How wide a value column is allowed to be. The spinbox is capped rather than fixed so a larger
+# system font can still render "50000" and its arrows; the measured column is fixed so a value
+# going from 9 to 88 does not shift the column under the eye of someone watching it move.
+_SPINBOX_WIDTH_PX = 90
+_MEASURED_WIDTH_PX = 52
+
+# What each cc_* field is called on its spinbox. Advice names the control to change, not the config
+# key, because the control is what the operator can actually go and edit.
+_CC_SPINBOX_LABELS = {
+    "cc_threshold": "CC Threshold",
+    "cc_min_area": "CC Min Area",
+    "cc_max_area": "CC Max Area",
+    "cc_row_tolerance": "CC Row Tolerance",
+    "cc_max_aspect_ratio": "CC Max Aspect Ratio",
+}
+
+# Decimals for each measured readout, matching the spinbox it sits beside so the two numbers can be
+# compared at a glance without one of them carrying spurious precision.
+# Base label for the Relax button. The count of what else a relaxation would admit is appended to
+# it rather than written in prose, so the one number that says "you are loosening the detector
+# rather than finding the spot" sits on the control that does the loosening.
+_RELAX_BUTTON_TEXT = "Relax to Admit Blob"
+
+_MEASURED_FORMATS = {
+    "cc_threshold": ".0f",
+    "cc_min_area": ".0f",
+    "cc_max_area": ".0f",
+    "cc_row_tolerance": ".0f",
+    "cc_max_aspect_ratio": ".1f",
 }
 
 
@@ -3054,6 +3086,12 @@ class LaserAutofocusSettingWidget(QWidget):
     # reads it, and the numbers on it move slowly.
     _CROP_STATUS_REFRESH_INTERVAL_S = 0.5
 
+    # How often the live measured values may be rewritten. Faster than the crop status above,
+    # because these are six short numbers rather than a paragraph of computed advice, and they are
+    # meant to be watched while turning focus -- half a second of lag reads as the panel being
+    # broken rather than as pacing.
+    _MARGIN_REFRESH_INTERVAL_S = 0.2
+
     def __init__(self, streamHandler, liveController: LiveController, laserAutofocusController, stretch=True):
         super().__init__()
         self._log = squid.logging.get_logger(self.__class__.__name__)
@@ -3073,11 +3111,19 @@ class LaserAutofocusSettingWidget(QWidget):
         self.setPalette(palette)
 
         self.spinboxes = {}
+        # The live measured value beside each cc_* control, keyed by the same config field name
+        # SpotCriterion carries, so updating them is a direct lookup with nothing in between.
+        self.measured_labels = {}
         # (x, y, source_roi) of the last successful manual spot detection. source_roi is the
         # camera ROI those coordinates were measured in, so a later crop change cannot cause
         # them to be reinterpreted against the wrong frame.
         self._last_spot_detection = None
         self._next_crop_status_refresh_s = 0.0
+        # The most recent live verdict, and the clock that paces redrawing it. Held rather than
+        # rendered immediately because the overlay runs at up to 20 Hz; the stored verdict is
+        # always current, only the redraw is paced.
+        self._last_detection_result = None
+        self._next_margin_refresh_s = 0.0
         self.init_ui()
         # Seed every control from the stored config, not just the ones _add_spinbox filled in.
         # The confirm-mode combo and the iterative-correction checkbox are only read back in
@@ -3241,12 +3287,34 @@ class LaserAutofocusSettingWidget(QWidget):
         # discarding the calibration and reference being tuned against.
 
         # Add connected component spot detection related spinboxes
-        self._add_spinbox(settings_layout, "CC Threshold:", "cc_threshold", 0, 255, 0)
-        self._add_spinbox(settings_layout, "CC Min Area (pixels):", "cc_min_area", 1, 1000, 0)
-        self._add_spinbox(settings_layout, "CC Max Area (pixels):", "cc_max_area", 100, 50000, 0)
-        self._add_spinbox(settings_layout, "CC Row Tolerance (pixels):", "cc_row_tolerance", 1, 200, 0)
-        self._add_spinbox(settings_layout, "CC Max Aspect Ratio:", "cc_max_aspect_ratio", 1.0, 10.0, 1, 0.5)
+        # measured=True puts what the live detector measures for each of these directly to the
+        # right of the setting it is compared against. The number turns red when it is the one
+        # keeping the spot out, and its tooltip says what to do about it.
+        self._add_spinbox(settings_layout, "CC Threshold:", "cc_threshold", 0, 255, 0, measured=True)
+        self._add_spinbox(settings_layout, "CC Min Area (pixels):", "cc_min_area", 1, 1000, 0, measured=True)
+        self._add_spinbox(settings_layout, "CC Max Area (pixels):", "cc_max_area", 100, 50000, 0, measured=True)
+        self._add_spinbox(
+            settings_layout, "CC Row Tolerance (pixels):", "cc_row_tolerance", 1, 200, 0, measured=True
+        )
+        self._add_spinbox(
+            settings_layout, "CC Max Aspect Ratio:", "cc_max_aspect_ratio", 1.0, 10.0, 1, 0.5, measured=True
+        )
+
         self._add_spinbox(settings_layout, "Filter Sigma:", "filter_sigma", 0, 100, 1, allow_none=True)
+
+        self.relax_button = QPushButton(_RELAX_BUTTON_TEXT)
+        self.relax_button.setEnabled(False)
+        self.relax_button.setToolTip(
+            "Fill the settings above with values that would let the rejected blob through -- every "
+            "failing one at once, since the detector stops at the first filter a blob fails.\n"
+            "It only fills them in: Apply without Re-initialization still commits, and until you "
+            "press it nothing has changed.\n"
+            "Relaxing until something is detected is how a static back-reflection gets locked "
+            "onto. The count on the button is how many OTHER blobs these settings would also let "
+            "in -- if it is not zero you are loosening the detector, not finding the spot. Confirm "
+            "with Test AF Sweep that the spot tracks z."
+        )
+        settings_layout.addWidget(self.relax_button)
 
         # Spot detection mode combo box
         spot_mode_layout = QHBoxLayout()
@@ -3260,10 +3328,20 @@ class LaserAutofocusSettingWidget(QWidget):
         self.spot_mode_combo.setCurrentIndex(current_index)
         self.spot_mode_combo.setToolTip(
             "Which candidate to use when more than one reflection is in frame.\n"
+            "Exactly one spot rejects the frame outright if it finds more than one -- the count to "
+            "the right is how many are in frame now.\n"
             "Selection is positional only -- it cannot tell a sample reflection from a spurious "
             "one, so use the crop and Test AF Sweep to decide which is which."
         )
         spot_mode_layout.addWidget(self.spot_mode_combo)
+        # What the mode has to choose between on the current frame. More than one candidate is what
+        # makes Single Spot fail, so the count belongs beside the mode that cares about it.
+        self.candidate_count_label = QLabel()
+        self.candidate_count_label.setFixedWidth(_MEASURED_WIDTH_PX)
+        self.candidate_count_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self.candidate_count_label.setStyleSheet("font-family: monospace;")
+        self.candidate_count_label.setToolTip("Spots the detector found in the current frame.")
+        spot_mode_layout.addWidget(self.candidate_count_label)
         settings_layout.addLayout(spot_mode_layout)
 
 
@@ -3450,6 +3528,7 @@ class LaserAutofocusSettingWidget(QWidget):
         self.exposure_spinbox.valueChanged.connect(self.update_exposure_time)
         self.analog_gain_spinbox.valueChanged.connect(self.update_analog_gain)
         self.update_threshold_button.clicked.connect(self.update_threshold_settings)
+        self.relax_button.clicked.connect(self.relax_to_admit_blob)
         self.apply_crop_button.clicked.connect(self.apply_crop)
         self.center_crop_button.clicked.connect(self.center_crop_on_last_detection)
         self.reset_crop_button.clicked.connect(self.reset_crop_to_full_sensor)
@@ -3477,13 +3556,26 @@ class LaserAutofocusSettingWidget(QWidget):
         decimals: int,
         step: float = 1,
         allow_none=False,
+        measured: bool = False,
     ) -> None:
-        """Helper method to add a labeled spinbox to the layout."""
+        """Helper method to add a labeled spinbox to the layout.
+
+        Every row is laid out the same way -- label, stretch, spinbox, value column -- so the
+        controls line up down the panel regardless of how long each label is. The value column is
+        reserved on every row even when nothing will be shown in it, because a column that exists
+        on some rows and not others puts the spinboxes at two different right edges.
+
+        `measured` registers that column in self.measured_labels, for the criteria the live
+        detector actually reports. It is what puts the number the setting is being compared against
+        directly beside the setting, rather than in a table somewhere else using different words.
+        """
         box_layout = QHBoxLayout()
         box_layout.addWidget(QLabel(label))
+        box_layout.addStretch()
 
         spinbox = QDoubleSpinBox()
         spinbox.setKeyboardTracking(False)
+        spinbox.setMaximumWidth(_SPINBOX_WIDTH_PX)
         if allow_none:
             spinbox.setRange(min_val - step, max_val)
             spinbox.setSpecialValueText("None")
@@ -3499,6 +3591,15 @@ class LaserAutofocusSettingWidget(QWidget):
             spinbox.setValue(current_value)
 
         box_layout.addWidget(spinbox)
+
+        value_label = QLabel()
+        value_label.setFixedWidth(_MEASURED_WIDTH_PX)
+        value_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        value_label.setStyleSheet("font-family: monospace;")
+        box_layout.addWidget(value_label)
+        if measured:
+            self.measured_labels[property_name] = value_label
+
         layout.addLayout(box_layout)
 
         # Store spinbox reference
@@ -3518,6 +3619,125 @@ class LaserAutofocusSettingWidget(QWidget):
         if now >= self._next_crop_status_refresh_s:
             self._next_crop_status_refresh_s = now + self._CROP_STATUS_REFRESH_INTERVAL_S
             self._update_crop_status()
+
+    def on_live_detection_result(self, result):
+        """Take the latest live verdict and refresh the measured values on a slower clock.
+
+        `result` is None when live detection has been turned off, in which case the readouts are
+        cleared at once -- a number left beside a control would describe a frame that is no longer
+        arriving.
+        """
+        self._last_detection_result = result
+        if result is None:
+            self._clear_live_readouts()
+            return
+
+        now = time.perf_counter()
+        if now >= self._next_margin_refresh_s:
+            self._next_margin_refresh_s = now + self._MARGIN_REFRESH_INTERVAL_S
+            self._update_live_readouts()
+
+    def _clear_live_readouts(self):
+        """Blank every measured value and reset Relax. Used whenever they stop being true."""
+        self._last_detection_result = None
+        for label in self.measured_labels.values():
+            label.setText("")
+            label.setStyleSheet("font-family: monospace;")
+            label.setToolTip("")
+        self.candidate_count_label.setText("")
+        self.relax_button.setText(_RELAX_BUTTON_TEXT)
+        self.relax_button.setEnabled(False)
+
+    @staticmethod
+    def _criterion_tooltip(criterion) -> str:
+        """What to do about one criterion, in the place the eye is already looking.
+
+        This is where the advice that used to be a paragraph under the controls now lives. The
+        third case is the one worth keeping most: some blobs cannot be admitted by any value the
+        setting can hold, and saying so -- and naming what to change instead -- is the difference
+        between a useful tool and one that sends the operator round a loop.
+        """
+        control_name = _CC_SPINBOX_LABELS[criterion.name]
+        measured = format(criterion.measured, _MEASURED_FORMATS[criterion.name])
+        limit = format(criterion.limit, _MEASURED_FORMATS[criterion.name])
+
+        if criterion.passed:
+            return f"Measured on the current frame: {measured}. {control_name} is {limit}."
+        if criterion.suggested is not None:
+            suggested = format(criterion.suggested, _MEASURED_FORMATS[criterion.name])
+            return (
+                f"Blob measures {measured} against {control_name} {limit}, so it is rejected. "
+                f"Relax sets {control_name} to {suggested}."
+            )
+        return criterion.alternative or (
+            f"Blob measures {measured} against {control_name} {limit}, and no value {control_name} "
+            f"can hold would admit it."
+        )
+
+    def _apply_criteria_to_readouts(self, criteria):
+        for criterion in criteria:
+            label = self.measured_labels.get(criterion.name)
+            if label is None:
+                continue
+            label.setText(format(criterion.measured, _MEASURED_FORMATS[criterion.name]))
+            label.setStyleSheet("font-family: monospace;" + ("" if criterion.passed else " color: #C00000;"))
+            label.setToolTip(self._criterion_tooltip(criterion))
+
+    def _update_live_readouts(self):
+        """Put the current frame's numbers beside the settings that judge them."""
+        result = self._last_detection_result
+        if result is None:
+            self._clear_live_readouts()
+            return
+
+        diagnosis = getattr(result, "diagnosis", None)
+        # A note means the frame has no per-blob answer at all -- the spot is not in the crop, or
+        # there is no signal. Any number beside a control would be describing nothing, so blank
+        # them; the reason goes to the live detection status line instead.
+        if diagnosis is not None and diagnosis.note:
+            self._clear_live_readouts()
+            return
+
+        suggested = {}
+        if result.criteria:
+            self._apply_criteria_to_readouts(result.criteria)
+            self.candidate_count_label.setText(str(len(result.candidates)))
+        elif diagnosis is not None and diagnosis.best is not None:
+            self._apply_criteria_to_readouts(diagnosis.best.criteria)
+            self.candidate_count_label.setText(str(len(result.candidates)))
+            suggested = diagnosis.suggested_params()
+        else:
+            self._clear_live_readouts()
+            return
+
+        others = diagnosis.also_admits if (suggested and diagnosis is not None) else 0
+        if others:
+            self.relax_button.setText(f"{_RELAX_BUTTON_TEXT} (+{others} other{'' if others == 1 else 's'})")
+        else:
+            self.relax_button.setText(_RELAX_BUTTON_TEXT)
+        # Filling the spinboxes is pointless while Apply is unavailable, so follow it.
+        self.relax_button.setEnabled(bool(suggested) and self.update_threshold_button.isEnabled())
+
+    def relax_to_admit_blob(self):
+        """Fill the cc_* spinboxes with values that would admit the rejected blob. Commit nothing.
+
+        Every failing criterion at once: the detector stops at the first filter a blob fails, so
+        relaxing them one at a time means clicking, applying, and being told about the next one.
+
+        Filling without applying is the same discipline the crop selector follows -- it populates
+        the crop fields and leaves Apply Crop to commit. It matters more here, because Apply on
+        this panel writes the objective's YAML immediately.
+        """
+        result = self._last_detection_result
+        diagnosis = getattr(result, "diagnosis", None) if result is not None else None
+        suggested = diagnosis.suggested_params() if diagnosis is not None else {}
+        if not suggested:
+            return
+
+        for name, value in suggested.items():
+            self.spinboxes[name].setValue(value)
+
+        self.relax_button.setEnabled(False)
 
     def show_live_detection_status(self, status: str):
         """Display why the current frame would fail laser AF, or nothing when it would not."""
@@ -3550,6 +3770,10 @@ class LaserAutofocusSettingWidget(QWidget):
         """Update all widget values from the controller properties"""
         self.clear_labels()
 
+        # Before any value is read back: this widens cc_row_tolerance to suit the current crop, and
+        # a spinbox clamps whatever it is handed to the range it has at the time.
+        self._update_row_tolerance_range()
+
         # Update spinboxes
         for prop_name, spinbox in self.spinboxes.items():
             current_value = getattr(self.laserAutofocusController.laser_af_properties, prop_name)
@@ -3580,6 +3804,9 @@ class LaserAutofocusSettingWidget(QWidget):
         self.update_threshold_button.setEnabled(self.laserAutofocusController.is_initialized)
         self.update_calibration_label()
         self.center_crop_button.setEnabled(self._last_spot_detection is not None)
+        # Reached after every crop apply and every Initialize. The table describes a frame captured
+        # in one camera ROI against one set of limits, and both may have just moved underneath it.
+        self._clear_live_readouts()
         self._update_crop_status()
         self._update_confirm_prediction_label()
         self._update_calibration_distance_label()
@@ -3679,6 +3906,9 @@ class LaserAutofocusSettingWidget(QWidget):
         self.laserAutofocusController.update_threshold_properties(updates)
         self._update_crop_status()
         self._update_confirm_prediction_label()
+        # The limits every margin was measured against have just changed, so every number on the
+        # table is now wrong. The next live frame refills it.
+        self._clear_live_readouts()
 
     def toggle_crop_selection(self, enabled):
         """Show or hide the drag-a-box crop selector on the focus camera image."""
@@ -3869,6 +4099,42 @@ class LaserAutofocusSettingWidget(QWidget):
         self._update_crop_status()
         self._update_calibration_distance_label()
         self._update_confirm_prediction_label()
+
+    def _update_row_tolerance_range(self):
+        """Let CC Row Tolerance reach any blob the current crop can contain.
+
+        Row deviation is measured from the middle of the crop, so it can never exceed half the crop
+        height -- and a fixed ceiling therefore means something different on every crop. At the
+        stock 256-tall crop a 200 px tolerance is already past anything measurable, while on a full
+        sensor a blob can sit 1000 px off centre and the same ceiling refuses to admit a spot that
+        is plainly visible in the frame.
+
+        Called from update_values, which is the single resync point after Apply Crop, Reset to Full
+        Sensor, Center on Last Detection and Initialize.
+        """
+        spinbox = self.spinboxes.get("cc_row_tolerance")
+        if spinbox is None:
+            return
+
+        config = self.laserAutofocusController.laser_af_properties
+        height = config.height
+        useful_max = utils._row_tolerance_ceiling(height)
+        # Also never below what this objective already has saved. Narrowing the crop would
+        # otherwise clamp the stored value on the way into the spinbox, and the next Apply would
+        # write the clamped number back -- losing a setting the operator chose against a wider crop
+        # for no behavioural gain, since anything past half the crop height accepts everything
+        # regardless.
+        spinbox.setMaximum(max(useful_max, float(config.cc_row_tolerance)))
+        spinbox.setToolTip(
+            "How far the spot may sit from the centre row of the crop before it is rejected.\n"
+            "The row offset itself is not a setting -- it is measured from the middle of the crop, "
+            "so it changes when the spot moves or when the crop moves (Crop Y Offset). This is how "
+            "much of it is tolerated.\n"
+            f"Half the current {int(height)} px crop is {height / 2:.0f} px, which is as far off "
+            "centre as a blob in this crop can possibly sit. At or above that this filter accepts "
+            "anything and stops discriminating at all -- if you need it that wide, moving the crop "
+            "is usually the better fix."
+        )
 
     def _update_crop_status(self):
         """Show where the crop sits, and how much focus travel it leaves before the spot
@@ -14337,6 +14603,11 @@ class LaserAFSpotOverlay(QObject):
     """
 
     signal_status = Signal(str)  # failure reason for the current frame, or "" when it would pass
+    # The whole verdict for the current frame, or None when detection is off. Carried alongside
+    # signal_status rather than replacing it: the status line wants a cheap string compare to
+    # decide whether to repaint at all, and a result object has no cheap equality. Consumers of
+    # this one pace their own redraw.
+    signal_detection_result = Signal(object)
     # (x, y, source_roi) of the spot the configured mode selected on this frame. source_roi is
     # the camera ROI those coordinates were measured in, so a later crop change cannot cause them
     # to be reinterpreted against the wrong frame. This is what keeps Center on Last Detection
@@ -14364,6 +14635,10 @@ class LaserAFSpotOverlay(QObject):
         self._rate_hz = max(float(rate_hz), 0.1)
         self._next_allowed_s = 0.0
         self._last_status = None
+        # Whether the previous frame produced no usable spot. A diagnosis is only worth asking for
+        # on a frame that failed, and asking on the frame after the failure costs one overlay
+        # interval and keeps the decision to a single flag.
+        self._last_frame_failed = False
 
     def _now(self) -> float:
         """One monotonic, high-resolution clock for both pacing and timing.
@@ -14379,8 +14654,12 @@ class LaserAFSpotOverlay(QObject):
         if self._enabled:
             self._next_allowed_s = 0.0  # act on the next frame rather than waiting out a stale gap
         else:
+            self._last_frame_failed = False
             self.imageDisplayWindow.clear_spot_overlay()
             self._emit_status("")
+            # Nothing is being measured any more, so anything still on screen describes a frame
+            # that is no longer arriving. Say so rather than leaving a live-looking verdict up.
+            self.signal_detection_result.emit(None)
 
     def set_rate_hz(self, rate_hz: float):
         self._rate_hz = max(float(rate_hz), 0.1)
@@ -14398,24 +14677,51 @@ class LaserAFSpotOverlay(QObject):
         if started_s < self._next_allowed_s:
             return
 
+        # Explaining a failure costs a second walk of the frame, so it is only asked for after one
+        # -- but it is close to free when it is asked: on the 1536x256 crop this normally runs on,
+        # a diagnosed frame measures within half a millisecond of an undiagnosed one, because the
+        # expensive parts (the Gaussian filter and the labelling) are shared rather than repeated.
         try:
-            result = self.laserAutofocusController.classify_frame_spots(image)
+            result = self.laserAutofocusController.classify_frame_spots(image, diagnose=self._last_frame_failed)
         except Exception:
             self._log.exception("Live spot detection failed; backing off.")
             self._next_allowed_s = self._now() + self._ERROR_BACKOFF_S
+            self._last_frame_failed = False
             self._emit_status("live spot detection failed - see the log")
+            self.signal_detection_result.emit(None)
             return
 
         elapsed_s = self._now() - started_s
         self._next_allowed_s = self._now() + max(1.0 / self._rate_hz, elapsed_s / self._DUTY_CYCLE)
+        self._last_frame_failed = result.failure_reason is not None
+
+        diagnosis = result.diagnosis
+        rejects = [(r.x, r.y) for r in diagnosis.rejects] if diagnosis is not None else []
+        reject_label = None
+        if diagnosis is not None and diagnosis.best is not None:
+            best = diagnosis.best
+            # Only the first couple of failures: this is a label on an image, not the table.
+            summary = ", ".join(f"{c.label} {c.measured:.4g}" for c in best.failures[:2])
+            if summary:
+                reject_label = (best.x, best.y, summary)
 
         self.imageDisplayWindow.set_spot_overlay(
             candidates=[(c["x"], c["y"]) for c in result.candidates],
             selected=(result.selected_x, result.selected_y) if result.selected_x is not None else None,
             reference_x=result.reference_x,
             failed=result.failure_reason is not None,
+            rejects=rejects,
+            reject_label=reject_label,
         )
-        self._emit_status(result.failure_reason or "")
+        # A diagnosis note takes precedence over the bare reason. Both say the frame failed, but
+        # "no spot detected" leaves the operator guessing while "the spot is not in this crop"
+        # tells them no detection setting is the fix. These are frame-level verdicts with no
+        # per-control answer, which is exactly what this one-line status already exists to carry.
+        note = diagnosis.note if diagnosis is not None else None
+        self._emit_status(note or result.failure_reason or "")
+        # Every run, ungated: the margins move continuously as focus is turned, and that movement
+        # is the point. The consumer paces its own rebuild.
+        self.signal_detection_result.emit(result)
 
         if result.selected_x is not None and result.selected_y is not None:
             # Read the ROI from the camera rather than from the config: it is the frame these
