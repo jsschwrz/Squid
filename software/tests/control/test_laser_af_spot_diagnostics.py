@@ -319,9 +319,9 @@ class _SettingsWidgetStub:
     """LaserAutofocusSettingWidget-shaped stub for the live readout slots.
 
     Same approach as _WidgetStub in test_laser_af_crop: bind the real methods onto an object
-    carrying only what they touch, so the readouts and the Relax button can be exercised without
-    building a Qt widget tree. Class attributes have to be copied across by hand, so a removed one
-    shows up here as an AttributeError rather than a silent pass.
+    carrying only what they touch, so the readouts can be exercised without building a Qt widget
+    tree. Class attributes have to be copied across by hand, so a removed one shows up here as an
+    AttributeError rather than a silent pass.
     """
 
     _MARGIN_REFRESH_INTERVAL_S = LaserAutofocusSettingWidget._MARGIN_REFRESH_INTERVAL_S
@@ -334,14 +334,12 @@ class _SettingsWidgetStub:
     _apply_criteria_to_readouts = LaserAutofocusSettingWidget._apply_criteria_to_readouts
     _update_live_readouts = LaserAutofocusSettingWidget._update_live_readouts
     _update_row_tolerance_range = LaserAutofocusSettingWidget._update_row_tolerance_range
-    relax_to_admit_blob = LaserAutofocusSettingWidget.relax_to_admit_blob
 
     def __init__(self, initialized=True, crop_height=256):
         self._last_detection_result = None
         self._next_margin_refresh_s = 0.0
         self.measured_labels = {name: MagicMock() for name in utils._CC_SPINBOX_LIMITS}
         self.candidate_count_label = MagicMock()
-        self.relax_button = MagicMock()
         self.update_threshold_button = MagicMock()
         self.update_threshold_button.isEnabled.return_value = initialized
         self.spinboxes = {name: MagicMock() for name in utils._CC_SPINBOX_LIMITS}
@@ -356,10 +354,6 @@ class _SettingsWidgetStub:
 
     def tooltip(self, name) -> str:
         return self.measured_labels[name].setToolTip.call_args[0][0]
-
-    @property
-    def button_text(self) -> str:
-        return self.relax_button.setText.call_args[0][0]
 
 
 def _result_for(image, diagnose=True, **config_overrides):
@@ -379,7 +373,6 @@ class TestMeasuredReadouts:
         assert all(widget.shown(name) for name in ALL_CC)
         assert not any(widget.is_red(name) for name in ALL_CC)
         assert widget.candidate_count_label.setText.call_args[0][0] == "1"
-        widget.relax_button.setEnabled.assert_called_with(False)
 
     def test_only_the_failing_control_goes_red(self):
         widget = _SettingsWidgetStub()
@@ -389,7 +382,6 @@ class TestMeasuredReadouts:
 
         assert widget.is_red("cc_min_area")
         assert not any(widget.is_red(name) for name in ALL_CC if name != "cc_min_area")
-        widget.relax_button.setEnabled.assert_called_with(True)
 
     def test_an_off_row_blob_reddens_cc_row_tolerance_and_names_it(self):
         """The reported confusion, pinned: the measurement is called "row offset" but the control
@@ -461,8 +453,6 @@ class TestMeasuredReadouts:
 
         assert all(widget.shown(name) == "" for name in ALL_CC)
         assert widget._last_detection_result is None
-        assert widget.button_text == "Relax to Admit Blob"
-        widget.relax_button.setEnabled.assert_called_with(False)
 
     def test_a_frame_level_note_blanks_the_readouts_rather_than_showing_stale_numbers(self):
         """No number beside a control describes anything on a frame with no spot in it at all.
@@ -471,61 +461,61 @@ class TestMeasuredReadouts:
         widget.on_live_detection_result(_result_for(np.zeros((256, 1536), dtype=np.uint8)))
 
         assert all(widget.shown(name) == "" for name in ALL_CC)
-        widget.relax_button.setEnabled.assert_called_with(False)
 
-    def test_relax_stays_disabled_until_apply_is_available(self):
-        widget = _SettingsWidgetStub(initialized=False)
+
+class TestTheSuggestionInTheTooltip:
+    """The Relax button is gone; what it knew now lives on the readout it applies to.
+
+    A rejected blob still needs to say which value would admit it -- and, crucially, what that
+    value would cost, because relaxing a filter until something appears is exactly how a static
+    back-reflection gets locked onto.
+    """
+
+    def test_a_rejected_blob_names_the_value_that_would_admit_it(self):
+        widget = _SettingsWidgetStub()
         widget.on_live_detection_result(
             _result_for(create_test_image([(320, 240)], spot_size=6), cc_min_area=400)
         )
-        widget.relax_button.setEnabled.assert_called_with(False)
 
+        assert "Set CC Min Area to" in widget.tooltip("cc_min_area")
 
-class TestRelaxButton:
-    def test_it_fills_every_failing_spinbox_at_once(self):
-        """Fixing one filter at a time means clicking, applying, and being told about the next."""
+    def test_every_failing_control_carries_its_own_suggestion(self):
+        """The detector stops at the first filter a blob fails, so one at a time is a loop."""
         widget = _SettingsWidgetStub()
         widget.on_live_detection_result(
             _result_for(create_test_image([(320, 60)], spot_size=6), cc_min_area=400, cc_row_tolerance=20)
         )
-        widget.relax_to_admit_blob()
 
-        assert widget.spinboxes["cc_min_area"].setValue.called
-        assert widget.spinboxes["cc_row_tolerance"].setValue.called
-
-    def test_it_commits_nothing(self):
-        widget = _SettingsWidgetStub()
-        widget.on_live_detection_result(
-            _result_for(create_test_image([(320, 240)], spot_size=6), cc_min_area=400)
-        )
-        widget.relax_to_admit_blob()
-        widget.laserAutofocusController.update_threshold_properties.assert_not_called()
-
-    def test_it_does_nothing_without_a_suggestion(self):
-        widget = _SettingsWidgetStub()
-        widget.on_live_detection_result(_result_for(create_test_image([(320, 240)])))
-        widget.relax_to_admit_blob()
-        assert not any(box.setValue.called for box in widget.spinboxes.values())
+        assert "Set CC Min Area to" in widget.tooltip("cc_min_area")
+        assert "Set CC Row Tolerance to" in widget.tooltip("cc_row_tolerance")
 
     def test_a_surgical_relaxation_says_nothing_extra(self):
         widget = _SettingsWidgetStub()
         widget.on_live_detection_result(
             _result_for(create_test_image([(320, 240)], spot_size=6), cc_min_area=400)
         )
-        assert widget.button_text == "Relax to Admit Blob"
+
+        assert "would also admit" not in widget.tooltip("cc_min_area")
 
     @pytest.mark.parametrize(
         "spots, expected",
         [
-            ([(200, 240), (440, 240)], "Relax to Admit Blob (+1 other)"),
-            ([(140, 240), (280, 240), (420, 240), (540, 240)], "Relax to Admit Blob (+3 others)"),
+            ([(200, 240), (440, 240)], "would also admit 1 other blob"),
+            ([(140, 240), (280, 240), (420, 240), (540, 240)], "would also admit 3 other blobs"),
         ],
     )
-    def test_the_button_says_how_many_others_it_would_admit(self, spots, expected):
-        """The guard against relaxing your way onto a back-reflection, on the control that does it."""
+    def test_it_says_how_many_others_the_suggestion_would_admit(self, spots, expected):
+        """The guard against relaxing your way onto a back-reflection, kept where the number is."""
         widget = _SettingsWidgetStub()
         widget.on_live_detection_result(_result_for(create_test_image(spots, spot_size=6), cc_min_area=400))
-        assert widget.button_text == expected
+
+        assert expected in widget.tooltip("cc_min_area")
+
+    def test_a_passing_frame_suggests_nothing(self):
+        widget = _SettingsWidgetStub()
+        widget.on_live_detection_result(_result_for(create_test_image([(320, 240)])))
+
+        assert "Set CC Min Area to" not in widget.tooltip("cc_min_area")
 
 
 class TestFrameNotesReachTheStatusLine:

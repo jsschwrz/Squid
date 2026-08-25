@@ -1730,9 +1730,16 @@ class HighContentScreeningGui(QMainWindow):
             self.imageDisplayWindow_focus.set_autolevel(
                 self.laserAutofocusSettingWidget.display_autolevel_checkbox.isChecked()
             )
-            # The sweep is driven from its own dock, which is where the plot it produces lives.
+            # The sweep plot lives in its own dock, but it is fired from the settings panel, beside
+            # the z range and step that define its grid. The sweep widget keeps every guard and the
+            # worker thread; these only carry the button presses across, and it mirrors the button
+            # states back through set_sweep_running / set_sweep_slope_available.
             self.laserAutofocusController.signal_af_sweep_sample.connect(self.laserAFSweepWidget.on_sweep_sample)
             self.laserAutofocusController.signal_af_sweep_finished.connect(self.laserAFSweepWidget.on_sweep_finished)
+            self.laserAutofocusSettingWidget.signal_run_af_sweep.connect(self.laserAFSweepWidget.start_sweep)
+            self.laserAutofocusSettingWidget.signal_apply_sweep_slope.connect(
+                self.laserAFSweepWidget.apply_fit_as_calibration
+            )
             # Marks current z on the sweep plot while focusing by hand. movement_updater already
             # polls the stage at 10 Hz and its `position` signal had no consumers, so this needs no
             # timer of its own -- and polling from the widget would mean calling stage.get_pos(),

@@ -5,7 +5,6 @@ pixel-to-um calibration sanity guard. The controller tests build minimal stubs r
 than a full Microscope so they stay fast and hardware-free.
 """
 
-import re
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -14,7 +13,7 @@ import control._def
 from control import utils
 from control.core.laser_auto_focus_controller import LaserAutofocusController
 from control.models import LaserAFConfig
-from control.widgets import LaserAutofocusSettingWidget
+from control.widgets import _DEFAULT_CROP_PX, LaserAutofocusSettingWidget
 
 SENSOR_WIDTH = 3088
 SENSOR_HEIGHT = 2064
@@ -305,7 +304,7 @@ class _WidgetStub:
     on_live_spot_detected = LaserAutofocusSettingWidget.on_live_spot_detected
     _CROP_STATUS_REFRESH_INTERVAL_S = LaserAutofocusSettingWidget._CROP_STATUS_REFRESH_INTERVAL_S
     center_crop_on_last_detection = LaserAutofocusSettingWidget.center_crop_on_last_detection
-    reset_crop_to_full_sensor = LaserAutofocusSettingWidget.reset_crop_to_full_sensor
+    reset_crop_to_default = LaserAutofocusSettingWidget.reset_crop_to_default
     _apply_crop_and_refresh = LaserAutofocusSettingWidget._apply_crop_and_refresh
     _update_crop_status = LaserAutofocusSettingWidget._update_crop_status
     on_crop_selection_changed = LaserAutofocusSettingWidget.on_crop_selection_changed
@@ -403,28 +402,32 @@ class TestWidgetCropSlots:
         assert widget._last_spot_detection is None
         widget.center_crop_button.setEnabled.assert_called_with(False)
 
-    def test_reset_to_full_sensor(self):
+    def test_reset_goes_to_a_centred_square_crop_not_the_whole_sensor(self):
+        """A full-sensor read is too slow to follow in live view, which is what Reset is for."""
         widget = _WidgetStub(LaserAFConfig(x_offset=752, y_offset=694, width=1536, height=256))
 
-        widget.reset_crop_to_full_sensor()
+        widget.reset_crop_to_default()
 
+        # (3088 - 1000) // 2 = 1044, snapped down to the camera's 8 px grid by clamp_roi.
         widget.laserAutofocusController.camera.set_region_of_interest.assert_called_once_with(
-            0, 0, SENSOR_WIDTH, SENSOR_HEIGHT
+            1040, 532, _DEFAULT_CROP_PX, _DEFAULT_CROP_PX
         )
 
-    def test_crop_status_reports_travel_headroom(self):
-        widget = _WidgetStub(
-            LaserAFConfig(x_offset=752, y_offset=694, width=1536, height=256, pixel_to_um=0.5, laser_af_range=40.0),
-            last_detection=(768.0, 128.0, (752, 694, 1536, 256)),
-        )
+    def test_reset_never_asks_for_more_than_the_sensor_has(self):
+        widget = _WidgetStub(LaserAFConfig(x_offset=0, y_offset=0, width=64, height=64))
+        widget.laserAutofocusController._sensor_size = (640, 480)
+
+        widget.reset_crop_to_default()
+
+        widget.laserAutofocusController.camera.set_region_of_interest.assert_called_once_with(0, 0, 640, 480)
+
+    def test_crop_status_is_one_line_of_what_the_crop_can_see(self):
+        """Everything else this label used to compute is now answered by the sweep plot."""
+        widget = _WidgetStub(LaserAFConfig(x_offset=752, y_offset=694, width=1536, height=256, pixel_to_um=0.5))
 
         widget._update_crop_status()
 
-        text = widget.crop_status_label.setText.call_args[0][0]
-        assert "full-sensor x=1520.0" in text
-        assert "768 px left / 768 px right" in text
-        assert "-384 um / +384 um" in text
-        assert widget.crop_status_label.setStyleSheet.call_args[0][0] == ""
+        assert widget.crop_status_label.setText.call_args[0][0] == "Crop sees ±384 um at 0.5000 um/px"
 
     def test_drawn_box_is_placed_on_the_sensor_using_the_camera_roi(self):
         """The displayed frame is itself a crop, so a box drawn on it is relative to that crop."""
@@ -476,72 +479,11 @@ class TestWidgetCropSlots:
 
         widget.select_crop_button.setChecked.assert_called_once_with(False)
 
-    def test_crop_status_flags_a_crop_too_narrow_for_the_search(self):
-        # The real 40x: 0.0799 um/px means a 512 px crop sees only +/-20 um, so most of a
-        # 40 um search runs where the spot cannot be.
-        widget = _WidgetStub(
-            LaserAFConfig(width=512, height=100, pixel_to_um=0.07986, laser_af_search_range_um=40.0)
-        )
-
-        widget._update_crop_status()
-
-        text = widget.crop_status_label.setText.call_args[0][0]
-        assert "TOO NARROW" in text
-        assert "red" in widget.crop_status_label.setStyleSheet.call_args[0][0]
-
-    def test_crop_status_advises_but_does_not_alarm_on_an_over_wide_crop(self):
-        # The real 20x: 5.2x wider than the search needs. Worth saying, not worth a warning.
-        widget = _WidgetStub(
-            LaserAFConfig(width=1536, height=256, pixel_to_um=0.6754, laser_af_search_range_um=100.0)
-        )
-
-        widget._update_crop_status()
-
-        text = widget.crop_status_label.setText.call_args[0][0]
-        assert "wider than the search needs" in text
-        assert widget.crop_status_label.setStyleSheet.call_args[0][0] == ""
-
-    def test_crop_status_stays_quiet_on_a_moderately_wide_crop(self):
-        # The real 4x: 3.7x, below the advisory factor. Flagging every objective would make the
-        # advice meaningless.
-        widget = _WidgetStub(
-            LaserAFConfig(width=1536, height=256, pixel_to_um=0.4820, laser_af_search_range_um=100.0)
-        )
-
-        widget._update_crop_status()
-
-        text = widget.crop_status_label.setText.call_args[0][0]
-        assert "wider than the search needs" not in text
-        assert "TOO NARROW" not in text
-
-    def test_crop_status_suggests_a_camera_legal_width(self):
-        widget = _WidgetStub(
-            LaserAFConfig(width=512, height=100, pixel_to_um=0.07986, laser_af_search_range_um=40.0)
-        )
-
-        widget._update_crop_status()
-
-        text = widget.crop_status_label.setText.call_args[0][0]
-        suggested = int(re.search(r"Widen the crop to ~(\d+) px", text).group(1))
-        # clamp_roi snaps width to a multiple of 8, so any other suggestion would be silently changed.
-        assert suggested % 8 == 0
-
-    def test_crop_status_survives_an_uncalibrated_objective(self):
-        widget = _WidgetStub(LaserAFConfig(width=1536, height=256, pixel_to_um=0.0))
+    @pytest.mark.parametrize("pixel_to_um", [0.0, float("inf"), float("nan")])
+    def test_crop_status_says_nothing_until_the_objective_is_calibrated(self, pixel_to_um):
+        """A um-per-pixel figure derived from a placeholder is worse than a blank line."""
+        widget = _WidgetStub(LaserAFConfig(width=1536, height=256, pixel_to_um=pixel_to_um))
 
         widget._update_crop_status()  # must not raise
 
-        assert "TOO NARROW" not in widget.crop_status_label.setText.call_args[0][0]
-
-    def test_crop_status_flags_a_spot_with_less_headroom_than_the_af_range(self):
-        # The hardware case: the spot 14 px from the crop edge, at 0.5 um/px, leaves 7 um of
-        # travel against a 40 um search range.
-        widget = _WidgetStub(
-            LaserAFConfig(x_offset=0, y_offset=694, width=1536, height=256, pixel_to_um=0.5, laser_af_range=40.0),
-            last_detection=(1521.5, 128.0, (0, 694, 1536, 256)),
-        )
-
-        widget._update_crop_status()
-
-        assert "Less headroom" in widget.crop_status_label.setText.call_args[0][0]
-        assert "red" in widget.crop_status_label.setStyleSheet.call_args[0][0]
+        assert widget.crop_status_label.setText.call_args[0][0] == ""
