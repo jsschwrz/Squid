@@ -1,0 +1,15 @@
+# A post-split config: the search range and step are stored explicitly and must be
+# taken verbatim, not re-derived from laser_af_range.
+version: 1
+x_offset: 776
+y_offset: 1000
+width: 1536
+height: 256
+pixel_to_um: 0.6754
+x_reference: 812.0
+has_reference: false
+laser_af_range: 200.0
+laser_af_search_range_um: 100.0
+laser_af_search_step_um: 4.0
+laser_af_averaging_n: 5
+spot_detection_mode: dual_left

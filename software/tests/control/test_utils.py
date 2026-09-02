@@ -73,15 +73,43 @@ def test_multi_spot_detection():
     spots = [(200, 240), (280, 240), (360, 240)]
     image = create_test_image(spots)
 
-    # Test rightmost spot detection
-    result = find_spot_location(image, mode=SpotDetectionMode.MULTI_RIGHT)
+    # More than two candidates: DUAL_RIGHT still means "the rightmost one". This is the case
+    # the retired MULTI_RIGHT mode covered, and it selected the same spot.
+    result = find_spot_location(image, mode=SpotDetectionMode.DUAL_RIGHT)
     assert result
     detected_x, detected_y = result
     assert abs(detected_x - spots[2][0]) < 5
 
-    # Test second from right spot detection
-    with pytest.raises(NotImplementedError):
-        result = find_spot_location(image, mode=SpotDetectionMode.MULTI_SECOND_RIGHT)
+    result = find_spot_location(image, mode=SpotDetectionMode.DUAL_LEFT)
+    assert result
+    detected_x, detected_y = result
+    assert abs(detected_x - spots[0][0]) < 5
+
+
+@pytest.mark.parametrize("retired, replacement", [("multi_right", "dual_right"), ("multi_second_right", "dual_right")])
+def test_retired_spot_modes_are_migrated_not_rejected(retired, replacement):
+    """A config naming a retired mode must still load with its calibration intact.
+
+    ConfigRepository._load_yaml swallows ValidationError and returns None, so rejecting the
+    value would silently cost the objective its pixel_to_um and reference image.
+    """
+    from control.models.laser_af_config import LaserAFConfig
+
+    config = LaserAFConfig(spot_detection_mode=retired, pixel_to_um=0.8735, x_reference=1786.4)
+
+    assert config.spot_detection_mode == SpotDetectionMode(replacement)
+    assert config.pixel_to_um == 0.8735
+    assert config.x_reference == 1786.4
+
+
+def test_unknown_spot_mode_is_still_rejected():
+    """The migration must not turn genuine typos into a silent default."""
+    from pydantic import ValidationError
+
+    from control.models.laser_af_config import LaserAFConfig
+
+    with pytest.raises(ValidationError):
+        LaserAFConfig(spot_detection_mode="dual_leftt")
 
 
 def test_invalid_inputs():
