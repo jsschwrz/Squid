@@ -1005,6 +1005,13 @@ class HighContentScreeningGui(QMainWindow):
                 self.liveController_focus_camera,
                 self.laserAutofocusController,
                 stretch=False,
+                # Extras for the Laser AF Map diagnostic. The flexible multipoint widget is
+                # built further down in this method, so it is passed as a getter that resolves
+                # lazily when the dialog opens.
+                microscope=self.microscope,
+                objectiveStore=self.objectiveStore,
+                mainLiveController=self.liveController,
+                getFlexibleMultiPointLocations=self._get_flexible_multipoint_locations,
             )  # ,show_display_options=True)
             self.waveformDisplay = widgets.WaveformDisplay(N=1000, include_x=True, include_y=False)
             self.displacementMeasurementWidget = widgets.DisplacementMeasurementWidget(
@@ -1301,6 +1308,18 @@ class HighContentScreeningGui(QMainWindow):
                 laserfocus_dockArea.addDock(dock_displayMeasurement, "bottom", relativeTo=dock_waveform)
 
             self.imageDisplayTabs.addTab(laserfocus_dockArea, self.LASER_BASED_FOCUS_TAB_NAME)
+
+    def _get_flexible_multipoint_locations(self):
+        """Current Flexible Multipoint location list, as (Nx3 [x_mm, y_mm, z_mm], N ids).
+
+        Resolved lazily so the Laser AF Map dialog always sees the list as it stands when the
+        user opens it, and so laserAutofocusSettingWidget can be built before
+        flexibleMultiPointWidget exists.
+        """
+        widget = self.flexibleMultiPointWidget
+        if widget is None:
+            return np.empty((0, 3), dtype=float), np.empty((0,), dtype="<U20")
+        return np.array(widget.location_list, dtype=float), np.array(widget.location_ids)
 
     def setupRecordTabWidget(self):
         if ENABLE_WELLPLATE_MULTIPOINT:
