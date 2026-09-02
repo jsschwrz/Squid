@@ -1,0 +1,15 @@
+# A pre-split config: laser_af_range bounded the z search before the search range and
+# step became fields of their own.  Loading it must back-fill the search range from
+# laser_af_range rather than from the field default, or an objective deliberately set
+# narrower would silently widen.
+version: 1
+x_offset: 800
+y_offset: 980
+width: 1536
+height: 256
+pixel_to_um: 0.482
+x_reference: 745.5
+has_reference: false
+laser_af_range: 60.0
+laser_af_averaging_n: 5
+spot_detection_mode: dual_left
