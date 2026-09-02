@@ -1,5 +1,6 @@
 """Tests for ImageDisplayWindow's Ctrl+Scroll Z-navigation event filter."""
 
+import numpy as np
 import pytest
 from qtpy.QtCore import Qt, QPointF, QPoint
 from qtpy.QtGui import QWheelEvent
@@ -101,3 +102,60 @@ def test_wheel_step_size_picks_up_live_def_changes(image_display_window, monkeyp
     image_display_window.eventFilter(image_display_window, _wheel_event(120, Qt.ControlModifier | Qt.ShiftModifier))
 
     assert received == [pytest.approx(7.5), pytest.approx(99.0)]
+
+
+# --- Crop selector (ROI) ----------------------------------------------------
+
+
+def test_scale_handles_are_on_the_lower_left_upper_right_diagonal(image_display_window):
+    """The laser AF spot crosses the frame lower-left to upper-right as focus changes.
+
+    Framing a crop means dragging the two corners the spot runs between, so the handles have to
+    sit on that diagonal rather than the other one.
+
+    Asserted in data coordinates, not in the ROI's own normalized ones: the view is y-inverted,
+    so which screen corner a normalized position lands on is exactly the part worth pinning. With
+    y inverted, the larger y is the lower edge.
+    """
+    image_display_window.display_image(np.zeros((2064, 3088), dtype=np.uint8))
+    image_display_window.start_roi_selection(x=100, y=200, width=300, height=400)
+    assert image_display_window.graphics_widget.view.yInverted()
+
+    corners = set()
+    for handle in image_display_window.ROI.handles:
+        point = image_display_window.ROI.mapToParent(handle["item"].pos())
+        corners.add((round(point.x()), round(point.y())))
+
+    lower_left = (100, 600)
+    upper_right = (400, 200)
+    assert corners == {lower_left, upper_right}
+
+
+def test_selector_opens_at_the_default_size_centered(image_display_window):
+    image_display_window.display_image(np.zeros((2064, 3088), dtype=np.uint8))
+    assert image_display_window.start_roi_selection() is True
+
+    size = ImageDisplayWindow.DEFAULT_ROI_SELECTION_SIZE
+    assert tuple(image_display_window.ROI.size()) == (size, size)
+    # Centered, rather than the old half-the-frame box that opened at 1544x1032 here.
+    assert tuple(image_display_window.ROI.pos()) == ((3088 - size) // 2, (2064 - size) // 2)
+
+
+def test_selector_is_clamped_to_a_frame_smaller_than_the_default(image_display_window):
+    image_display_window.display_image(np.zeros((256, 640), dtype=np.uint8))
+    image_display_window.start_roi_selection()
+
+    assert tuple(image_display_window.ROI.size()) == (640, 256)
+    assert tuple(image_display_window.ROI.pos()) == (0, 0)
+
+
+def test_explicit_bounds_still_win_over_the_default(image_display_window):
+    image_display_window.display_image(np.zeros((2064, 3088), dtype=np.uint8))
+    image_display_window.start_roi_selection(x=100, y=200, width=300, height=400)
+
+    assert tuple(image_display_window.ROI.pos()) == (100, 200)
+    assert tuple(image_display_window.ROI.size()) == (300, 400)
+
+
+def test_selection_before_any_image_is_refused(image_display_window):
+    assert image_display_window.start_roi_selection() is False
