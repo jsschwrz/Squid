@@ -376,9 +376,7 @@ class TestMeasuredReadouts:
 
     def test_only_the_failing_control_goes_red(self):
         widget = _SettingsWidgetStub()
-        widget.on_live_detection_result(
-            _result_for(create_test_image([(320, 240)], spot_size=6), cc_min_area=400)
-        )
+        widget.on_live_detection_result(_result_for(create_test_image([(320, 240)], spot_size=6), cc_min_area=400))
 
         assert widget.is_red("cc_min_area")
         assert not any(widget.is_red(name) for name in ALL_CC if name != "cc_min_area")
@@ -387,9 +385,7 @@ class TestMeasuredReadouts:
         """The reported confusion, pinned: the measurement is called "row offset" but the control
         that governs it is CC Row Tolerance, and only the control name is actionable."""
         widget = _SettingsWidgetStub()
-        widget.on_live_detection_result(
-            _result_for(create_test_image([(320, 60)]), cc_row_tolerance=20)
-        )
+        widget.on_live_detection_result(_result_for(create_test_image([(320, 60)]), cc_row_tolerance=20))
 
         assert widget.is_red("cc_row_tolerance")
         assert widget.shown("cc_row_tolerance") == "180"
@@ -473,9 +469,7 @@ class TestTheSuggestionInTheTooltip:
 
     def test_a_rejected_blob_names_the_value_that_would_admit_it(self):
         widget = _SettingsWidgetStub()
-        widget.on_live_detection_result(
-            _result_for(create_test_image([(320, 240)], spot_size=6), cc_min_area=400)
-        )
+        widget.on_live_detection_result(_result_for(create_test_image([(320, 240)], spot_size=6), cc_min_area=400))
 
         assert "Set CC Min Area to" in widget.tooltip("cc_min_area")
 
@@ -491,9 +485,7 @@ class TestTheSuggestionInTheTooltip:
 
     def test_a_surgical_relaxation_says_nothing_extra(self):
         widget = _SettingsWidgetStub()
-        widget.on_live_detection_result(
-            _result_for(create_test_image([(320, 240)], spot_size=6), cc_min_area=400)
-        )
+        widget.on_live_detection_result(_result_for(create_test_image([(320, 240)], spot_size=6), cc_min_area=400))
 
         assert "would also admit" not in widget.tooltip("cc_min_area")
 
@@ -520,7 +512,7 @@ class TestTheSuggestionInTheTooltip:
 
 class TestFrameNotesReachTheStatusLine:
     def test_a_note_is_preferred_over_the_bare_failure_reason(self):
-        """"no spot detected" leaves you guessing; "the spot is not in this crop" tells you no
+        """ "no spot detected" leaves you guessing; "the spot is not in this crop" tells you no
         detection setting is the fix."""
         from control.widgets import LaserAFSpotOverlay
 
