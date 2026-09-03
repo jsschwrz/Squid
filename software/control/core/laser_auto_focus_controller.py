@@ -338,7 +338,9 @@ class LaserAutofocusController(QObject):
         )
         # Only warn when the clamp actually bit -- an offset that merely got truncated to the
         # camera's 8/2 px alignment grid is normal and would otherwise warn on every init.
-        if not (0 <= requested_x <= self._sensor_size[0] - crop_w and 0 <= requested_y <= self._sensor_size[1] - crop_h):
+        if not (
+            0 <= requested_x <= self._sensor_size[0] - crop_w and 0 <= requested_y <= self._sensor_size[1] - crop_h
+        ):
             self._log.warning(
                 f"Laser spot at ({x:.1f}, {y:.1f}) cannot be centered in a {crop_w}x{crop_h} crop on a "
                 f"{self._sensor_size[0]}x{self._sensor_size[1]} sensor; using offset ({crop_x}, {crop_y}). "
@@ -732,9 +734,7 @@ class LaserAutofocusController(QObject):
         )
         if accepted:
             return True, "confirmed: spot translated with z"
-        return False, (
-            f"rejected: spot moved {observed_dx_px:+.2f} px where {predicted_dx_px:+.2f} px was expected"
-        )
+        return False, (f"rejected: spot moved {observed_dx_px:+.2f} px where {predicted_dx_px:+.2f} px was expected")
 
     def _build_search_positions(
         self, range_um: Optional[float] = None, step_um: Optional[float] = None
@@ -944,9 +944,7 @@ class LaserAutofocusController(QObject):
 
         x_reference = self.laser_af_properties.x_reference
         save_config = self.laser_af_properties.model_copy(
-            update={
-                "x_reference": None if x_reference is None else x_reference + self.laser_af_properties.x_offset
-            }
+            update={"x_reference": None if x_reference is None else x_reference + self.laser_af_properties.x_offset}
         )
         if self.laser_af_properties.has_reference and self.reference_crop is not None:
             save_config.set_reference_image(self.reference_crop)
@@ -961,9 +959,7 @@ class LaserAutofocusController(QObject):
             "threshold": self.laser_af_properties.cc_threshold,
             "min_area": self.laser_af_properties.cc_min_area,
             "max_area": self.laser_af_properties.cc_max_area,
-            "row_tolerance": (
-                self.laser_af_properties.cc_row_tolerance if row_tolerance is None else row_tolerance
-            ),
+            "row_tolerance": (self.laser_af_properties.cc_row_tolerance if row_tolerance is None else row_tolerance),
             "max_aspect_ratio": self.laser_af_properties.cc_max_aspect_ratio,
         }
 
@@ -1265,9 +1261,7 @@ class LaserAutofocusController(QObject):
                 )
                 return
 
-            self._log.info(
-                f"Iterative correction pass {pass_number}: residual {error_um:+.2f} um, moving again."
-            )
+            self._log.info(f"Iterative correction pass {pass_number}: residual {error_um:+.2f} um, moving again.")
             self._move_z(-error_um)
             if self.piezo is not None:
                 time.sleep(control._def.MULTIPOINT_PIEZO_DELAY_MS / 1000)

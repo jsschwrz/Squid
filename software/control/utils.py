@@ -1077,9 +1077,7 @@ def diagnose_frame(
 
     if peak > p["threshold"]:
         _, _, labels, num_labels, _, components = _collect_valid_spots(working_image, p, collect_rejects=True)
-        return _diagnose_above_threshold(
-            working_image, p, peak, median, x_reference, labels, num_labels, components
-        )
+        return _diagnose_above_threshold(working_image, p, peak, median, x_reference, labels, num_labels, components)
     return _diagnose_below_threshold(working_image, p, peak, median)
 
 
@@ -1124,9 +1122,7 @@ def analyze_frame(
     if peak <= p["threshold"]:
         return [], (diagnose_frame(working_image, params=p, x_reference=x_reference) if diagnose else None)
 
-    valid_spots, _, labels, num_labels, _, components = _collect_valid_spots(
-        working_image, p, collect_rejects=diagnose
-    )
+    valid_spots, _, labels, num_labels, _, components = _collect_valid_spots(working_image, p, collect_rejects=diagnose)
     candidates = _candidates_from_valid_spots(working_image, valid_spots, max_candidates)
 
     diagnosis = None

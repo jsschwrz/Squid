@@ -112,9 +112,7 @@ class LaserAFConfig(BaseModel):
         description="Extra z step used to confirm the spot translates with z. Must be large enough "
         "that dz/pixel_to_um is measurable, which differs by an order of magnitude between objectives.",
     )
-    confirm_tolerance_px: float = Field(
-        4.0, gt=0, description="Absolute slack on the predicted translation, in pixels"
-    )
+    confirm_tolerance_px: float = Field(4.0, gt=0, description="Absolute slack on the predicted translation, in pixels")
     # A plain bool rather than a mode enum: unlike confirm_motion_mode there is only one place
     # this can hook in, so there is no second variant to name.
     iterative_correction_enabled: bool = Field(

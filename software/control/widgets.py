@@ -3312,9 +3312,7 @@ class LaserAutofocusSettingWidget(QWidget):
         self._add_spinbox(settings_layout, "CC Threshold:", "cc_threshold", 0, 255, 0, measured=True)
         self._add_spinbox(settings_layout, "CC Min Area (pixels):", "cc_min_area", 1, 1000, 0, measured=True)
         self._add_spinbox(settings_layout, "CC Max Area (pixels):", "cc_max_area", 100, 50000, 0, measured=True)
-        self._add_spinbox(
-            settings_layout, "CC Row Tolerance (pixels):", "cc_row_tolerance", 1, 200, 0, measured=True
-        )
+        self._add_spinbox(settings_layout, "CC Row Tolerance (pixels):", "cc_row_tolerance", 1, 200, 0, measured=True)
         self._add_spinbox(
             settings_layout, "CC Max Aspect Ratio:", "cc_max_aspect_ratio", 1.0, 10.0, 1, 0.5, measured=True
         )
@@ -3348,8 +3346,6 @@ class LaserAutofocusSettingWidget(QWidget):
         self.candidate_count_label.setToolTip("Spots the detector found in the current frame.")
         spot_mode_layout.addWidget(self.candidate_count_label)
         settings_layout.addLayout(spot_mode_layout)
-
-
 
         # Add threshold property spinboxes
         self._add_spinbox(settings_layout, "Spot Crop Size (pixels):", "spot_crop_size", 1, 500, 0)
@@ -3836,7 +3832,9 @@ class LaserAutofocusSettingWidget(QWidget):
             self.spot_mode_combo.setCurrentIndex(index)
 
         # Update motion confirm mode
-        confirm_index = self.confirm_mode_combo.findData(self.laserAutofocusController.laser_af_properties.confirm_motion_mode)
+        confirm_index = self.confirm_mode_combo.findData(
+            self.laserAutofocusController.laser_af_properties.confirm_motion_mode
+        )
         if confirm_index >= 0:
             self.confirm_mode_combo.setCurrentIndex(confirm_index)
         self.iterative_correction_checkbox.setChecked(
@@ -14868,9 +14866,7 @@ class LaserAFSweepWidget(QWidget):
             return
 
         if not self.laserAutofocusController.is_initialized:
-            QMessageBox.warning(
-                self, "Laser Autofocus", "Initialize the laser autofocus before running a sweep."
-            )
+            QMessageBox.warning(self, "Laser Autofocus", "Initialize the laser autofocus before running a sweep.")
             return
 
         config = self.laserAutofocusController.laser_af_properties
@@ -15043,8 +15039,7 @@ class LaserAFSweepWidget(QWidget):
         # Whether the slope is worth reading back into the configuration is a question about the fit,
         # so the fit quality belongs next to the slope rather than in the log.
         quality = (
-            f" Fit: {fit.n_points} points over {fit.dz_span_um:.0f} um, residual "
-            f"{fit.residual_rms_px:.2f} px RMS."
+            f" Fit: {fit.n_points} points over {fit.dz_span_um:.0f} um, residual " f"{fit.residual_rms_px:.2f} px RMS."
         )
         if fit.residual_is_high:
             quality += " That is a lot of curvature for one straight line; narrow the sweep around focus."

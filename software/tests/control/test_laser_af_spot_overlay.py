@@ -168,9 +168,9 @@ class TestSpotOverlayThrottle:
         overlay.set_enabled(True)
         # A full-sensor crop: detection itself burns 1 s, so the 5 Hz rate is not the binding
         # constraint -- the duty cycle is, and it must hold the next run off for 1/0.25 = 4 s.
-        controller.classify_frame_spots.side_effect = lambda image, diagnose=False: clock.advance(
-            1.0
-        ) or SpotOverlayResult()
+        controller.classify_frame_spots.side_effect = (
+            lambda image, diagnose=False: clock.advance(1.0) or SpotOverlayResult()
+        )
         overlay.on_frame(np.zeros((16, 16), dtype=np.uint8))
 
         clock.advance(3.0)

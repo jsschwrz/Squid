@@ -268,9 +268,7 @@ class TestInitializeWithinCurrentCrop:
 
     def test_default_mode_still_resets_to_the_full_sensor(self):
         controller = self._controller(LaserAFConfig(x_offset=2048, y_offset=694, width=512, height=256))
-        controller._get_laser_spot_centroid = MagicMock(
-            side_effect=[(1520.0, 822.0), (700.0, 100.0), (710.64, 100.0)]
-        )
+        controller._get_laser_spot_centroid = MagicMock(side_effect=[(1520.0, 822.0), (700.0, 100.0), (710.64, 100.0)])
 
         assert controller.initialize_auto() is True
 

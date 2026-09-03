@@ -193,17 +193,13 @@ class TestFalseColorLut:
 
 class TestBuildSearchPositions:
     def test_step_is_honoured(self):
-        controller = _controller_for_search(
-            LaserAFConfig(laser_af_search_range_um=10.0, laser_af_search_step_um=2.5)
-        )
+        controller = _controller_for_search(LaserAFConfig(laser_af_search_range_um=10.0, laser_af_search_step_um=2.5))
         _, _, positions = controller._build_search_positions()
         deltas = {round(b - a, 6) for a, b in zip(sorted(positions), sorted(positions)[1:])}
         assert deltas == {2.5}
 
     def test_explicit_arguments_override_the_config(self):
-        controller = _controller_for_search(
-            LaserAFConfig(laser_af_search_range_um=100.0, laser_af_search_step_um=10.0)
-        )
+        controller = _controller_for_search(LaserAFConfig(laser_af_search_range_um=100.0, laser_af_search_step_um=10.0))
         _, step_used, positions = controller._build_search_positions(range_um=5.0, step_um=1.0)
         assert step_used == pytest.approx(1.0)
         assert min(positions) == pytest.approx(995.0)
@@ -944,8 +940,10 @@ class TestRunAfSweep:
         widget = MagicMock()
         widget.laserAutofocusController.laser_af_properties = LaserAFConfig(pixel_to_um=0.5)
         # A spot translating at exactly 1/0.5 = 2 px per um.
-        samples = [SweepSample(z_um=1000.0 + dz, dz_um=dz, candidates=[{"x": 100.0 + 2 * dz}], selected_x=100.0 + 2 * dz)
-                   for dz in (-20.0, -10.0, 0.0, 10.0, 20.0)]
+        samples = [
+            SweepSample(z_um=1000.0 + dz, dz_um=dz, candidates=[{"x": 100.0 + 2 * dz}], selected_x=100.0 + 2 * dz)
+            for dz in (-20.0, -10.0, 0.0, 10.0, 20.0)
+        ]
 
         text = LaserAFSweepWidget._summarize(widget, samples)
 
@@ -958,8 +956,10 @@ class TestRunAfSweep:
 
         widget = MagicMock()
         widget.laserAutofocusController.laser_af_properties = LaserAFConfig(pixel_to_um=0.5)
-        samples = [SweepSample(z_um=1000.0 + dz, dz_um=dz, candidates=[{"x": 100.0}], selected_x=100.0)
-                   for dz in (-20.0, -10.0, 0.0, 10.0, 20.0)]
+        samples = [
+            SweepSample(z_um=1000.0 + dz, dz_um=dz, candidates=[{"x": 100.0}], selected_x=100.0)
+            for dz in (-20.0, -10.0, 0.0, 10.0, 20.0)
+        ]
 
         text = LaserAFSweepWidget._summarize(widget, samples)
 
@@ -972,9 +972,10 @@ class TestRunAfSweep:
         widget = MagicMock()
         widget.laserAutofocusController.laser_af_properties = LaserAFConfig(pixel_to_um=0.5)
         # Translating at 12.5 px/um -> 0.08 um/px, nothing like the stored 0.5.
-        samples = [SweepSample(z_um=1000.0 + dz, dz_um=dz, candidates=[{"x": 100.0 + 12.5 * dz}],
-                               selected_x=100.0 + 12.5 * dz)
-                   for dz in (-20.0, -10.0, 0.0, 10.0, 20.0)]
+        samples = [
+            SweepSample(z_um=1000.0 + dz, dz_um=dz, candidates=[{"x": 100.0 + 12.5 * dz}], selected_x=100.0 + 12.5 * dz)
+            for dz in (-20.0, -10.0, 0.0, 10.0, 20.0)
+        ]
 
         text = LaserAFSweepWidget._summarize(widget, samples)
 
@@ -1042,8 +1043,12 @@ class TestSweepFit:
 
         # A parabola, which no straight line describes.
         samples = [
-            SweepSample(z_um=1000.0 + dz, dz_um=dz, candidates=[{"x": 100.0 + 0.02 * dz * dz}],
-                        selected_x=100.0 + 0.02 * dz * dz)
+            SweepSample(
+                z_um=1000.0 + dz,
+                dz_um=dz,
+                candidates=[{"x": 100.0 + 0.02 * dz * dz}],
+                selected_x=100.0 + 0.02 * dz * dz,
+            )
             for dz in range(-100, 101, 10)
         ]
 
@@ -1164,13 +1169,17 @@ class TestApplySweepFitAsCalibration:
         widget._set_slope_available = LaserAFSweepWidget._set_slope_available.__get__(widget)
         panel = widget.laserAutofocusSettingWidget
 
-        moving = [SweepSample(z_um=1000.0 + dz, dz_um=dz, candidates=[{"x": 100.0 + 2 * dz}],
-                              selected_x=100.0 + 2 * dz) for dz in (-10.0, 0.0, 10.0)]
+        moving = [
+            SweepSample(z_um=1000.0 + dz, dz_um=dz, candidates=[{"x": 100.0 + 2 * dz}], selected_x=100.0 + 2 * dz)
+            for dz in (-10.0, 0.0, 10.0)
+        ]
         LaserAFSweepWidget.on_sweep_finished(widget, moving)
         assert panel.set_sweep_slope_available.call_args[0][0] is True
 
-        static = [SweepSample(z_um=1000.0 + dz, dz_um=dz, candidates=[{"x": 100.0}], selected_x=100.0)
-                  for dz in (-10.0, 0.0, 10.0)]
+        static = [
+            SweepSample(z_um=1000.0 + dz, dz_um=dz, candidates=[{"x": 100.0}], selected_x=100.0)
+            for dz in (-10.0, 0.0, 10.0)
+        ]
         LaserAFSweepWidget.on_sweep_finished(widget, static)
         assert panel.set_sweep_slope_available.call_args[0][0] is False
 
@@ -1272,6 +1281,8 @@ class TestCalibrationDistanceFitsThePiezo:
         controller = self._controller(100.0, piezo=MagicMock(position=10.0, range_um=300.0))
 
         assert not controller._calibration_distance_fits()
+
+
 class _StrictImageSignal:
     """Stands in for image_to_display, which is typed numpy.ndarray and rejects None.
 
