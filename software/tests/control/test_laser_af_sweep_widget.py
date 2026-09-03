@@ -237,8 +237,10 @@ class TestRunAfSweep:
         text = LaserAFSweepWidget._summarize(widget, samples)
 
         assert "2.00 px/um" in text
-        assert "0.5000 um/px" in text
-        assert "agrees within" in text
+        # Three decimals in the readout; the fourth belongs on the Apply Found Slope dialog, which
+        # is where the number is actually committed.
+        assert "0.500 um/px" in text
+        assert "agrees" in text
 
     def test_summarize_calls_out_a_branch_that_does_not_move(self):
         from control.widgets import LaserAFSweepWidget
@@ -268,7 +270,8 @@ class TestRunAfSweep:
 
         text = LaserAFSweepWidget._summarize(widget, samples)
 
-        assert "DISAGREES" in text
+        assert "off " in text and "%" in text
+        assert "agrees" not in text
 
     def test_summarize_handles_an_empty_sweep(self):
         from control.widgets import LaserAFSweepWidget
@@ -354,8 +357,7 @@ class TestSweepFit:
 
         text = LaserAFSweepWidget._summarize(widget, self._samples(slope_px_per_um=2.0))
 
-        assert "5 points over 40 um" in text
-        assert "residual 0.00 px RMS" in text
+        assert "5 pts / 40 um / 0.00 px RMS" in text
 
 
 class TestApplySweepFitAsCalibration:
