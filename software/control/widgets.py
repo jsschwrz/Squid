@@ -7,7 +7,7 @@ import yaml
 import logging
 import sys
 from pathlib import Path
-from typing import Dict, List, NamedTuple, Optional, TYPE_CHECKING
+from typing import Dict, List, NamedTuple, Optional, Tuple, TYPE_CHECKING
 
 import psutil
 
@@ -13216,6 +13216,85 @@ def _fit_sweep_slope(samples) -> Optional[_SweepFit]:
     return _SweepFit(float(slope), residual_rms_px, len(points), dz_span_um)
 
 
+# Amber for everything the manual-focus overlay draws. The plot already spends grey on the
+# candidates, blue on the selected spot, green on the reference row and yellow on the live z marker;
+# amber is what is left that still reads as a distinct series against all four.
+_MANUAL_FOCUS_COLOR = (255, 170, 0)
+# Height of a rug tick as a fraction of the visible y range, so the ticks stay a rug through a zoom
+# rather than growing into full-height lines that would compete with the data.
+_MANUAL_FOCUS_RUG_FRACTION = 0.04
+
+
+class _ManualFocusSource(NamedTuple):
+    """One list of hand-focused z values the overlay can draw."""
+
+    key: str
+    button_text: str
+    label: str
+    z_values_um: List[float]
+
+
+class _ManualFocusSpread(NamedTuple):
+    """Where a list of hand-focused z values sits on the sweep plot's offset axis."""
+
+    offsets_um: List[float]
+    mean_um: float
+    min_um: float
+    max_um: float
+
+    @property
+    def span_um(self) -> float:
+        return self.max_um - self.min_um
+
+
+def _manual_focus_spread(z_values_um, origin_um: float) -> Optional[_ManualFocusSpread]:
+    """Place absolute z values onto the axis measured from ``origin_um``.
+
+    Module level for the same reason _fit_sweep_slope is: the numbers the status line quotes are
+    worth computing and testing without building a widget around them.
+
+    Returns None when there is nothing to place. A single point is not an error -- it has zero
+    span, which is a true statement about one point.
+    """
+    values = [float(z) for z in z_values_um if z is not None and math.isfinite(float(z))]
+    if not values:
+        return None
+
+    offsets = [z - origin_um for z in values]
+    array = np.array(offsets, dtype=float)
+    return _ManualFocusSpread(
+        offsets_um=offsets,
+        mean_um=float(np.mean(array)),
+        min_um=float(np.min(array)),
+        max_um=float(np.max(array)),
+    )
+
+
+def _signed_um(value: float) -> str:
+    """One decimal with an explicit sign, and never "-0.0".
+
+    A mean a hundredth of a micron below the origin is zero at this precision, and a minus sign in
+    front of a zero reads as a defect rather than as zero.
+    """
+    text = f"{value:+.1f}"
+    return "+0.0" if text == "-0.0" else text
+
+
+def _summarize_manual_focus(spread: _ManualFocusSpread, mean_centred: bool = False) -> str:
+    """How wide the hand-focused spread is, where its ends are, and where its middle sits.
+
+    Everything else the plot says better: how many points there are is the rug, and whether the
+    sweep reaches them is now visible because the band widens the plot rather than being clipped
+    out of it. What no mark can carry is that the band is not measured from where the axis says --
+    hence mean_centred, which is true only when a piezo puts the sweep on a different axis from the
+    stage z these points hold. The mean is dropped in that case: it is zero by construction there.
+    """
+    where = f"{_signed_um(spread.min_um)} to {_signed_um(spread.max_um)}"
+    if mean_centred:
+        return f"Manual focus {spread.span_um:.1f} um about the mean: {where}."
+    return f"Manual focus {spread.span_um:.1f} um: {where}, mean {_signed_um(spread.mean_um)}."
+
+
 class LaserAFSweepWidget(QWidget):
     """Plots every reflection in the focus camera's crop against z.
 
@@ -13259,6 +13338,16 @@ class LaserAFSweepWidget(QWidget):
         # and the calibration they can adopt from it are the same number.
         self._fit = None
 
+        # Manual focus overlay. The two point lists are injected after construction -- see
+        # set_manual_focus_sources -- because neither exists yet when gui_hcs builds this widget.
+        self.focusMapWidget = None
+        self.flexibleMultiPointWidget = None
+        # Which list the operator picked, so a redraw prompted by anything other than the button
+        # itself never raises the chooser again. Dropped when the overlay is switched off.
+        self._manual_focus_source = None
+        self._manual_focus_offsets = []
+        self._manual_focus_status = ""
+
         self.init_ui()
 
     def init_ui(self):
@@ -13270,6 +13359,16 @@ class LaserAFSweepWidget(QWidget):
         button_layout = QHBoxLayout()
         self.btn_clear = QPushButton("Clear")
         button_layout.addWidget(self.btn_clear)
+        # Beside Clear because it is the other thing that acts on the plot rather than on the
+        # hardware: both change only what is drawn, and neither moves z.
+        self.btn_show_manual_focus = QPushButton("Show Manual Focus")
+        self.btn_show_manual_focus.setCheckable(True)
+        self.btn_show_manual_focus.setToolTip(
+            "Draw the z values from the Focus Map or the Flexible Multipoint point list on this "
+            "plot, so the spread of real focus positions can be read against the range a sweep "
+            "covers. Never moves z."
+        )
+        button_layout.addWidget(self.btn_show_manual_focus)
         button_layout.addStretch()
         layout.addLayout(button_layout)
 
@@ -13313,10 +13412,49 @@ class LaserAFSweepWidget(QWidget):
         self.plot.addItem(self.current_z_line, ignoreBounds=True)
         self.current_z_line.setVisible(False)
 
+        # Where the sample is actually in focus, from the hand-built point lists. Three items for
+        # one answer: the band is the envelope, the line is the middle of it, and the rug is the
+        # distribution inside it -- an envelope alone cannot tell four clustered points from four
+        # evenly spread ones.
+        #
+        # Only the band takes part in the plot's auto-range, and it is the only one of the three
+        # that can. LinearRegionItem.dataBounds returns the region for x and None for y, so it
+        # widens the plot by exactly the spread and cannot touch the y scale. InfiniteLine's
+        # returns None for x and (0, 0) for y whatever its position, so a mean line in the bounds
+        # would contribute nothing useful and would drag y down to include 0 px on a crop whose
+        # spot lives at 200-400. The rug's y comes from the current y view, so putting it in the
+        # bounds is a feedback loop. Both sit inside the band anyway, which is what carries them
+        # into view.
+        self.manual_focus_region = pg.LinearRegionItem(
+            values=(0, 0),
+            movable=False,
+            # Faint enough to read the grid and the swept points through: the band covers a wide
+            # part of the plot, and the data underneath it is the thing being compared against.
+            brush=pg.mkBrush(*_MANUAL_FOCUS_COLOR, 12),
+            pen=pg.mkPen(*_MANUAL_FOCUS_COLOR, width=1),
+        )
+        self.manual_focus_region.setZValue(-10)
+        self.manual_focus_mean_line = pg.InfiniteLine(
+            angle=90,
+            pen=pg.mkPen(*_MANUAL_FOCUS_COLOR, width=2, style=Qt.DashLine),
+            label="mean {value:.1f} um",
+            labelOpts={"position": 0.1, "color": _MANUAL_FOCUS_COLOR},
+        )
+        self.manual_focus_rug = pg.PlotDataItem(pen=pg.mkPen(*_MANUAL_FOCUS_COLOR, width=2), name="manual focus")
+        self.plot.addItem(self.manual_focus_region)
+        for item in (self.manual_focus_mean_line, self.manual_focus_rug):
+            self.plot.addItem(item, ignoreBounds=True)
+        for item in (self.manual_focus_region, self.manual_focus_mean_line, self.manual_focus_rug):
+            item.setVisible(False)
+
         layout.addWidget(self.graphics)
         self.setLayout(layout)
 
         self.btn_clear.clicked.connect(self.clear)
+        self.btn_show_manual_focus.toggled.connect(self._on_show_manual_focus_toggled)
+        # The rug is pinned to the bottom of whatever is on screen, so it has to be redrawn
+        # whenever that moves.
+        self.plot.sigYRangeChanged.connect(self._on_plot_y_range_changed)
 
     def clear(self):
         self._samples = []
@@ -13331,6 +13469,10 @@ class LaserAFSweepWidget(QWidget):
         self.current_z_line.setVisible(False)
         self.status_label.setText("Cleared.")
         self.status_label.setStyleSheet("")
+        # The overlay was placed against the origin just dropped, so it has to be re-placed rather
+        # than left where a sweep that no longer exists put it. Silent: start_sweep clears too, and
+        # a chooser raised from there would land in front of a sweep about to move z.
+        self._refresh_manual_focus()
 
     def _set_sweep_running(self, running: bool) -> None:
         """Mirror the sweep's state onto the panel that holds the buttons.
@@ -13467,8 +13609,11 @@ class LaserAFSweepWidget(QWidget):
             return
 
         self._last_marked_z_um = z_um
-        self.current_z_line.setPos(z_um - self._sweep_start_z_um)
+        # Shown first for the same reason the manual focus mean is: the label on a hidden
+        # InfiniteLine does not follow setPos, so the first placement after a clear would draw the
+        # previous sweep's number beside the new position.
         self.current_z_line.setVisible(True)
+        self.current_z_line.setPos(z_um - self._sweep_start_z_um)
 
     def on_sweep_sample(self, sample):
         if self._sweep_start_z_um is None:
@@ -13476,6 +13621,9 @@ class LaserAFSweepWidget(QWidget):
             # Taking it from the sample rather than reading z here means it is the origin the
             # sweep actually used, even if the sweep was cancelled partway.
             self._sweep_start_z_um = sample.z_um - sample.dz_um
+            # The axis has an origin now where it had none, so anything drawn against the old one
+            # is in the wrong place by exactly the amount nobody would notice.
+            self._refresh_manual_focus(update_status=False)
         self._samples.append(sample)
         all_x, all_y, sel_x, sel_y = [], [], [], []
         for s in self._samples:
@@ -13499,17 +13647,29 @@ class LaserAFSweepWidget(QWidget):
             self._was_main_live = False
 
         self._fit = _fit_sweep_slope(samples)
-        self.status_label.setText(self._summarize(samples))
+        # Re-place before summarizing: the swept span the overlay compares itself against is only
+        # final now, and both sentences share one status line.
+        self._refresh_manual_focus(update_status=False)
+        summary = self._summarize(samples)
+        if self._manual_focus_status:
+            summary = f"{summary} {self._manual_focus_status}"
+        self.status_label.setText(summary)
         self._set_slope_available(self._fit is not None and self._fit.is_usable_calibration)
 
     def _summarize(self, samples) -> str:
-        """Fit the selected branch against z and compare the slope to the stored calibration."""
-        n_selected = sum(1 for s in samples if s.selected_x is not None)
-        positions_with_any = sum(1 for s in samples if s.candidates)
-        header = f"{len(samples)} z positions, {positions_with_any} with a detected spot."
+        """Fit the selected branch against z and compare the slope to the stored calibration.
 
+        Deliberately short, because it shares one line with the manual focus spread and sits under
+        a plot that already shows most of what a longer sentence would say. How many z positions
+        were visited and how many held a spot is the scatter itself -- so those counts appear only
+        in the branches below where no slope could be fitted, which is exactly where the plot is
+        empty or degenerate and the count is the diagnosis rather than a restatement.
+        """
         fit = _fit_sweep_slope(samples)
         if fit is None:
+            n_selected = sum(1 for s in samples if s.selected_x is not None)
+            positions_with_any = sum(1 for s in samples if s.candidates)
+            header = f"{len(samples)} z positions, {positions_with_any} with a detected spot."
             if n_selected >= 2:
                 return f"{header} All detections at one z; cannot fit a slope."
             return (
@@ -13517,31 +13677,28 @@ class LaserAFSweepWidget(QWidget):
                 f"outside the crop across this whole range -- check the crop status in the settings panel."
             )
 
-        stored = self.laserAutofocusController.laser_af_properties.pixel_to_um
-
         if not fit.is_usable_calibration:
             return (
-                f"{header} Slope {fit.slope_px_per_um:.3f} px/um - this branch does NOT move with z, so it "
+                f"Slope {fit.slope_px_per_um:.3f} px/um - this branch does NOT move with z, so it "
                 f"is a static reflection, not the sample reflection. Reposition the crop onto a "
                 f"reflection that tracks focus."
             )
 
         measured_um_per_px = fit.um_per_px
-        agreement = ""
+        # Three decimals here against four in the Apply Found Slope dialog: this is a readout, and
+        # the digit that decides whether to adopt the number belongs on the commit, not the glance.
+        calibration = f"{measured_um_per_px:.3f} um/px ({fit.slope_px_per_um:.2f} px/um)"
+        stored = self.laserAutofocusController.laser_af_properties.pixel_to_um
         if stored not in (0, None) and math.isfinite(stored):
             rel = abs(measured_um_per_px - stored) / abs(stored)
-            agreement = (
-                f" Stored pixel_to_um = {stored:.4f} ({'agrees within' if rel < 0.1 else 'DISAGREES by'} "
-                f"{rel * 100:.0f}%)."
-            )
+            verdict = "agrees" if rel < 0.1 else f"off {rel * 100:.0f}%"
+            calibration += f" vs stored {stored:.3f}, {verdict}"
         # Whether the slope is worth reading back into the configuration is a question about the fit,
         # so the fit quality belongs next to the slope rather than in the log.
-        quality = (
-            f" Fit: {fit.n_points} points over {fit.dz_span_um:.0f} um, residual " f"{fit.residual_rms_px:.2f} px RMS."
-        )
+        quality = f"{fit.n_points} pts / {fit.dz_span_um:.0f} um / {fit.residual_rms_px:.2f} px RMS"
         if fit.residual_is_high:
-            quality += " That is a lot of curvature for one straight line; narrow the sweep around focus."
-        return f"{header} Slope {fit.slope_px_per_um:.2f} px/um -> {measured_um_per_px:.4f} um/px.{agreement}{quality}"
+            quality += ", not straight across this range"
+        return f"{calibration}. {quality}."
 
     def apply_fit_as_calibration(self):
         """Read the fitted slope back into pixel_to_um for the current objective.
@@ -13618,6 +13775,187 @@ class LaserAFSweepWidget(QWidget):
             f"Was {stored:.4f} um/px."
         )
         self.status_label.setStyleSheet("")
+
+    def set_manual_focus_sources(self, focusMapWidget=None, flexibleMultiPointWidget=None) -> None:
+        """Point the manual focus overlay at the two widgets that hold hand-focused z values.
+
+        Injected after construction rather than through __init__ because gui_hcs builds the laser
+        AF docks before the acquisition tabs, so flexibleMultiPointWidget does not exist yet at
+        that point. Both stay optional: the sweep plot is useful without either.
+        """
+        self.focusMapWidget = focusMapWidget
+        self.flexibleMultiPointWidget = flexibleMultiPointWidget
+
+    def _focus_map_z_um(self) -> List[float]:
+        """Z of every Focus Map point, in um. focus_points holds (region_id, x, y, z) in mm."""
+        points = getattr(self.focusMapWidget, "focus_points", None)
+        if not points:
+            return []
+        return [float(point[3]) * 1000 for point in points]
+
+    def _flexible_multipoint_z_um(self) -> List[float]:
+        """Z of every Flexible Multipoint point, in um.
+
+        Read from location_list, never from table_location_list: the array is the store and holds
+        mm, while the table is a mirror of it that displays um.
+        """
+        locations = getattr(self.flexibleMultiPointWidget, "location_list", None)
+        if locations is None or len(locations) == 0:
+            return []
+        return [float(z) * 1000 for z in np.asarray(locations)[:, 2]]
+
+    def _manual_focus_sources(self) -> List[_ManualFocusSource]:
+        return [
+            _ManualFocusSource("focus_map", "Focus Map", "the Focus Map", self._focus_map_z_um()),
+            _ManualFocusSource(
+                "flexible", "Flexible Multipoint", "the Flexible Multipoint list", self._flexible_multipoint_z_um()
+            ),
+        ]
+
+    def _read_manual_focus_points(self, allow_prompt: bool) -> Optional[_ManualFocusSource]:
+        """Whichever point list the overlay should draw, re-read from the widget that owns it.
+
+        Neither source emits a change signal, so there is nothing to subscribe to -- the list is
+        read fresh on every redraw instead, which also means the overlay can never show a point
+        that has since been removed.
+        """
+        sources = self._manual_focus_sources()
+
+        remembered = next((s for s in sources if s.key == self._manual_focus_source and s.z_values_um), None)
+        if remembered is not None:
+            return remembered
+
+        populated = [s for s in sources if s.z_values_um]
+        if not populated:
+            self.status_label.setText(
+                "No focus points to show. Add them on the Focus Map panel or the Flexible Multipoint "
+                "tab, focusing each one, then press Show Manual Focus again."
+            )
+            self.status_label.setStyleSheet("")
+            return None
+
+        if len(populated) == 1 or not allow_prompt:
+            chosen = populated[0]
+        else:
+            chosen = self._choose_manual_focus_source(populated)
+            if chosen is None:
+                return None
+
+        self._manual_focus_source = chosen.key
+        return chosen
+
+    def _choose_manual_focus_source(self, populated: List[_ManualFocusSource]) -> Optional[_ManualFocusSource]:
+        """Ask which list to draw, naming the counts so the answer can be given without leaving."""
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Question)
+        box.setWindowTitle("Laser Autofocus")
+        box.setText("Both point lists hold focus positions. Which should be drawn?")
+        box.setInformativeText(
+            "\n".join(f"{source.button_text}: {len(source.z_values_um)} points" for source in populated)
+        )
+        buttons = [(box.addButton(source.button_text, QMessageBox.AcceptRole), source) for source in populated]
+        box.addButton(QMessageBox.Cancel)
+        box.exec_()
+        clicked = box.clickedButton()
+        return next((source for button, source in buttons if button is clicked), None)
+
+    def _manual_focus_origin(self, z_values_um: List[float]) -> Tuple[float, bool]:
+        """(origin in um, whether the band had to be centred on its own mean) for stage z here.
+
+        The point lists always hold stage z. The plot's axis is measured in whatever frame the
+        sweep runs in -- the piezo when one is fitted, which is a different axis entirely and
+        cannot carry an absolute stage position at all. Only when both are the stage can a point be
+        drawn where it really is. Otherwise the mean becomes the zero, and the label has to say so:
+        a cloud centred on 0 that quietly meant something else would read as a real position and is
+        not one, the same trap clear() avoids by dropping the current-z marker with its origin.
+        """
+        if self.laserAutofocusController.piezo is None:
+            if self._sweep_start_z_um is not None:
+                return self._sweep_start_z_um, False
+            try:
+                # No sweep yet, so no origin -- but a sweep started now would start from here, so
+                # this is the axis these points are about to be read against anyway, and the axis
+                # label is right about both.
+                return self.laserAutofocusController.get_current_z_um(), False
+            except Exception:
+                self._log.exception("Could not read z for the manual focus overlay; centring on the mean instead.")
+        return float(np.mean(z_values_um)), True
+
+    def _on_show_manual_focus_toggled(self, checked: bool) -> None:
+        if not checked:
+            # Forget the choice, so the next press asks again rather than silently reusing a list
+            # the operator may have moved on from.
+            self._manual_focus_source = None
+        self._refresh_manual_focus(allow_prompt=checked)
+
+    def _on_plot_y_range_changed(self, *args) -> None:
+        self._position_manual_focus_rug()
+
+    def _refresh_manual_focus(self, update_status: bool = True, allow_prompt: bool = False) -> None:
+        """The single path by which the overlay is drawn, so it can never outlive its origin."""
+        if not self.btn_show_manual_focus.isChecked():
+            self._clear_manual_focus()
+            return
+
+        source = self._read_manual_focus_points(allow_prompt=allow_prompt)
+        if source is None:
+            self._clear_manual_focus()
+            # Nothing to draw is not a state the button should stay pressed in. Unchecking re-enters
+            # here through toggled, which is a no-op now the overlay is already hidden.
+            self.btn_show_manual_focus.setChecked(False)
+            return
+
+        origin_um, mean_centred = self._manual_focus_origin(source.z_values_um)
+        spread = _manual_focus_spread(source.z_values_um, origin_um)
+        if spread is None:
+            self._clear_manual_focus()
+            return
+
+        # Shown before being placed: InfLineLabel.valueChanged returns early while its line is
+        # hidden, so a mean set first would keep drawing the label of wherever the line was last.
+        for item in (self.manual_focus_region, self.manual_focus_mean_line, self.manual_focus_rug):
+            item.setVisible(True)
+        self.manual_focus_region.setRegion((spread.min_um, spread.max_um))
+        self.manual_focus_mean_line.setPos(spread.mean_um)
+        self._position_manual_focus_rug(spread.offsets_um)
+        # Ask now rather than waiting for the next unrelated update, so a band outside the swept
+        # range is in view by the time the status line below describes it.
+        self.plot.getViewBox().updateAutoRange()
+
+        self._manual_focus_status = _summarize_manual_focus(spread, mean_centred)
+        if update_status:
+            self.status_label.setText(self._manual_focus_status)
+            self.status_label.setStyleSheet("")
+
+    def _position_manual_focus_rug(self, offsets_um: Optional[List[float]] = None) -> None:
+        """Draw one short tick per point along the bottom of the current y view.
+
+        The y axis is spot x in pixels, which a z value has no position on. The ticks are pinned to
+        the bottom of whatever is on screen and redrawn when that moves, rather than given a y that
+        would claim a pixel position they do not have.
+        """
+        if offsets_um is not None:
+            self._manual_focus_offsets = list(offsets_um)
+        if not self._manual_focus_offsets:
+            return
+
+        y_min, y_max = self.plot.viewRange()[1]
+        tick_top = y_min + _MANUAL_FOCUS_RUG_FRACTION * (y_max - y_min)
+        x, y = [], []
+        for offset in self._manual_focus_offsets:
+            x.extend((offset, offset))
+            y.extend((y_min, tick_top))
+        self.manual_focus_rug.setData(x, y, connect="pairs")
+
+    def _clear_manual_focus(self) -> None:
+        """Hide the overlay without touching the button, which owns whether it should be shown."""
+        self._manual_focus_offsets = []
+        self._manual_focus_status = ""
+        for item in (self.manual_focus_region, self.manual_focus_mean_line, self.manual_focus_rug):
+            item.setVisible(False)
+        # ViewBox.childrenBounds skips invisible items, so hiding the band is enough to give the
+        # width back -- but only once something asks for the bounds again.
+        self.plot.getViewBox().updateAutoRange()
 
     def closeEvent(self, event):
         # Emitting a signal into a destroyed widget is a hard crash, not an exception.

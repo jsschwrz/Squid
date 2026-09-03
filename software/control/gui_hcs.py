@@ -1058,6 +1058,13 @@ class HighContentScreeningGui(QMainWindow):
             self.focusMapWidget,
             self.unifiedMosaicWidget,
         )
+        if SUPPORT_LASER_AUTOFOCUS:
+            # Wired here rather than at construction: the laser AF docks are built above, before
+            # flexibleMultiPointWidget exists. The sweep plot only reads these lists.
+            self.laserAFSweepWidget.set_manual_focus_sources(
+                focusMapWidget=self.focusMapWidget,
+                flexibleMultiPointWidget=self.flexibleMultiPointWidget,
+            )
         self.wellplateMultiPointWidget = widgets.WellplateMultiPointWidget(
             self.stage,
             self.navigationViewer,
